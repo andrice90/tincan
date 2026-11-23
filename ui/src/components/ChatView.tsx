@@ -4,7 +4,7 @@ import { Hash, Phone, Users } from "lucide-react";
 import type { Channel, DmSummary, ServerSummary } from "../api/types";
 import { startCall, toggleMembers } from "../store/actions";
 import { convKey, useStore, type TypingEntry } from "../store/store";
-import { Avatar, ICON, IconButton } from "./common";
+import { Avatar, ICON, IconButton, PersonName } from "./common";
 import { Composer, TypingLine } from "./Composer";
 import { MessageList } from "./MessageList";
 import { VoiceStage } from "./VoiceView";
@@ -56,7 +56,9 @@ export function DmChat({ dm }: { dm: DmSummary }) {
       <header className="main-header">
         <h1 className="main-title">
           <Avatar userId={dm.userId} name={dm.name} size={24} online={dm.online} />
-          <span className="truncate">{dm.name}</span>
+          <span className="truncate">
+            <PersonName userId={dm.userId} name={dm.name} />
+          </span>
           <span className="main-sub">{dm.online ? "Online" : "Offline"}</span>
         </h1>
         <IconButton

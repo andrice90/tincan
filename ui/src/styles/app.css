@@ -12,6 +12,24 @@
   font-size: var(--fs-13);
 }
 
+/* Short id after a display name that someone else also uses. */
+.user-id {
+  margin-left: var(--sp-2);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: var(--fs-12);
+  font-weight: 400;
+  color: var(--text-3);
+}
+
+.person-id {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+.person-id .mono {
+  font-size: var(--fs-12);
+}
+
 /* ---------------------------------------------------------------- title bar */
 
 .titlebar {
@@ -1214,6 +1232,24 @@ button.clip-tile:hover:not(:disabled) {
   color: var(--danger);
 }
 
+.menu-head {
+  display: grid;
+  max-width: 240px;
+  padding: var(--sp-1) var(--sp-2) var(--sp-2);
+  margin-bottom: var(--sp-1);
+  border-bottom: 1px solid var(--border);
+}
+
+.menu-head-name {
+  font-size: var(--fs-13);
+  font-weight: 600;
+}
+
+.volume-pop .person-id {
+  display: block;
+  margin-bottom: var(--sp-2);
+}
+
 .menu-sep {
   height: 1px;
   margin: var(--sp-1) 0;
@@ -1290,7 +1326,12 @@ button.clip-tile:hover:not(:disabled) {
 .call-ringing {
   display: grid;
   place-items: center;
+  gap: var(--sp-2);
   padding: var(--sp-2) 0;
+}
+
+.call-ringing .user-id {
+  margin-left: 0;
 }
 
 /* screen picker */

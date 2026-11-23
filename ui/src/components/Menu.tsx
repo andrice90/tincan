@@ -100,10 +100,12 @@ interface MenuProps {
   items: MenuItem[];
   onClose: () => void;
   label: string;
+  /** Shown above the items, such as who the menu is about. */
+  header?: ReactNode;
 }
 
 /** A keyboard-navigable menu of actions. */
-export function Menu({ anchor, items, onClose, label }: MenuProps) {
+export function Menu({ anchor, items, onClose, label, header }: MenuProps) {
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
     e.preventDefault();
@@ -116,6 +118,11 @@ export function Menu({ anchor, items, onClose, label }: MenuProps) {
 
   return (
     <Popover anchor={anchor} onClose={onClose} label={label} role="menu" className="menu" onKeyDown={onKeyDown}>
+      {header && (
+        <div className="menu-head" role="presentation">
+          {header}
+        </div>
+      )}
       {items.map((item, i) =>
         item === "separator" ? (
           <div key={`sep-${i}`} className="menu-sep" role="separator" />

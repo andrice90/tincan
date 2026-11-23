@@ -1503,6 +1503,10 @@ declare global {
       toast(text: string): void;
       /** What the mock backend thinks, for scripted checks. */
       state(): { voice: VoiceSession | null; call: CallInfo | null };
+      /** Adds an online member named `name` to a server (default Game night), for name clashes. */
+      addMember(name: string, server?: string): void;
+      /** Plays `count` different clips nobody owns into my voice session. */
+      soundFlood(count: number): void;
     };
   }
 }
@@ -1526,6 +1530,24 @@ if (typeof window !== "undefined") {
     },
     toast: (text) => toast("info", text),
     state: () => structuredClone({ voice: st.voice, call: st.call }),
+    addMember: (name, serverName = "Game night") => {
+      const s = st.servers.find((x) => x.summary.name === serverName);
+      if (!s) return;
+      const p: Person = { id: userId(`extra:${name}:${idCounter++}`), name, online: true };
+      allPeople.push(p);
+      s.members.push(member(p));
+      refreshOnline(s);
+      emitMembers(s);
+      emit("server-updated", s.summary);
+    },
+    soundFlood: (count) => {
+      const by = people.jordan;
+      for (let i = 0; i < count; i++) {
+        const hash = freshHex();
+        const clip: Clip = { hash, name: `Clip ${i + 1}`, durationMs: 500, size: 9_000, owned: false, heardFrom: by.id, transfer: null };
+        emit("sound-played", { userId: by.id, name: by.name, clip });
+      }
+    },
   };
   if (FLAG_RING) setTimeout(() => ringFrom(people.alex), 1500);
   if (!FLAG_FRESH) {

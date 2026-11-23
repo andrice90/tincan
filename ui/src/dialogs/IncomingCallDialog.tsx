@@ -1,7 +1,7 @@
 // Shown while someone is ringing me.
 
 import type { CallInfo } from "../api/types";
-import { Avatar } from "../components/common";
+import { Avatar, IdSuffix } from "../components/common";
 import { Modal } from "../components/Modal";
 import { acceptCall, declineCall } from "../store/actions";
 
@@ -25,6 +25,7 @@ export function IncomingCallDialog({ call }: { call: CallInfo }) {
     >
       <div className="call-ringing">
         <Avatar userId={call.userId} name={call.name} size={64} />
+        <IdSuffix userId={call.userId} name={call.name} />
       </div>
     </Modal>
   );

@@ -18,6 +18,7 @@ import type {
   VoiceSession,
 } from "../api/types";
 import { leaveCommand } from "./calls";
+import { addPlayedClip } from "./clips";
 import {
   convKey,
   getState,
@@ -399,7 +400,10 @@ export function init(): () => void {
     listen("clips-updated", (clips) => patch({ clips })),
     listen("sound-played", ({ clip }) => {
       markPlaying(clip.hash, clip.durationMs);
-      update((s) => (s.clips.some((c) => c.hash === clip.hash) ? s : { ...s, clips: [...s.clips, clip] }));
+      update((s) => {
+        const clips = addPlayedClip(s.clips, clip);
+        return clips === s.clips ? s : { ...s, clips };
+      });
     }),
     listen("toast", ({ kind, text }) => pushToast(kind, text)),
   ];

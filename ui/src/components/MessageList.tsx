@@ -9,7 +9,7 @@ import { dayStart, formatDay, formatFull, formatTime } from "../lib/format";
 import { loadOlder, openDialog } from "../store/actions";
 import { convKey, useStore } from "../store/store";
 import { Attachment } from "./Attachment";
-import { Avatar, ICON_SM } from "./common";
+import { Avatar, ICON_SM, PersonName } from "./common";
 
 const GROUP_MS = 5 * 60_000;
 const LOAD_OLDER_PX = 400;
@@ -83,7 +83,9 @@ const MessageItem = memo(function MessageItem({ m, head, canDelete, pendingName 
       <div className="msg-body">
         {head && (
           <div className="msg-meta">
-            <span className="msg-author">{m.authorName}</span>
+            <span className="msg-author">
+              <PersonName userId={m.authorId} name={m.authorName} />
+            </span>
             <time className="msg-time" dateTime={new Date(m.sentAt).toISOString()} title={formatFull(m.sentAt)}>
               {formatTime(m.sentAt)}
             </time>

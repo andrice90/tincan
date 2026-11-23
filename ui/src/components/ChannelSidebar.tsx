@@ -6,7 +6,7 @@ import { memo, useMemo, useRef, type MouseEvent, type ReactNode } from "react";
 import type { Channel, Connection, Member, ServerSummary, VoiceSession } from "../api/types";
 import { openDialog, selectChannel } from "../store/actions";
 import { useStore } from "../store/store";
-import { ICON_SM, IconButton, SpeakingAvatar } from "./common";
+import { ICON_SM, IconButton, PersonName, SpeakingAvatar } from "./common";
 import { Menu, useMenu, type MenuItem } from "./Menu";
 
 /** One line of host state for the header. */
@@ -228,7 +228,9 @@ function VoiceRoomRow({
           {people.map((p) => (
             <li key={p.userId} className="room-person">
               <SpeakingAvatar userId={p.userId} name={p.name} size={20} />
-              <span className="truncate">{p.name}</span>
+              <span className="truncate">
+                <PersonName userId={p.userId} name={p.name} />
+              </span>
               <span className="room-person-icons">
                 {p.sharing && <Monitor size={14} role="img" aria-label="Sharing screen" />}
                 {p.deafened ? <HeadphoneOff size={14} role="img" aria-label="Deafened" /> : p.muted && <MicOff size={14} role="img" aria-label="Muted" />}
