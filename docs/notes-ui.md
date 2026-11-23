@@ -84,6 +84,7 @@ Display names are chosen by each peer and are not unique. When two people the UI
   - The room header's "Chat" button toggles a 340px panel beside the tiles (`State.roomChatPanel`, kept across rooms for the session). `.voice-split` has `contain: inline-size` so the tile strip scrolls instead of widening the window.
   - `store/chatView.ts` (`shownChat`, `roomChatMode`) is the one answer to "which chat is on screen". Loading, `mark_read`, `markSeen` and the snapshot cache all use it, so a room's chat is never marked read while only its tiles show. The row's unread state (bold, sr-only "unread messages") and the Chat button's follow the same rule.
   - The member list shows beside a room's chat page, not beside its tiles.
+  - Known gap: a full-window stage (`.stage.is-full`) covers the open panel, but the panel still counts as on screen, so messages arriving then are marked read (the DM call stage has the same gap). The soundboard popover floats over the left of the main area and can overlap the panel in a narrow window.
 - DM typing works: `typing` takes `channelId: null` for a DM and the app sends `typing` events with `channelId: null`, shown under the DM composer.
 - Settings > Network shows "N people connected" for a server this PC hosts (the app reports no path while hosting).
 - The auto-download menu stops at 25 MB, the app's attachment limit.
