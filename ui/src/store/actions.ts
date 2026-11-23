@@ -20,6 +20,7 @@ import type {
 } from "../api/types";
 import { leaveCommand } from "./calls";
 import { addPlayedClip } from "./clips";
+import { withCreatedServer } from "./servers";
 import { staleTransfers, takeTransfer } from "./transfers";
 import { typingTracker } from "./typing";
 import { MAX_PAGE, applyLive, keepOnSnapshot, mergeNewest, olderPageApplies, pageCovers, prependOlder, refreshLimit, refreshRead, refreshSpan } from "./messages";
@@ -576,7 +577,7 @@ export async function setName(name: string): Promise<void> {
 }
 
 function addServer(summary: ServerSummary): void {
-  update((s) => ({ ...s, servers: upsert(s.servers, summary, (x) => x.id === summary.id) }));
+  update((s) => ({ ...s, servers: withCreatedServer(s.servers, summary) }));
   loadServer(summary.id);
   selectServer(summary.id);
 }

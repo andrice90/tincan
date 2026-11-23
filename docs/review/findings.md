@@ -4,7 +4,7 @@ Status of every confirmed finding from the two review rounds on 2026-11-23. Each
 
 Status values: `open`, `fixed` (with the subjects of the commits that fixed it), `deferred` (with reason). Aliases share their id's row and status.
 
-Round 2 fixes landed on 2026-11-23: four fix branches (`fix/net`, `fix/files-sec`, `fix/ui`, `fix/shell`) merged into main, then the app-side follow-ups on main. Round 3 fixes (the review of the round 2 fixes, below) landed on main the same day. After them the two-profile UI e2e (`ui/e2e`, docs/e2e.md) passed all 49 checks with the embedded UI. Not verified on real hardware or the real Tauri app since: the NSIS installer and its delete-data box, a real Windows logoff, and the merge, flood and stranger paths of round 3 (covered by the in-process tests only).
+Round 2 fixes landed on 2026-11-23: four fix branches (`fix/net`, `fix/files-sec`, `fix/ui`, `fix/shell`) merged into main, then the app-side follow-ups on main. Round 3 fixes (the review of the round 2 fixes, below) landed on main the same day. The two-profile UI e2e (`ui/e2e`, docs/e2e.md) then found one UI bug (E2E-R3-1 below); after its fix it passed all 49 checks twice in a row with the embedded UI. Not verified on real hardware or the real Tauri app since: the NSIS installer and its delete-data box, a real Windows logoff, and the merge, flood and stranger paths of round 3 (covered by the in-process tests only).
 
 ## Round 3: review of the round 2 fixes
 
@@ -29,6 +29,14 @@ Found and confirmed after the round 2 fixes landed (review of main at `afc192c`)
 | REGRESSION-2 | minor | `crates/tincan-app/src/pump.rs:354` | After a lag an RTT-only ConnectionChanged starts a sync that never ends, stretching bulk windows to 60 s | fixed ("Prove blob sizes before refusing, resume only from the origin, keep server shares, fix pump and UI regressions") |
 | REGRESSION-3 | minor | `ui/src/components/Composer.tsx:80` | A send that fails after switching away and back writes its text where the new box never reads it; the next keystroke loses it | fixed ("Prove blob sizes before refusing, resume only from the origin, keep server shares, fix pump and UI regressions") |
 | REGRESSION-4 | minor | `ui/src/components/VoiceView.tsx:261` | Tiles of an unjoined room start the volume slider at 100% and a release without a change overwrites the saved volume (UI-LOGIC-13 was only partly fixed) | fixed ("Prove blob sizes before refusing, resume only from the origin, keep server shares, fix pump and UI regressions") |
+| E2E-R3-1 | minor | `ui/src/store/actions.ts:579` | A `join_server` result built before the history sync replaced the newer `server-updated` in the store, so the header kept the host's short id (found by the e2e run, reachable since bulk windows end at SyncComplete) | fixed ("Keep server-updated over an older join result; test a young server merge") |
+
+Left open by round 3:
+
+| Id | Sev | Where | Finding | Status |
+|---|---|---|---|---|
+| R3-OPEN-1 | medium | `crates/tincan-net/src/session/member.rs:171` | A malicious host can still flood its members with valid events of its own or relayed (members budget only new-member admissions from the host), growing their storage and UI | open (raised with NET-SECURITY-3) |
+| R3-OPEN-2 | low | `crates/tincan-app/src/lib.rs` | No way to delete or block a DM conversation: stranger spam stays in the DM list (it no longer locks out new strangers) | open (raised with NET-SECURITY-6; needs an app contract and UI change) |
 
 ## Round 2: tincan-app, src-tauri, ui
 

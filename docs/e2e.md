@@ -67,7 +67,7 @@ The script drives each flow by clicking and typing in the two webviews, with the
 
 ## Results
 
-Last run: 2026-11-23, after the round 2 fixes and the round 3 review fixes (`docs/review/findings.md`), debug build (`dev` profile) with the embedded UI, started from the repository root. All 49 checks passed. The first run after those fixes failed one check, "B sees who hosts": it read B's header once, right after B's member list showed both names, and got "Hosted by w67ra3gh" (Alice's short id). One refresh emits `members-updated` before `server-updated`, and the header shown before the sync still had the short id, so the read fell between the two events. The check now waits up to 5 s for "Hosted by Alice"; the next two runs passed all 49 checks, the header within the first poll. No instance wrote a warning or error to its log (`TINCAN_LOG=warn,tincan_audio=info`). Both instances that joined voice opened and closed the microphone and speaker exactly once: on joining voice, and on leaving it. The restarted instance never joined voice and opened no device. The numbers below come from the last run. The run before (2026-11-23, before the round 2 fixes) was within a few ms of them, except the host exit (219 ms then).
+Last run: 2026-11-23, after the round 2 fixes and the round 3 review fixes (`docs/review/findings.md`), debug build (`dev` profile) with the embedded UI, started from the repository root. All 49 checks passed, in two runs in a row after bug 4 below was fixed. The first run after the round 3 fixes had failed "B sees who hosts" (bug 4). No instance wrote a warning or error to its log (`TINCAN_LOG=warn,tincan_audio=info`). Both instances that joined voice opened and closed the microphone and speaker exactly once: on joining voice, and on leaving it. The restarted instance never joined voice and opened no device. The numbers below come from the first of the two passing runs. The run before the round 2 fixes was within a few ms of them, except the host exit (219 ms then).
 
 ### Timings (loopback, offline network)
 
@@ -75,24 +75,24 @@ Waits poll every 50 ms. Message latencies are stamped in the pages themselves: f
 
 | What | Time |
 |---|---|
-| Create server (click to "Only you are online") | 81 ms |
-| Join: click "Join server" to the server shown on B | 77 ms |
-| Join: to both online in B's member list / in A's | 79 ms / 200 ms |
+| Create server (click to "Only you are online") | 83 ms |
+| Join: click "Join server" to the server shown on B | 79 ms |
+| Join: to both online in B's member list / in A's | 81 ms / 201 ms |
 | Message latency A to B, median of 10 | 4 ms |
-| Message latency B to A, median of 10 | 4 ms |
-| Attachment (180 B PNG): Enter to B's inline preview loaded, auto-fetched | 60 ms |
-| DM A to B, including B opening the new conversation / DM B to A | 28 ms / 12 ms |
-| Voice: both listed in Lounge on both sides | 297 ms |
-| Sound played on A to "Heard in this call" on B | 14 ms |
-| Clip pull on B (Save to playable tile) | 843 ms |
-| Screen share: Share click to "Stop sharing" | 328 ms |
-| Watch click to first decoded frame on B | 14 ms |
-| Stop sharing to the share gone on B | 322 ms |
-| Host migration: Close click to survivor "Only you are online" | 156 ms |
-| Host migration: Close click to the host process exiting (clean handoff) | 98 ms |
-| Close click to the survivor having sent two messages (includes typing) | 1132 ms |
-| Restart: launch to "Hosted by Bob" / to the missed messages shown | 431 ms / 433 ms |
-| First message after the rejoin | 5 ms |
+| Message latency B to A, median of 10 | 3 ms |
+| Attachment (180 B PNG): Enter to B's inline preview loaded, auto-fetched | 78 ms |
+| DM A to B, including B opening the new conversation / DM B to A | 26 ms / 11 ms |
+| Voice: both listed in Lounge on both sides | 332 ms |
+| Sound played on A to "Heard in this call" on B | 16 ms |
+| Clip pull on B (Save to playable tile) | 839 ms |
+| Screen share: Share click to "Stop sharing" | 331 ms |
+| Watch click to first decoded frame on B | 18 ms |
+| Stop sharing to the share gone on B | 319 ms |
+| Host migration: Close click to survivor "Only you are online" | 162 ms |
+| Host migration: Close click to the host process exiting (clean handoff) | 91 ms |
+| Close click to the survivor having sent two messages (includes typing) | 1138 ms |
+| Restart: launch to "Hosted by Bob" / to the missed messages shown | 446 ms / 449 ms |
+| First message after the rejoin | 4 ms |
 
 ### Resources after 60 s idle
 
@@ -100,17 +100,17 @@ Debug build, both instances in a server text channel, not in voice, CDP disconne
 
 | Process | e2e-a (restarted, never in voice since) | e2e-b (was in voice earlier) |
 |---|---|---|
-| tincan.exe | 57.3 MB, 9.3 MB, 14, 0% | 60.3 MB, 11.3 MB, 18, 0% |
-| WebView2 browser | 121.9 MB, 32.7 MB, 53, 0.15% | 138.2 MB, 38.4 MB, 59, 0.15% |
-| WebView2 GPU | 81.1 MB, 73.9 MB, 61, 0.15% | 119.3 MB, 102.2 MB, 63, 0.6% |
-| WebView2 renderer | 87.5 MB, 38.9 MB, 25, 0.15% | 118.4 MB, 62.6 MB, 27, 0.3% |
-| WebView2 utility (2) | 40.4 + 22.1 MB, 11.1 + 7.2 MB, 23 + 10, 0% | 41 + 22 MB, 11.5 + 7.2 MB, 25 + 10, 0% |
-| WebView2 crashpad | 15.8 MB, 3.2 MB, 12, 0% | 15.8 MB, 3.3 MB, 13, 0% |
-| Total (7 processes) | 426 MB working set, 176 MB private, 198 threads, 0.45% | 515 MB working set, 237 MB private, 215 threads, 1.05% |
+| tincan.exe | 57.4 MB, 9.4 MB, 14, 0% | 58.2 MB, 11.6 MB, 19, 0% |
+| WebView2 browser | 129.1 MB, 32.9 MB, 56, 0.15% | 126.6 MB, 36.1 MB, 51, 0.3% |
+| WebView2 GPU | 77.2 MB, 74.2 MB, 62, 0% | 113.4 MB, 102.1 MB, 63, 0% |
+| WebView2 renderer | 85.2 MB, 36.8 MB, 25, 0% | 116.2 MB, 61.2 MB, 29, 0% |
+| WebView2 utility (2) | 40.9 + 22.7 MB, 11.2 + 7.3 MB, 24 + 11, 0% | 42.7 + 22 MB, 11.5 + 7.2 MB, 24 + 10, 0.15% |
+| WebView2 crashpad | 15.8 MB, 3.3 MB, 12, 0% | 15.8 MB, 3.3 MB, 12, 0% |
+| Total (7 processes) | 428 MB working set, 175 MB private, 204 threads, 0.15% | 495 MB working set, 233 MB private, 208 threads, 0.45% |
 
-- The Rust process idles at 0% CPU with 9-11 MB of private memory.
-- **The architecture target of under 30 MB RSS for the idle Rust core is not demonstrated.** The debug build's working set is 57-60 MB. Given the 9-11 MB of private bytes, that is likely mostly the debug exe's image pages, but no release build was measured.
-- B's 4 extra threads are likely its audio engine, which stays parked after the first voice use (by design, per the app notes). Its devices were closed, as the logs show.
+- The Rust process idles at 0% CPU with 9-12 MB of private memory.
+- **The architecture target of under 30 MB RSS for the idle Rust core is not demonstrated.** The debug build's working set is 57-58 MB. Given the 9-11 MB of private bytes, that is likely mostly the debug exe's image pages, but no release build was measured.
+- B's 5 extra threads are likely its audio engine, which stays parked after the first voice use (by design, per the app notes). Its devices were closed, as the logs show.
 - B's larger GPU and renderer processes are likely left over from decoding the screen share. This was not measured separately.
 
 ## Bugs found and fixed
@@ -120,6 +120,7 @@ The app and the shell met for the first time in this run. They needed no glue ch
 1. **A delivered DM kept showing "Waiting for Bob to come online".** On loopback the DM ack (`message-updated`, `pending: false`) arrived before the `send_message` result (`pending: true`), and `putMessage` replaced the newer state with the older one. The fix: `putMessage` (`ui/src/store/actions.ts`) treats `pending` and `deleted` as one-way. A command result can no longer bring back a pending or deleted state that an event already cleared.
 2. **A conversation stayed unread when the view changed right after a message arrived.** The UI marked a conversation read only when the backend's debounced unread flag (100 ms) came back while the conversation was still on screen. Leaving within that window left a DM or channel unread, and that survived restarts. The fix: `markSeen` in `actions.ts` calls `mark_read` as soon as someone else's message lands in the conversation on screen, then once more at the end of a burst if the conversation is still on screen, at most once per second per conversation.
 3. **No way to see backend logs.** The shell had no tracing subscriber, so device and network warnings were invisible. The fix: `TINCAN_LOG=<EnvFilter>` (`src-tauri/src/main.rs`) writes tracing output to stderr. When unset, nothing is installed. The e2e run captures it per instance under `logs/`.
+4. **B's header kept "Hosted by <short id>" after joining** (found after the round 2 and 3 fixes, in one run of three). `join_server` returns a `ServerSummary` built when the join returns, before the history sync brought the host's Profile. Since round 2 the bulk window ends at `SyncComplete`, so the sync's `server-updated` (with "Alice") can reach the UI before the command result. `addServer` then replaced the newer entry with the result, and the backend never sends the same `server-updated` again, so the header stayed wrong until the summary changed for another reason. The check read the header 55 ms after the member list showed both names and still saw the short id. The fix: a `create_server` or `join_server` result only adds a server the list does not hold yet (`withCreatedServer` in `ui/src/store/servers.ts`), the same rule as command results for transfers (UI-LOGIC-10).
 
 ## Not verified
 

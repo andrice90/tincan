@@ -912,3 +912,36 @@ async fn events_frames_do_not_bypass_the_publish_budget() {
         n.net.shutdown().await;
     }
 }
+
+/// NET-SECURITY-2 (honest path): with the attester age rule on and every member minutes old,
+/// a solo host still rejoins the populated partition (it has nobody to hand over, so it
+/// counts every valid attestation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_solo_host_rejoins_a_young_server() {
+    let t = || Timings { established_after: Duration::from_secs(3600), ..fast() };
+    let a = node("alice", t()).await;
+    let b = node("bob", t()).await;
+    let c = node("carol", t()).await;
+    wire(&[&a, &b, &c]);
+    let server = cluster(&a, &[&b, &c]).await;
+    let ids: Vec<_> = [&a, &b, &c].iter().map(|n| (n.identity.clone(), n.storage.clone())).collect();
+    for n in [a, b, c] {
+        n.net.shutdown().await;
+    }
+    let a = start(ids[0].0.clone(), ids[0].1.clone(), "alice", t()).await;
+    let b = start(ids[1].0.clone(), ids[1].1.clone(), "bob", t()).await;
+    let c = start(ids[2].0.clone(), ids[2].1.clone(), "carol", t()).await;
+    wire(&[&a, &c]);
+    until("a and c together, b solo", Duration::from_secs(15), || {
+        let h = host_of(&a, &server);
+        h.is_some() && h == host_of(&c, &server) && b.net.connection(&server).state == ConnState::Solo
+    })
+    .await;
+    let pair_host = host_of(&a, &server).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    wire(&[&a, &b, &c]);
+    until("one host again", Duration::from_secs(20), || [&a, &b, &c].iter().all(|n| host_of(n, &server) == Some(pair_host))).await;
+    for n in [a, b, c] {
+        n.net.shutdown().await;
+    }
+}
