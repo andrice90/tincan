@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tincan_core::event::{Body, StoredEvent};
+use tincan_core::event::{Body, SignedEvent, StoredEvent};
 use tincan_core::hlc::Hlc;
 use tincan_core::keys::ServerKeys;
 use tincan_core::state::{Change, ConvState, PendingBuffer, PendingLimits, Verdict};
@@ -228,6 +228,38 @@ impl Replica {
         Ok(r)
     }
 
+    /// Was I removed from this server? Either my history holds the removal, or a host
+    /// showed me the owner-signed removal (`removed_notice`) while refusing my Hello.
+    pub fn removed(&self, storage: &dyn Storage, me: &UserId) -> bool {
+        if self.record.is_dm {
+            return false;
+        }
+        self.state.is_removed(me) || load_notice(storage, &self.record.id).is_some_and(|n| self.state.removal_of(&n, me))
+    }
+
+    /// Remember an owner-signed removal of me heard from a host (checked with
+    /// `ConvState::removal_of` first). It may not apply yet when my history is behind.
+    pub fn store_notice(&self, storage: &dyn Storage, notice: &StoredEvent) {
+        let Ok(bytes) = postcard::to_stdvec(&notice.signed) else { return };
+        if let Err(e) = storage.set_kv(&notice_key(&self.record.id), &bytes) {
+            tracing::warn!(error = %e, "persisting a removal notice failed");
+        }
+    }
+
+    /// I was removed: seqs I signed past my applied head were never stored by an honest host
+    /// (it refuses a removed member's events), so a re-join continues right after it. The
+    /// removal's cut also counts: an acknowledgement I lost may have left my events there.
+    pub fn reset_floor_after_removal(&mut self, storage: &dyn Storage, me: &UserId, cut: u64) {
+        let floor = self.state.head(me).max(cut);
+        if floor < self.own_floor {
+            tracing::info!(conv = %self.record.id.short(), from = self.own_floor, to = floor, "removed: releasing seqs nobody stored");
+            self.own_floor = floor;
+            if let Err(e) = storage.set_kv(&floor_key(&self.record.id), &floor.to_le_bytes()) {
+                tracing::error!(error = %e, "persisting own seq floor failed");
+            }
+        }
+    }
+
     /// A floor poisoned by a host's bogus seq hint (far above the head) is reset to the head.
     fn repair_floor(&mut self, storage: &dyn Storage, me: &UserId) {
         let head = self.state.head(me);
@@ -351,6 +383,22 @@ impl Replica {
                 tracing::error!(error = %e, "persisting own seq floor failed");
             }
         }
+    }
+}
+
+fn notice_key(conv: &ConvId) -> String { format!("net/removed/{}", conv.to_hex()) }
+
+/// The stored removal notice of a conversation, if any (verified again on load).
+pub(crate) fn load_notice(storage: &dyn Storage, conv: &ConvId) -> Option<StoredEvent> {
+    let raw = storage.get_kv(&notice_key(conv)).ok().flatten()?;
+    let signed: SignedEvent = postcard::from_bytes(&raw).ok()?;
+    StoredEvent::from_signed(signed).ok()
+}
+
+/// Forget a removal notice (a re-join starts over).
+pub(crate) fn clear_notice(storage: &dyn Storage, conv: &ConvId) {
+    if let Err(e) = storage.set_kv(&notice_key(conv), &[]) {
+        tracing::warn!(error = %e, "clearing a removal notice failed");
     }
 }
 

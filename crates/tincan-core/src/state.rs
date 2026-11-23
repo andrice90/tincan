@@ -231,8 +231,9 @@ pub struct ProfileRecord {
     pub name: String,
 }
 
-/// Is a seq valid under these removals? (See [`Member::seq_valid`].)
-fn valid_under(removals: &[RemovalRecord], seq: u64) -> bool {
+/// Is a member's seq valid under these removals of them? (See [`Member::seq_valid`]; for
+/// code that keeps a copy of the removals, like the app's views.)
+pub fn valid_under(removals: &[RemovalRecord], seq: u64) -> bool {
     removals.iter().all(|r| r.last_seq >= seq || r.cleared_from.is_some_and(|f| f <= seq))
 }
 

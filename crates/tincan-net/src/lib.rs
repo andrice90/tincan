@@ -41,6 +41,8 @@ mod tests_media;
 #[cfg(test)]
 mod tests_security;
 #[cfg(test)]
+mod tests_removal;
+#[cfg(test)]
 mod tests_store;
 #[cfg(test)]
 mod tests_dm;

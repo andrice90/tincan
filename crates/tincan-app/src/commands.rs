@@ -81,7 +81,8 @@ impl Core {
     /// `join_server`.
     pub(crate) async fn cmd_join_server(&self, invite: &str) -> Result<dto::ServerSummary, String> {
         self.require_name()?;
-        let fresh = Invite::decode(invite).ok().filter(|inv| self.view(&inv.server).is_none()).map(|inv| inv.server);
+        // A server I was removed from starts over too: its history comes back with the sync.
+        let fresh = Invite::decode(invite).ok().filter(|inv| self.view(&inv.server).is_none() || self.net.is_removed(&inv.server)).map(|inv| inv.server);
         if let Some(server) = fresh {
             // The history sync follows the join at once: no per-message events for it.
             self.arm_bulk(server);
@@ -102,6 +103,21 @@ impl Core {
         self.invalidate_view(&server);
         self.forget_sent(&server);
         self.update_policy();
+        Ok(())
+    }
+
+    /// `kick_member`: the owner removes a member. They lose their connection and can come
+    /// back only with an invite that still works.
+    pub(crate) async fn cmd_kick_member(&self, server: ConvId, user: UserId) -> Result<(), String> {
+        let view = self.server_view(&server)?;
+        owner_only(&view, &self.me)?;
+        if user == self.me {
+            return Err("You can't remove yourself. Leave the server instead.".into());
+        }
+        if !view.members.contains(&user) {
+            return Err("They're not in this server anymore.".into());
+        }
+        self.net.remove_member(server, user).await.map_err(net_err)?;
         Ok(())
     }
 

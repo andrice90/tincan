@@ -113,7 +113,7 @@ fn is_hex64(v: &Value) -> bool { v.as_str().is_some_and(|s| s.len() == 64 && s.c
 
 const MESSAGE_KEYS: &[&str] = &["id", "convId", "channelId", "authorId", "authorName", "text", "attachments", "sentAt", "deleted", "pending"];
 const MEMBER_KEYS: &[&str] = &["userId", "name", "online", "isHost", "isOwner", "voiceChannelId", "muted", "deafened", "sharing", "speaking"];
-const SERVER_KEYS: &[&str] = &["id", "name", "ownerId", "isOwner", "connection", "unread", "onlineCount"];
+const SERVER_KEYS: &[&str] = &["id", "name", "ownerId", "isOwner", "connection", "unread", "onlineCount", "removed"];
 const CHANNEL_KEYS: &[&str] = &["id", "serverId", "name", "kind", "position", "unread"];
 const TRANSFER_KEYS: &[&str] = &["hash", "state", "have", "total", "peers"];
 const DM_KEYS: &[&str] = &["convId", "userId", "name", "online", "unread", "lastMessageAt"];
@@ -1046,4 +1046,87 @@ async fn contract_matches_types_ts() {
     assert_eq!(snap["settings"]["theme"], "dark");
     assert_eq!(snap["settings"]["allowHosting"], false);
     again.shutdown().await;
+}
+
+/// The owner removes a member with `kick_member`. The removed member is told (toast and
+/// `removed: true`), keeps a read-only copy, can no longer post or fetch the server's files
+/// from the others, and the rest see it leave the member list with a toast. A current
+/// invite brings it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_removes_a_member() {
+    let _g = serial().await;
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let files = tempfile::tempdir().unwrap();
+    let a = node(dirs[0].path(), "Alice").await;
+    let mut b = node(dirs[1].path(), "Bob").await;
+    let mut m = node(dirs[2].path(), "Mallory").await;
+    let mut s = call(&m.app, "app_snapshot", json!({})).await["settings"].clone();
+    s["autoFetchLimit"] = json!(0);
+    call(&m.app, "settings_set", json!({ "settings": s })).await;
+
+    let server = server_id(&call(&a.app, "create_server", json!({ "name": "Shared" })).await);
+    let invite = call(&a.app, "create_invite", json!({ "serverId": server })).await;
+    call(&b.app, "join_server", json!({ "invite": invite })).await;
+    call(&m.app, "join_server", json!({ "invite": invite })).await;
+    all_online(&[&a, &b, &m], &server).await;
+    let general = text_channel(&m.app, &server).await;
+    let before = call(&m.app, "send_message", json!({ "convId": server, "channelId": general, "text": "before", "attachments": [] })).await;
+
+    // Two server files that Bob holds: Mallory may fetch one from Bob now (control).
+    let (f1, f2) = (files.path().join("one.bin"), files.path().join("two.bin"));
+    std::fs::write(&f1, data(60_000, 31)).unwrap();
+    std::fs::write(&f2, data(60_000, 32)).unwrap();
+    let h1 = send_file(&a.app, &server, Some(&general), &f1).await;
+    let h2 = send_file(&a.app, &server, Some(&general), &f2).await;
+    until_complete(&b.app, &h1, "Bob fetches file one").await;
+    until_complete(&b.app, &h2, "Bob fetches file two").await;
+    let bob_addrs = b.app.test_addrs();
+    assert!(m.app.test_fetch_from(&h1, &b.user, &bob_addrs, 20).await, "control: a member fetches a server file");
+
+    // Only the owner, never itself.
+    let args = json!({ "serverId": server, "userId": m.user });
+    assert_eq!(call_err(&b.app, "kick_member", args.clone()).await, "Only the server owner can do that.");
+    assert!(!call_err(&a.app, "kick_member", json!({ "serverId": server, "userId": a.user })).await.is_empty());
+    assert_eq!(call(&a.app, "kick_member", args.clone()).await, Value::Null);
+
+    wait_for(&mut m.rx, "toast", 20, |t| t["text"] == "You were removed from Shared.").await;
+    wait_for(&mut b.rx, "toast", 20, |t| t["text"] == "Mallory was removed from Shared.").await;
+    let mine = eventually("Mallory sees the server as removed", 20, || async {
+        let snap = call(&m.app, "app_snapshot", json!({})).await;
+        snap["servers"].as_array().unwrap().iter().find(|s| s["id"] == server.as_str() && s["removed"] == true).cloned()
+    })
+    .await;
+    assert_keys(&mine, SERVER_KEYS);
+    assert_eq!(mine["connection"]["state"], "offline");
+    for n in [&a, &b] {
+        eventually("Mallory left the member list", 20, || async {
+            let ms = call(&n.app, "members", json!({ "serverId": server })).await;
+            (!ms.as_array().unwrap().iter().any(|x| x["userId"] == m.user.as_str())).then_some(())
+        })
+        .await;
+    }
+    // Read-only, history kept on both sides.
+    let (texts, _) = all_texts(&m.app, &server, Some(&general), 50).await;
+    assert!(texts.contains(&"before".to_string()));
+    let (texts, _) = all_texts(&b.app, &server, Some(&general), 50).await;
+    assert!(texts.contains(&"before".to_string()), "messages from before the removal stay");
+    assert!(!call_err(&m.app, "send_message", json!({ "convId": server, "channelId": general, "text": "after", "attachments": [] })).await.is_empty());
+    assert_eq!(call_err(&a.app, "kick_member", args.clone()).await, "They're not in this server anymore.");
+    // Bob no longer shares the server's files with Mallory.
+    assert!(!m.app.test_fetch_from(&h2, &b.user, &bob_addrs, 15).await, "a removed member fetched a server file");
+
+    // A current invite brings Mallory back.
+    let back = call(&m.app, "join_server", json!({ "invite": invite })).await;
+    assert_keys(&back, SERVER_KEYS);
+    assert_eq!(back["removed"], false);
+    all_online(&[&a, &b, &m], &server).await;
+    let again = call(&m.app, "send_message", json!({ "convId": server, "channelId": general, "text": "back", "attachments": [] })).await;
+    wait_for(&mut b.rx, "message-added", 20, |x| x["id"] == again["id"]).await;
+    let (texts, _) = all_texts(&b.app, &server, Some(&general), 50).await;
+    assert!(texts.contains(&"before".to_string()) && texts.contains(&"back".to_string()));
+    assert_ne!(before["id"], again["id"]);
+
+    for n in [&a, &b, &m] {
+        n.app.shutdown().await;
+    }
 }

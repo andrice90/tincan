@@ -79,6 +79,9 @@ pub struct ServerSummary {
     pub unread: bool,
     /// Members online, me included.
     pub online_count: u32,
+    /// The owner removed me: read-only up to the removal, offline, until I join again with
+    /// a current invite.
+    pub removed: bool,
 }
 
 /// `ChannelKind`.
