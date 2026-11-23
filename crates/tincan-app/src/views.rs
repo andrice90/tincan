@@ -555,6 +555,7 @@ mod tests {
             all_channels: BTreeMap::new(),
             members: Vec::new(),
             names: HashMap::new(),
+            removals: HashMap::new(),
         })
     }
 

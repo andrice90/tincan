@@ -443,6 +443,9 @@ impl Net {
         if dm::peer_of(&self.inner, &conv).is_some() {
             return dm::publish(&self.inner, conv, body);
         }
+        if self.is_removed(&conv) {
+            return Err(NetError::Rejected("You were removed from this server.".into()));
+        }
         let tx = self.inner.sessions.lock().get(&conv).map(|s| s.tx.clone()).ok_or(NetError::UnknownConv)?;
         let (reply, rx) = oneshot::channel();
         tx.send(SessionCmd::Publish { body, reply }).await.map_err(|_| NetError::Closed)?;

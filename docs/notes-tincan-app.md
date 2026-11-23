@@ -51,6 +51,7 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 3. `Files::load(blobs, endpoint, policy)`. The policy is `index::Policy` over `Arc<RwLock<Access>>` (see Blob access below). It starts empty, so nobody can connect until step 5 fills in the conversations. Then the shares of every held blob are read from kv (`load_shares`).
    - Conversation membership is rebuilt from the cached views on startup, joins and leaves.
    - It is rebuilt at once on a `Members` change, so a new member can fetch right after joining.
+   - A removal is a `Members` change too: the removed user is no current member, so nobody serves them through that server. A server I was removed from is left out of the set entirely (`update_policy` skips it), so its members fetch nothing from me through it and its host is told nothing.
 4. `Net::start(.., |b| b.accept(tincan_files::ALPN, files.protocol()))`. Then subscribe to both event streams. The `Have` list is set in step 5 (`update_policy` calls `announce`).
 5. Warm every view and DM delivery mark. Spawn the pump and the fetch worker. Read `files.partial_downloads()` for resuming later.
 
@@ -112,6 +113,8 @@ Rules from api.md and the task:
 | `RosterUpdated` | `server-updated`, `members-updated`, DM online states; holders re-queried for parked downloads. The refresh is skipped when nothing the UI shows changed (`RosterSig`: online users, voice room, muted, deafened, sharing, host; not RTT buckets, addresses or revisions); a changed address still re-queries parked downloads |
 | `ConnectionChanged` | `server-updated`, `members-updated`; on a new state or host also DM online states, a fresh roster comparison and (as member) the start of the server's history sync |
 | `SyncComplete` | ends the conversation's bulk window at once (one refresh plus the `snapshot`) |
+| `EventAdded` + a `MemberRemove` of someone else (not during a bulk window) | `toast` "X was removed from Y." |
+| `Removed` (I was removed) | leaves my voice room there, view invalidated, `snapshot` (`removed: true`), `toast` "You were removed from Y." |
 | `DmNameChanged` | `dm-updated`, the contact record's name, `call-updated` / `voice-updated` when they show the contact (no `snapshot`: a peer can send names often) |
 | `ConvUpdated` + `Channels` deleting my voice room | `Media::on_channels`: I leave the room ("The voice room was deleted.") |
 | `Typing` | `typing` (`channelId` null for DMs), never for my own typing |

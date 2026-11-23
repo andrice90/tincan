@@ -627,6 +627,10 @@ impl Session {
         match cmd {
             SessionCmd::Incoming { conn, send, reader, first } => self.on_incoming(conn, send, reader, first),
             SessionCmd::Publish { body, reply } => {
+                if self.ctx.removed_handled {
+                    let _ = reply.send(Err(NetError::Rejected("You were removed from this server.".into())));
+                    return Next::Stay;
+                }
                 let deadline = Instant::now() + self.ctx.net.timings.publish_timeout;
                 self.ctx.pubs.queued.push_back(Queued { body, reply, deadline });
                 self.pump_publishes();

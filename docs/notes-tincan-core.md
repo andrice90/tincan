@@ -15,6 +15,15 @@ What the other crates need to know beyond the doc comments. Rustdoc: `cargo doc 
 - Invite fields: `max_uses == 0` means unlimited; `expires_ms == u64::MAX` means it never expires. Expiry is judged at the admit's hlc, so it is deterministic.
 - DMs: `ConvState::new_dm(a, b)`. `Message.channel` must be `state::dm_channel(&conv)` (use `build::dm_message`). Only Message and Delete bodies; you can only delete your own messages.
 
+## Removal (`Body::MemberRemove`, index 11)
+
+- Owner only, never naming the owner. The cut is `last_seq` in the removed user's seq space. `build::remove_member` and `Session::sign_own` fill it with the owner's head for that user.
+- Rule 6 (membership for the seq chain) ignores removals, so validation stays monotonic. What removals change is derived in `refresh_removals`, a least fixpoint over `Member::admit_log` and `Member::removals`. It is recomputed after every admit or removal, and only when some removal exists.
+- Read it through `is_member` (false while a removal is uncleared), `is_removed`, `event_valid(author, seq)` (void events are hidden), `active_removal`, `invite_status` (an invite created at a void seq is Revoked), `Member::name` (latest valid Profile) and `state::valid_under` (for code that keeps a copy of the removals).
+- `removal_of(ev, me)` checks a removal heard straight from a host: owner-signed, names me, not cleared by an admit I hold.
+- `verify_join_request` refuses (Busy) a removed joiner whose profile seq is not past the cut, when the host is behind on their events.
+- New `Member` fields: `admit_log`, `removals`, `profiles`. New `InviteState` field: `created_seq`. A duplicate admit is still a no-op for membership, but it is recorded in `admit_log`.
+
 ## Startup rebuild (store + net)
 
 - `ConvState::rebuild` needs EVERY stored event of the conversation. For each `(author, head)` in `Storage::heads(conv)`, call `events_range(conv, author, 1, head)`.
