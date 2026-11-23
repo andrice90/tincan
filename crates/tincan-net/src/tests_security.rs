@@ -263,7 +263,7 @@ async fn n9_refused_publish_never_reuses_its_seq() {
     *a.net.inner().test.refuse_publish.lock() = Some(format!("\u{1b}[31mACCOUNT LOCKED\u{7}{}", "!".repeat(5000)));
     let first = say(&b, server, "first").await;
     let text = match first {
-        Err(NetError::Rejected(t)) => t,
+        Err(NetError::RejectedByPeer(t)) => t,
         other => panic!("expected a refusal, got {other:?}"),
     };
     assert!(text.chars().count() <= 200 && !text.chars().any(char::is_control), "{text:?}");

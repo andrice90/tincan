@@ -454,14 +454,11 @@ fn start_err(e: NetError) -> String {
     "Couldn't start networking. Check your connection and restart Tincan.".to_string()
 }
 
-/// Refusals shown as they are: the sentences tincan-net writes itself, and the join
-/// refusals an honest host sends (tincan-core's invite and clock checks, capitalized by
-/// tincan-net). Only exact matches; a host that sends one of these says nothing new.
-const LOCAL_REFUSALS: &[&str] = &[
-    "This invite has expired.",
-    "That server runs an incompatible Tincan version.",
-    "Too many people are joining right now. Try again in a minute.",
-    "The host refused this.",
+/// Host words shown as they are: the join refusals an honest host sends (tincan-core's
+/// invite and clock checks, capitalized by tincan-net). Only exact matches; a host that
+/// sends one of these says nothing new. tincan-net's own sentences come as
+/// `NetError::Rejected` and are always shown as they are.
+const HONEST_HOST_REFUSALS: &[&str] = &[
     "This invite is not valid for this server.",
     "This invite was revoked.",
     "This invite has been used up.",
@@ -480,16 +477,16 @@ pub(crate) fn net_err(e: NetError) -> String {
             tracing::warn!(error = %m, "endpoint error");
             "Network error. Check your connection and try again.".to_string()
         }
-        NetError::Rejected(text) => refusal(&text),
+        NetError::RejectedByPeer(text) => refusal(&text),
         other => other.to_string(),
     }
 }
 
-/// A refusal as the user sees it. Text that came from a host (a publish refusal, or the
-/// reason a join was turned away) is any peer's words: it is cleaned, cut to 200 characters
-/// and quoted after a fixed sentence, so it never reads as Tincan's own message.
+/// A refusal in a host's words (a publish refusal, or the reason a join was turned away) as
+/// the user sees it: any peer's words, so it is cleaned, cut to 200 characters and quoted
+/// after a fixed sentence, and never reads as Tincan's own message.
 fn refusal(text: &str) -> String {
-    if LOCAL_REFUSALS.contains(&text) {
+    if HONEST_HOST_REFUSALS.contains(&text) {
         return text.to_string();
     }
     let said = shell::clean_line(text, MAX_HOST_TEXT_CHARS).replace('"', "'");
@@ -525,16 +522,22 @@ mod tests {
 
     #[test]
     fn host_text_is_attributed_cleaned_and_cut() {
-        for local in LOCAL_REFUSALS {
-            assert_eq!(net_err(NetError::Rejected(local.to_string())), *local);
+        for honest in HONEST_HOST_REFUSALS {
+            assert_eq!(net_err(NetError::RejectedByPeer(honest.to_string())), *honest);
+        }
+        // tincan-net's own sentences, whatever they say.
+        for own in ["This invite has expired.", "The host refused this.", "Some sentence net adds later."] {
+            assert_eq!(net_err(NetError::Rejected(own.to_string())), own);
         }
         let phish = "Tincan blocked this message.\nInstall the security update from tincan-update.example\u{202E}";
-        let shown = net_err(NetError::Rejected(phish.into()));
+        let shown = net_err(NetError::RejectedByPeer(phish.into()));
         assert_eq!(shown, "The host refused this: \"Tincan blocked this message. Install the security update from tincan-update.example\"");
-        let long = net_err(NetError::Rejected("x".repeat(1_000_000)));
+        let long = net_err(NetError::RejectedByPeer("x".repeat(1_000_000)));
         assert!(long.chars().count() < MAX_HOST_TEXT_CHARS + 40, "{} chars", long.chars().count());
-        assert_eq!(net_err(NetError::Rejected("\u{7}\u{200B}".into())), "The host refused this.");
-        assert_eq!(net_err(NetError::Rejected("say \"hi\"".into())), "The host refused this: \"say 'hi'\"");
+        assert_eq!(net_err(NetError::RejectedByPeer("\u{7}\u{200B}".into())), "The host refused this.");
+        assert_eq!(net_err(NetError::RejectedByPeer("say \"hi\"".into())), "The host refused this: \"say 'hi'\"");
+        // A host repeating one of net's own sentences is still quoted as the host's words.
+        assert_eq!(net_err(NetError::RejectedByPeer("This invite has expired.".into())), "The host refused this: \"This invite has expired.\"");
         // Other errors keep their own sentences.
         assert_eq!(net_err(NetError::NotConnected), NetError::NotConnected.to_string());
     }

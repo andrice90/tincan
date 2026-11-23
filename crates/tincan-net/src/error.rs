@@ -11,9 +11,15 @@ pub enum NetError {
     /// A tincan-core failure (encoding, signing, storage, validation).
     #[error("{0}")]
     Core(#[from] CoreError),
-    /// The peer or host turned the request away; the text says why.
+    /// The peer or host turned the request away; the text is tincan-net's own sentence and
+    /// says why.
     #[error("{0}")]
     Rejected(String),
+    /// The host turned the request away in its own words (why it refused a publish or a
+    /// join). Cleaned of control characters and at most 200 characters, but still text from
+    /// a peer: show it as the host's words, never as Tincan's own sentence.
+    #[error("{0}")]
+    RejectedByPeer(String),
     /// Nobody could be reached; the text says what to do.
     #[error("{0}")]
     Unreachable(String),

@@ -269,6 +269,15 @@ fn refusal_text(reason: &str) -> String {
     if clean.trim().is_empty() { "The host refused this.".to_string() } else { crate::error::capitalize(&clean) }
 }
 
+/// The error for a refusal: the host's words when it gave some, else my own sentence.
+fn refusal(reason: &str) -> NetError {
+    if wire::sanitize_text(reason, MAX_REFUSAL_CHARS).trim().is_empty() {
+        NetError::Rejected(refusal_text(reason))
+    } else {
+        NetError::RejectedByPeer(refusal_text(reason))
+    }
+}
+
 fn on_ack(s: &mut Session, id: tincan_core::EventId, ok: bool, reason: String) {
     let matches = s.ctx.pubs.inflight.as_ref().is_some_and(|i| i.event.id == id);
     if !matches {
@@ -316,7 +325,7 @@ fn refused(s: &mut Session, reason: String) {
             let Some(inf) = s.ctx.pubs.inflight.take() else { return };
             s.ctx.replica.lock().release_own_seq(s.ctx.net.storage.as_ref(), inf.event.event.seq);
             if let Some(r) = inf.reply {
-                let _ = r.send(Err(NetError::Rejected(refusal_text(&reason))));
+                let _ = r.send(Err(refusal(&reason)));
             }
         }
         Verdict::Stale => {
@@ -324,7 +333,7 @@ fn refused(s: &mut Session, reason: String) {
             let Some(inf) = s.ctx.pubs.inflight.take() else { return };
             let stored = matches!(s.ctx.net.storage.event(&inf.event.id), Ok(Some(_)));
             if let Some(r) = inf.reply {
-                let _ = r.send(if stored { Ok(inf.event) } else { Err(NetError::Rejected(refusal_text(&reason))) });
+                let _ = r.send(if stored { Ok(inf.event) } else { Err(refusal(&reason)) });
             }
         }
         _ => {
@@ -333,7 +342,7 @@ fn refused(s: &mut Session, reason: String) {
             inf.retry_at = Some(retry);
             inf.gap_retries = 0;
             if let Some(r) = inf.reply.take() {
-                let _ = r.send(Err(NetError::Rejected(refusal_text(&reason))));
+                let _ = r.send(Err(refusal(&reason)));
             }
         }
     }
@@ -454,5 +463,7 @@ mod tests {
         assert!(t.chars().count() <= MAX_REFUSAL_CHARS);
         assert!(!t.chars().any(char::is_control));
         assert_eq!(refusal_text("\u{7}\u{8}"), "The host refused this.");
+        assert!(matches!(refusal("\u{7}"), NetError::Rejected(_)), "no words of the host: my own sentence");
+        assert!(matches!(refusal("busy"), NetError::RejectedByPeer(t) if t == "Busy."));
     }
 }

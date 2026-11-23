@@ -569,7 +569,7 @@ async fn invite_rejections() {
     let mut forged = good.clone();
     forged.invite_seed = [0xAA; 16];
     match within("forged join", Duration::from_secs(15), b.net.join(&forged.encode())).await {
-        Err(NetError::Rejected(m)) => assert!(m.to_lowercase().contains("not valid"), "{m}"),
+        Err(NetError::RejectedByPeer(m)) => assert!(m.to_lowercase().contains("not valid"), "{m}"),
         other => panic!("expected rejection, got {other:?}"),
     }
 

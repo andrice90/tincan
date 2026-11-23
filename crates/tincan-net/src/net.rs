@@ -770,7 +770,8 @@ async fn join_dial(inner: &Arc<Inner>, invite: &Invite, name: &str, seq: u64, hl
                 link::close_conn(&d.conn, tincan_core::CLOSE_NORMAL, "rejected");
                 let err = match code {
                     RejectCode::InviteExpired => Some(NetError::Rejected("This invite has expired.".into())),
-                    RejectCode::BadInvite => Some(NetError::Rejected(capitalize(&reason))),
+                    // The host's words (tincan-core's invite checks on an honest host).
+                    RejectCode::BadInvite => Some(NetError::RejectedByPeer(capitalize(&tincan_core::wire::sanitize_text(&reason, 200)))),
                     RejectCode::Version => Some(NetError::Rejected("That server runs an incompatible Tincan version.".into())),
                     RejectCode::Busy => Some(NetError::Rejected("Too many people are joining right now. Try again in a minute.".into())),
                     RejectCode::NotMember | RejectCode::NotHost | RejectCode::Internal => None,
