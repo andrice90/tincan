@@ -4,8 +4,9 @@
 //
 // URL flags: `?fresh` starts at the name picker with no servers, `?noenc`
 // makes screen sharing fail with "no-hardware-encoder", `?ring` rings an
-// incoming call shortly after start. `window.tincanMock` has helpers for the
-// console: ring(), online(name), offline(name), migrate(), toast(text).
+// incoming call shortly after start, `?noanswer` leaves outgoing calls ringing.
+// `window.tincanMock` has helpers for the console: ring(), online(name),
+// offline(name), migrate(), toast(text), state().
 
 import type { Backend } from "./client";
 import type {
@@ -74,6 +75,7 @@ const params = new URLSearchParams(typeof location === "undefined" ? "" : locati
 const FLAG_FRESH = params.has("fresh");
 const FLAG_NOENC = params.has("noenc");
 const FLAG_RING = params.has("ring");
+const FLAG_NOANSWER = params.has("noanswer");
 
 // ------------------------------------------------------------------ people
 
@@ -144,6 +146,8 @@ const st = {
   mutedBeforeDeafen: false,
   /** Screen tracks of people currently sharing, by user. */
   screenTracks: new Map<UserId, number>(),
+  /** Per-user playback volumes (0..2), as saved by set_user_volume. Jordan starts quieter. */
+  volumes: new Map<UserId, number>([[people.jordan.id, 0.3]]),
   heardDemoDone: false,
 };
 
@@ -435,7 +439,7 @@ function seed(): void {
       name: "Book club",
       ownerId: people.riley.id,
       isOwner: false,
-      connection: { state: "hosting", hostId: people.sam.id, hostName: "Sam", path: "direct", rttMs: 31 },
+      connection: { state: "hosting", hostId: people.sam.id, hostName: "Sam", path: "none", rttMs: null },
       unread: true,
       onlineCount: 2,
     },
@@ -576,6 +580,7 @@ function participantOf(m: { userId: UserId; name: string; muted: boolean; deafen
     deafened: m.deafened,
     speaking: m.speaking,
     screenTrack: st.screenTracks.get(m.userId) ?? null,
+    volume: m.userId === st.me?.userId ? 1 : (st.volumes.get(m.userId) ?? 1),
   };
 }
 
@@ -1059,7 +1064,8 @@ const handlers: Handlers = {
   messages: ({ convId, channelId, before, limit }) => {
     const list = st.messages.get(convKey(convId, channelId)) ?? [];
     const end = before === null ? list.length : Math.max(0, Number.parseInt(before, 10) || 0);
-    const start = Math.max(0, end - Math.max(1, limit));
+    // the app clamps the page size to 1..200
+    const start = Math.max(0, end - Math.min(200, Math.max(1, limit)));
     return { messages: list.slice(start, end), cursor: start > 0 ? String(start) : null };
   },
 
@@ -1258,12 +1264,21 @@ const handlers: Handlers = {
     const call: CallInfo = { callId: freshHex(), userId: p.id, name: p.name, state: "ringing-out" };
     st.call = call;
     emit("call-updated", call);
-    setTimeout(() => {
-      if (st.call?.callId !== call.callId) return;
-      st.call = { ...call, state: "active" };
-      emit("call-updated", st.call);
-      startCallVoice(dm);
-    }, 2500);
+    setTimeout(
+      () => {
+        if (st.call?.callId !== call.callId) return;
+        if (FLAG_NOANSWER) {
+          st.call = null;
+          emit("call-updated", null);
+          toast("info", `${p.name} didn't answer.`);
+          return;
+        }
+        st.call = { ...call, state: "active" };
+        emit("call-updated", st.call);
+        startCallVoice(dm);
+      },
+      FLAG_NOANSWER ? 45_000 : 2500,
+    );
     return call;
   },
 
@@ -1308,8 +1323,10 @@ const handlers: Handlers = {
     return null;
   },
 
-  set_user_volume: ({ volume }) => {
+  set_user_volume: ({ userId, volume }) => {
     if (!(volume >= 0 && volume <= 2)) fail("Volume must be between 0% and 200%.");
+    st.volumes.set(userId, volume);
+    if (st.voice) voiceChanged();
     return null;
   },
 
@@ -1351,8 +1368,8 @@ const handlers: Handlers = {
 
   clip_add: async ({ path, name }) => {
     const n = name.trim() || stripExtension(baseName(path));
-    if (!/\.(mp3|wav|ogg|flac|m4a|opus)$/i.test(path)) {
-      fail("That file isn't a sound. Pick an MP3, WAV, OGG or FLAC file.");
+    if (!/\.(mp3|wav|ogg|flac|m4a)$/i.test(path)) {
+      fail(`${baseName(path)} isn't a sound Tincan can play. Pick an MP3, WAV, OGG, FLAC or M4A file.`);
     }
     await sleep(400);
     const hash = hexId(`clip:${path}:${Date.now()}`);
@@ -1398,7 +1415,14 @@ const handlers: Handlers = {
   settings_set: ({ settings }) => {
     const relay = settings.customRelayUrl?.trim() ?? "";
     if (relay && !/^https?:\/\/[^\s/]+/.test(relay)) fail("Enter a relay URL that starts with https://");
-    st.settings = { ...settings, customRelayUrl: relay || null };
+    const vol = (v: number) => (Number.isFinite(v) ? Math.min(2, Math.max(0, v)) : 1);
+    st.settings = {
+      ...settings,
+      inputVolume: vol(settings.inputVolume),
+      outputVolume: vol(settings.outputVolume),
+      autoFetchLimit: Math.min(25 * MB, Math.max(0, Math.floor(settings.autoFetchLimit))),
+      customRelayUrl: relay || null,
+    };
     return st.settings;
   },
 
@@ -1432,15 +1456,22 @@ const handlers: Handlers = {
 
 // ------------------------------------------------------------------ backend
 
+/** Extra latency per command, set with tincanMock.delay(): before it runs, or after (`reply`). */
+const delays = new Map<string, number>();
+const replyDelays = new Map<string, number>();
+
 /** The mock backend used outside Tauri. */
 export const mockBackend: Backend = {
   async invoke(name, args) {
     const h = (handlers as Record<string, ((a: unknown) => unknown) | undefined>)[name];
     if (!h) throw `Unknown command ${name}`;
-    await sleep(15);
+    await sleep(15 + (delays.get(name) ?? 0));
     try {
       const result = await h(structuredClone(args ?? {}));
-      return result === undefined ? null : structuredClone(result);
+      const copy = result === undefined ? null : structuredClone(result);
+      // the command ran; its result reaches the UI later (events sent meanwhile arrive first)
+      if (replyDelays.has(name)) await sleep(replyDelays.get(name) ?? 0);
+      return copy;
     } catch (err) {
       // Tauri rejects with the command's error string, so do the same.
       throw err instanceof CmdError ? err.message : String(err);
@@ -1490,6 +1521,22 @@ declare global {
       offline(name: string): void;
       migrate(): void;
       toast(text: string): void;
+      /** What the mock backend thinks, for scripted checks. */
+      state(): { voice: VoiceSession | null; call: CallInfo | null };
+      /** Adds an online member named `name` to a server (default Game night), for name clashes. */
+      addMember(name: string, server?: string): void;
+      /** Plays `count` different clips nobody owns into my voice session. */
+      soundFlood(count: number): void;
+      /** Emits a snapshot, as the app does after a lag or a bulk catch-up. */
+      snapshot(): void;
+      /** Adds extra latency to one command (0 to clear), before it runs or, with `reply`, after. */
+      delay(command: string, ms: number, reply?: boolean): void;
+      /** Someone posts a message in a Game night channel. */
+      post(name: string, text: string, channel?: string): void;
+      /** Someone types once in a Game night channel. */
+      typing(name: string, channel?: string): void;
+      /** Finishes a file download without sending transfer-updated (a dropped event). */
+      finishQuietly(fileName: string): void;
     };
   }
 }
@@ -1512,6 +1559,68 @@ if (typeof window !== "undefined") {
       toast("info", "Morgan is now hosting Game night");
     },
     toast: (text) => toast("info", text),
+    state: () => structuredClone({ voice: st.voice, call: st.call }),
+    addMember: (name, serverName = "Game night") => {
+      const s = st.servers.find((x) => x.summary.name === serverName);
+      if (!s) return;
+      const p: Person = { id: userId(`extra:${name}:${idCounter++}`), name, online: true };
+      allPeople.push(p);
+      s.members.push(member(p));
+      refreshOnline(s);
+      emitMembers(s);
+      emit("server-updated", s.summary);
+    },
+    snapshot: () => emit("snapshot", snapshot()),
+    delay: (command, ms, reply = false) => {
+      const map = reply ? replyDelays : delays;
+      if (ms > 0) map.set(command, ms);
+      else map.delete(command);
+    },
+    post: (name, text, channelName = "general") => {
+      const s = st.servers.find((x) => x.summary.name === "Game night");
+      const ch = s?.channels.find((c) => c.name === channelName);
+      const p = allPeople.find((x) => x.name.toLowerCase() === name.toLowerCase());
+      if (!s || !ch || !p) return;
+      const msg: Message = {
+        id: freshHex(),
+        convId: s.summary.id,
+        channelId: ch.id,
+        authorId: p.id,
+        authorName: p.name,
+        text,
+        attachments: [],
+        sentAt: Date.now(),
+        deleted: false,
+        pending: false,
+      };
+      const key = convKey(s.summary.id, ch.id);
+      const list = st.messages.get(key) ?? [];
+      list.push(msg);
+      st.messages.set(key, list);
+      emit("message-added", msg);
+    },
+    typing: (name, channelName = "general") => {
+      const s = st.servers.find((x) => x.summary.name === "Game night");
+      const ch = s?.channels.find((c) => c.name === channelName);
+      const p = allPeople.find((x) => x.name.toLowerCase() === name.toLowerCase());
+      if (!s || !ch || !p) return;
+      emit("typing", { convId: s.summary.id, channelId: ch.id, userId: p.id, name: p.name });
+    },
+    finishQuietly: (fileName) => {
+      for (const [hash, f] of st.files) {
+        if (f.name !== fileName) continue;
+        const t = st.transfers.get(hash);
+        if (t) Object.assign(t, { state: "complete", have: t.total });
+      }
+    },
+    soundFlood: (count) => {
+      const by = people.jordan;
+      for (let i = 0; i < count; i++) {
+        const hash = freshHex();
+        const clip: Clip = { hash, name: `Clip ${i + 1}`, durationMs: 500, size: 9_000, owned: false, heardFrom: by.id, transfer: null };
+        emit("sound-played", { userId: by.id, name: by.name, clip });
+      }
+    },
   };
   if (FLAG_RING) setTimeout(() => ringFrom(people.alex), 1500);
   if (!FLAG_FRESH) {

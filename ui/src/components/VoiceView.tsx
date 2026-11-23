@@ -6,18 +6,20 @@ import { memo, useEffect, useState, type MouseEvent } from "react";
 import type { Channel, Member, ServerSummary, UserId, VoiceParticipant, VoiceSession } from "../api/types";
 import { ScreenView } from "../media/ScreenView";
 import { joinVoice, messageUser, setFullStage, setUserVolume, stopShare } from "../store/actions";
+import { initialVolume } from "../store/calls";
 import { useStore } from "../store/store";
-import { ICON, ICON_SM, IconButton, SpeakingAvatar } from "./common";
+import { ICON, ICON_SM, IconButton, PersonId, PersonName, SpeakingAvatar } from "./common";
 import { Popover, useMenu } from "./Menu";
 
-/** Per-user playback volume picked in this session (0..2). */
+/** Per-user playback volume picked in this session (0..2); the app's saved value seeds it. */
 const volumes = new Map<UserId, number>();
 
 function VolumePopover({ p, anchor, onClose }: { p: VoiceParticipant; anchor: NonNullable<ReturnType<typeof useMenu>["anchor"]>; onClose: () => void }) {
-  const [v, setV] = useState(() => volumes.get(p.userId) ?? 1);
+  const [v, setV] = useState(() => initialVolume(volumes.get(p.userId), p));
   const id = `vol-${p.userId}`;
   return (
     <Popover anchor={anchor} onClose={onClose} label={`${p.name} options`} className="volume-pop">
+      <PersonId userId={p.userId} />
       <label className="field-label" htmlFor={id}>
         Volume for {p.name}
       </label>
@@ -79,7 +81,9 @@ const Tile = memo(function Tile({
   const body = (
     <>
       <SpeakingAvatar userId={p.userId} name={p.name} size={small ? 40 : 64} />
-      <span className="tile-name truncate">{isMe ? `${p.name} (you)` : p.name}</span>
+      <span className="tile-name truncate">
+        <PersonName userId={p.userId} name={p.name} you={isMe} />
+      </span>
       <span className="tile-icons">
         {sharing && <Monitor size={ICON_SM} role="img" aria-label="Sharing screen" />}
         {p.deafened ? (

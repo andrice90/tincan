@@ -5,7 +5,7 @@ import { memo, useMemo } from "react";
 import type { Member, ServerId } from "../api/types";
 import { messageUser, startCall } from "../store/actions";
 import { useStore } from "../store/store";
-import { ICON_SM, SpeakingAvatar } from "./common";
+import { ICON_SM, PersonId, PersonName, SpeakingAvatar } from "./common";
 import { Menu, useMenu, type MenuItem } from "./Menu";
 
 const EMPTY: Member[] = [];
@@ -19,7 +19,9 @@ const MemberRow = memo(function MemberRow({ m, isMe, canCall }: { m: Member; isM
   const content = (
     <>
       <SpeakingAvatar userId={m.userId} name={m.name} size={32} />
-      <span className="member-name truncate">{isMe ? `${m.name} (you)` : m.name}</span>
+      <span className="member-name truncate">
+        <PersonName userId={m.userId} name={m.name} you={isMe} />
+      </span>
       {m.isHost && <span className="member-tag">Host</span>}
       {m.isOwner && <span className="member-tag">Owner</span>}
     </>
@@ -39,7 +41,20 @@ const MemberRow = memo(function MemberRow({ m, isMe, canCall }: { m: Member; isM
           {content}
         </button>
       )}
-      {menu.anchor && <Menu anchor={menu.anchor} items={items} onClose={menu.close} label={`${m.name} menu`} />}
+      {menu.anchor && (
+        <Menu
+          anchor={menu.anchor}
+          items={items}
+          onClose={menu.close}
+          label={`${m.name} menu`}
+          header={
+            <>
+              <bdi className="menu-head-name truncate">{m.name}</bdi>
+              <PersonId userId={m.userId} />
+            </>
+          }
+        />
+      )}
     </li>
   );
 });

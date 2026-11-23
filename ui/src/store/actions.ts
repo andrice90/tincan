@@ -14,9 +14,15 @@ import type {
   ServerSummary,
   Settings,
   ShareMode,
+  Transfer,
   UserId,
   VoiceSession,
 } from "../api/types";
+import { leaveCommand } from "./calls";
+import { addPlayedClip } from "./clips";
+import { staleTransfers, takeTransfer } from "./transfers";
+import { typingTracker } from "./typing";
+import { MAX_PAGE, applyLive, keepOnSnapshot, mergeNewest, olderPageApplies, pageCovers, prependOlder, refreshLimit, refreshRead, refreshSpan } from "./messages";
 import {
   convKey,
   getState,
@@ -27,7 +33,6 @@ import {
   update,
   type DialogState,
   type State,
-  type TypingEntry,
   type View,
 } from "./store";
 
@@ -131,28 +136,106 @@ export function loadServer(serverId: ServerId): void {
   );
 }
 
+/**
+ * Generation of the message caches. A snapshot after the first one bumps it: pages read
+ * before it may have holes (dropped events, bulk windows), so they are not merged after it.
+ * It is part of the load keys, so a load from before a snapshot never blocks one after it.
+ */
+let cacheGen = 0;
+const msgsKey = (key: string): string => `msgs:${cacheGen}:${key}`;
+
+/** The conversation in the main area, if it is a text channel or a DM. */
+function shownConv(s: State): { convId: ConvId; channelId: ChannelId | null; key: string } | null {
+  const v = s.view;
+  if (v.kind === "server" && v.channelId) {
+    const ch = s.channels[v.serverId]?.find((c) => c.id === v.channelId);
+    return ch?.kind === "text" ? { convId: v.serverId, channelId: ch.id, key: convKey(v.serverId, ch.id) } : null;
+  }
+  if (v.kind === "dms" && v.convId) return { convId: v.convId, channelId: null, key: convKey(v.convId, null) };
+  return null;
+}
+
+function shownKey(s: State): string | null {
+  return shownConv(s)?.key ?? null;
+}
+
 /** Loads the newest page of a conversation if it isn't loaded yet. */
 export function ensureMessages(convId: ConvId, channelId: ChannelId | null): void {
   const key = convKey(convId, channelId);
   if (getState().messages[key]?.loaded) return;
+  const gen = cacheGen;
   run(
-    once(`msgs:${key}`, async () => {
+    once(msgsKey(key), async () => {
       const page = await invoke("messages", { convId, channelId, before: null, limit: PAGE_SIZE });
+      // a snapshot came in between: its own load runs under the new generation
+      if (gen !== cacheGen) return;
       update((s) => {
-        const existing = s.messages[key]?.list ?? [];
-        const ids = new Set(page.messages.map((m) => m.id));
-        const live = existing.filter((m) => !ids.has(m.id));
+        // messages that arrived while the page was in flight are merged, not lost
+        const merged = mergeNewest(page, s.messages[key]?.list ?? []);
         return {
           ...s,
-          messages: {
-            ...s.messages,
-            [key]: { list: [...page.messages, ...live], cursor: page.cursor, loaded: true, loadingOlder: false },
-          },
+          messages: { ...s.messages, [key]: { list: merged.list, cursor: merged.cursor, loaded: true, loadingOlder: false } },
         };
       });
     }),
   );
 }
+
+/** Older pages read past the newest one when re-reading a long cache after a snapshot. */
+const REFRESH_EXTRA_PAGES = 5;
+
+/**
+ * Re-reads the cached span of the conversation on screen after a snapshot, from the newest
+ * message back to the oldest cached one, and merges it (refreshSpan). The view keeps its rows
+ * and reading position instead of being dropped and reloaded at the bottom.
+ */
+function refreshMessages(convId: ConvId, channelId: ChannelId | null): void {
+  const key = convKey(convId, channelId);
+  const gen = cacheGen;
+  let failed = false;
+  run(
+    once(msgsKey(key), async () => {
+      const cached = getState().messages[key];
+      if (!cached?.loaded) return;
+      const coverId = cached.list[0]?.id ?? null;
+      try {
+        const first = await invoke("messages", { convId, channelId, before: null, limit: refreshLimit(cached.list.length, PAGE_SIZE) });
+        let page = first;
+        for (let i = 0; i < REFRESH_EXTRA_PAGES && page.cursor !== null && !pageCovers(page, coverId); i++) {
+          if (gen !== cacheGen) return;
+          const older = await invoke("messages", { convId, channelId, before: page.cursor, limit: MAX_PAGE });
+          page = { messages: [...older.messages, ...page.messages], cursor: older.cursor };
+        }
+        if (gen !== cacheGen) return;
+        const read = refreshRead(first, page, coverId);
+        update((s) => {
+          const c = s.messages[key];
+          if (!c) return s;
+          const next = refreshSpan(c, read, coverId);
+          if (!next.loadingOlder) olderReq.delete(key);
+          return { ...s, messages: { ...s.messages, [key]: next } };
+        });
+      } catch (err) {
+        failed = true;
+        throw err;
+      }
+    }).finally(() => {
+      if (!failed || gen !== cacheGen) return;
+      // the kept cache may have holes and could not be re-read: drop it like any other
+      update((s) => {
+        if (!s.messages[key]) return s;
+        const messages = { ...s.messages };
+        delete messages[key];
+        return { ...s, messages };
+      });
+      if (shownKey(getState()) === key) ensureMessages(convId, channelId);
+    }),
+  );
+}
+
+/** The loadOlder call that set a conversation's loadingOlder flag, by cache key. */
+const olderReq = new Map<string, number>();
+let olderSeq = 0;
 
 /** Loads the next older page. Resolves when done (or immediately if nothing to load). */
 export async function loadOlder(convId: ConvId, channelId: ChannelId | null): Promise<void> {
@@ -160,53 +243,55 @@ export async function loadOlder(convId: ConvId, channelId: ChannelId | null): Pr
   const conv = getState().messages[key];
   if (!conv || conv.cursor === null || conv.loadingOlder) return;
   const before = conv.cursor;
-  const setLoading = (loadingOlder: boolean) =>
-    update((s) => {
-      const c = s.messages[key];
-      return c ? { ...s, messages: { ...s.messages, [key]: { ...c, loadingOlder } } } : s;
-    });
-  setLoading(true);
+  const gen = cacheGen;
+  const token = ++olderSeq;
+  olderReq.set(key, token);
+  update((s) => {
+    const c = s.messages[key];
+    return c ? { ...s, messages: { ...s.messages, [key]: { ...c, loadingOlder: true } } } : s;
+  });
+  /** Clears loadingOlder unless another call owns it now (after a snapshot replaced the entry). */
+  const done = (s: State): State => {
+    const c = s.messages[key];
+    if (olderReq.get(key) !== token || !c?.loadingOlder) return s;
+    return { ...s, messages: { ...s.messages, [key]: { ...c, loadingOlder: false } } };
+  };
   try {
     const page = await invoke("messages", { convId, channelId, before, limit: PAGE_SIZE });
     update((s) => {
       const c = s.messages[key];
-      if (!c) return s;
-      const ids = new Set(c.list.map((m) => m.id));
-      const older = page.messages.filter((m) => !ids.has(m.id));
-      return {
-        ...s,
-        messages: { ...s.messages, [key]: { ...c, list: [...older, ...c.list], cursor: page.cursor, loadingOlder: false } },
-      };
+      // only in front of the entry it was asked for: a deep page landing on a reloaded
+      // newest page, or one read before a snapshot, would leave a hole
+      if (!c || !olderPageApplies(c, before, gen === cacheGen)) return done(s);
+      return { ...s, messages: { ...s.messages, [key]: prependOlder(c, page) } };
     });
   } catch (err) {
-    setLoading(false);
+    update(done);
     pushToast("error", errorText(err));
+  } finally {
+    if (olderReq.get(key) === token) olderReq.delete(key);
   }
 }
 
 function putMessage(m: Message): void {
   const key = convKey(m.convId, m.channelId);
+  const loading = inflight.has(msgsKey(key));
   update((s) => {
-    const c = s.messages[key];
     const typing = s.typing[key];
     const typingNext = typing?.some((t) => t.userId === m.authorId)
       ? { ...s.typing, [key]: typing.filter((t) => t.userId !== m.authorId) }
       : s.typing;
-    if (!c) return typingNext === s.typing ? s : { ...s, typing: typingNext };
-    const i = c.list.findIndex((x) => x.id === m.id);
-    let list: Message[];
-    if (i >= 0) {
-      list = c.list.slice();
-      // Delivery and deletion only move one way. A command result can arrive after the
-      // event that already moved them (a DM acked within milliseconds), so never undo them.
-      const prev = c.list[i];
-      list[i] = { ...m, pending: m.pending && prev.pending, deleted: m.deleted || prev.deleted };
-    } else {
-      list = [...c.list, m];
-      // keep display order when a late event arrives out of order
-      if (list.length > 1 && list[list.length - 2].sentAt > m.sentAt) list.sort((a, b) => a.sentAt - b.sentAt);
+    const c = s.messages[key];
+    const next = applyLive(c, m, { loading, shown: shownKey(s) === key });
+    let messages = s.messages;
+    if (next === null) {
+      messages = { ...s.messages };
+      delete messages[key];
+    } else if (next !== undefined) {
+      messages = { ...s.messages, [key]: next };
     }
-    return { ...s, typing: typingNext, messages: { ...s.messages, [key]: { ...c, list } } };
+    if (messages === s.messages && typingNext === s.typing) return s;
+    return { ...s, typing: typingNext, messages };
   });
 }
 
@@ -289,6 +374,7 @@ function afterViewChange(): void {
 
 function applySnapshot(snap: AppSnapshot): void {
   const wasReady = getState().ready;
+  if (wasReady) cacheGen++;
   seedSpeaking(snap.voice);
   update((s) => {
     const next: State = {
@@ -302,16 +388,22 @@ function applySnapshot(snap: AppSnapshot): void {
       settings: snap.settings,
       voice: snap.voice,
       call: snap.call,
-      // A snapshot can follow dropped events (the shell sends one when its event stream
-      // lagged), so cached message pages may have holes: drop them and reload on view.
-      messages: wasReady ? {} : s.messages,
     };
     if (!wasReady && snap.servers.length > 0 && s.view.kind === "home") {
       next.view = { kind: "server", serverId: snap.servers[0].id, channelId: null };
     }
     next.view = repairView(next);
+    // A snapshot can follow dropped events (the shell sends one when its event stream lagged,
+    // the app after a bulk window), so cached pages may have holes: drop them, except the
+    // conversation on screen, which is re-read below so its reading position survives.
+    if (wasReady) next.messages = keepOnSnapshot(s.messages, shownKey(next));
     return next;
   });
+  if (wasReady) {
+    const shown = shownConv(getState());
+    if (shown && getState().messages[shown.key]?.loaded) refreshMessages(shown.convId, shown.channelId);
+    resyncTransfers();
+  }
   for (const srv of snap.servers) loadServer(srv.id);
   if (!wasReady && snap.me) {
     run(invoke("clips", {}).then((clips) => patch({ clips })));
@@ -321,37 +413,16 @@ function applySnapshot(snap: AppSnapshot): void {
 
 // ------------------------------------------------------------------ init
 
-const typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const typing = typingTracker({
+  now: Date.now,
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  get: (key) => getState().typing[key],
+  set: (key, list) => update((s) => ({ ...s, typing: { ...s.typing, [key]: list } })),
+});
 
 function onTyping(e: { convId: ConvId; channelId: ChannelId | null; userId: UserId; name: string }): void {
   if (e.userId === getState().me?.userId) return;
-  const key = convKey(e.convId, e.channelId);
-  const until = Date.now() + TYPING_SHOW_MS;
-  update((s) => {
-    const list: TypingEntry[] = (s.typing[key] ?? []).filter((t) => t.userId !== e.userId);
-    return { ...s, typing: { ...s.typing, [key]: [...list, { userId: e.userId, name: e.name, until }] } };
-  });
-  const prev = typingTimers.get(key);
-  if (prev) clearTimeout(prev);
-  typingTimers.set(
-    key,
-    setTimeout(function sweep() {
-      typingTimers.delete(key);
-      const t = Date.now();
-      update((s) => {
-        const list = s.typing[key];
-        if (!list) return s;
-        const live = list.filter((x) => x.until > t);
-        if (live.length === list.length) return s;
-        return { ...s, typing: { ...s.typing, [key]: live } };
-      });
-      const rest = getState().typing[key];
-      if (rest && rest.length > 0) {
-        const next = Math.min(...rest.map((x) => x.until)) - Date.now();
-        typingTimers.set(key, setTimeout(sweep, Math.max(50, next)));
-      }
-    }, TYPING_SHOW_MS),
-  );
+  typing.typed(convKey(e.convId, e.channelId), { userId: e.userId, name: e.name, until: Date.now() + TYPING_SHOW_MS });
 }
 
 /** Wires backend events into the store and loads the first snapshot. Returns a cleanup. */
@@ -398,7 +469,10 @@ export function init(): () => void {
     listen("clips-updated", (clips) => patch({ clips })),
     listen("sound-played", ({ clip }) => {
       markPlaying(clip.hash, clip.durationMs);
-      update((s) => (s.clips.some((c) => c.hash === clip.hash) ? s : { ...s, clips: [...s.clips, clip] }));
+      update((s) => {
+        const clips = addPlayedClip(s.clips, clip);
+        return clips === s.clips ? s : { ...s, clips };
+      });
     }),
     listen("toast", ({ kind, text }) => pushToast(kind, text)),
   ];
@@ -597,6 +671,24 @@ export function sendTyping(convId: ConvId, channelId: ChannelId | null): void {
 
 // ------------------------------------------------------------------ files
 
+/** Sets a command's transfer result unless a newer transfer-updated arrived while it ran. */
+function setTransfer(hash: BlobHash, before: Transfer | undefined, t: Transfer): void {
+  if (takeTransfer(transferStore.get(hash), before, t)) transferStore.set(hash, t);
+}
+
+/** Reads every unfinished transfer again: a lag snapshot may follow a dropped final event. */
+function resyncTransfers(): void {
+  for (const hash of staleTransfers(transferStore.entries())) {
+    const before = transferStore.get(hash);
+    invoke("transfer", { hash }).then(
+      (t) => setTransfer(hash, before, t),
+      () => {
+        // best effort; the next event or a click on the card updates it
+      },
+    );
+  }
+}
+
 /** Fetches the transfer state of a blob once, if nothing is known yet. */
 export function ensureTransfer(hash: BlobHash): void {
   if (transferStore.get(hash)) return;
@@ -610,7 +702,8 @@ export function ensureTransfer(hash: BlobHash): void {
 
 /** Starts downloading a file. */
 export function downloadFile(hash: BlobHash): void {
-  run(invoke("download", { hash }).then((t) => transferStore.set(hash, t)));
+  const before = transferStore.get(hash);
+  run(invoke("download", { hash }).then((t) => setTransfer(hash, before, t)));
 }
 
 /** Opens a downloaded file with the shell. */
@@ -641,14 +734,20 @@ export function joinVoice(serverId: ServerId, channelId: ChannelId): void {
   );
 }
 
-/** Leaves the voice room or hangs up the call. */
+/** Leaves the voice room or hangs up the call. A call ringing out from a room keeps ringing. */
 export function leaveVoice(): void {
   const s = getState();
-  if (s.voice?.kind === "call" || s.call) {
-    run(invoke("call_hangup", {}).then(() => patch({ voice: null, call: null, soundboardOpen: false, fullStage: false })));
-  } else if (s.voice) {
+  const cmd = leaveCommand(s.voice, s.call);
+  if (cmd === "voice_leave") {
     run(invoke("voice_leave", {}).then(() => patch({ voice: null, soundboardOpen: false, fullStage: false })));
+  } else if (cmd === "call_hangup") {
+    run(invoke("call_hangup", {}).then(() => patch({ voice: null, call: null, soundboardOpen: false, fullStage: false })));
   }
+}
+
+/** Cancels the call that is ringing out, without leaving a voice room. */
+export function cancelCall(): void {
+  run(invoke("call_hangup", {}).then(() => patch({ call: null })));
 }
 
 function patchVoice(p: Partial<VoiceSession>): void {
@@ -686,9 +785,20 @@ export function stopShare(): void {
   run(invoke("screen_stop", {}).then(() => patchVoice({ sharing: false })));
 }
 
-/** Rings a user. */
+/**
+ * Rings a user and opens the conversation with them: the call stage (their screen share,
+ * per-user volume) lives there, also when the call was started from a member list.
+ */
 export function startCall(userId: UserId): void {
-  run(invoke("call_start", { userId }).then((call) => patch({ call })));
+  run(
+    invoke("open_dm", { userId })
+      .then((dm) => {
+        update((s) => ({ ...s, dms: upsert(s.dms, dm, (x) => x.convId === dm.convId) }));
+        openDms(dm.convId);
+        return invoke("call_start", { userId });
+      })
+      .then((call) => patch({ call })),
+  );
 }
 
 /** Accepts the incoming call. */

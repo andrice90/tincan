@@ -1,11 +1,12 @@
 // Message input: Enter sends, Shift+Enter adds a line, files attach through the picker.
 
 import { Paperclip, X } from "lucide-react";
-import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import { errorText, pickFiles } from "../api/client";
 import type { ChannelId, ConvId } from "../api/types";
+import { finishSend, type Draft } from "../lib/compose";
 import { baseName } from "../lib/format";
-import { sendMessage, sendTyping } from "../store/actions";
+import { pushToast, sendMessage, sendTyping } from "../store/actions";
 import { convKey } from "../store/store";
 import { ICON, IconButton } from "./common";
 
@@ -27,6 +28,27 @@ export function Composer({ convId, channelId, placeholder }: Props) {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const area = useRef<HTMLTextAreaElement>(null);
+  /** What the box holds right now, for the end of a send. */
+  const box = useRef<Draft>({ text, files });
+  const busy = useRef(false);
+  /** Enter was pressed during a send: send the box when it finishes. */
+  const queued = useRef(false);
+  const mounted = useRef(false);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const setBox = (d: Draft) => {
+    box.current = d;
+    setText(d.text);
+    setFiles(d.files);
+    if (d.text) drafts.set(key, d.text);
+    else drafts.delete(key);
+  };
 
   useLayoutEffect(() => {
     const el = area.current;
@@ -36,28 +58,56 @@ export function Composer({ convId, channelId, placeholder }: Props) {
   }, [text]);
 
   const change = (v: string) => {
+    box.current = { ...box.current, text: v };
     setText(v);
     drafts.set(key, v);
     setError(null);
     if (v.trim()) sendTyping(convId, channelId);
   };
 
-  const send = async () => {
-    if (sending || (!text.trim() && files.length === 0)) return;
+  // The box is emptied when the send starts, so typing during a slow send (a host ack, a
+  // file import) goes into an empty box and is never wiped. A failed send puts its text back.
+  const send = async (): Promise<void> => {
+    const sent = box.current;
+    if (!sent.text.trim() && sent.files.length === 0) return;
+    if (busy.current) {
+      queued.current = true;
+      return;
+    }
+    busy.current = true;
     setSending(true);
     setError(null);
+    setBox({ text: "", files: [] });
+    let ok = false;
     try {
-      await sendMessage(convId, channelId, text.trim(), files);
-      setText("");
-      setFiles([]);
-      drafts.delete(key);
+      await sendMessage(convId, channelId, sent.text.trim(), sent.files);
+      ok = true;
     } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setSending(false);
-      area.current?.focus();
+      queued.current = false;
+      if (mounted.current) setError(errorText(err));
+      else pushToast("error", errorText(err));
+    }
+    busy.current = false;
+    if (!mounted.current) {
+      // switched away during the send: keep a failed text as the draft
+      if (!ok) drafts.set(key, finishSend({ text: drafts.get(key) ?? "", files: [] }, sent, false).text);
+      return;
+    }
+    setBox(finishSend(box.current, sent, ok));
+    setSending(false);
+    area.current?.focus();
+    if (queued.current) {
+      queued.current = false;
+      await send();
     }
   };
+
+  const addFiles = (picked: string[]) => {
+    const cur = box.current.files;
+    setBox({ ...box.current, files: [...cur, ...picked.filter((p) => !cur.includes(p))] });
+  };
+
+  const removeFile = (p: string) => setBox({ ...box.current, files: box.current.files.filter((x) => x !== p) });
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -69,7 +119,7 @@ export function Composer({ convId, channelId, placeholder }: Props) {
   const attach = async () => {
     try {
       const picked = await pickFiles({ multiple: true });
-      if (picked.length > 0) setFiles((f) => [...f, ...picked.filter((p) => !f.includes(p))]);
+      if (picked.length > 0) addFiles(picked);
     } catch (err) {
       setError(errorText(err));
     }
@@ -96,7 +146,7 @@ export function Composer({ convId, channelId, placeholder }: Props) {
                   className="icon-btn icon-btn-sm"
                   aria-label={`Remove ${baseName(p)}`}
                   title="Remove"
-                  onClick={() => setFiles((f) => f.filter((x) => x !== p))}
+                  onClick={() => removeFile(p)}
                 >
                   <X size={14} />
                 </button>

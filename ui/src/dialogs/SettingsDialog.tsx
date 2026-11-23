@@ -8,6 +8,7 @@ import { hostLine } from "../components/ChannelSidebar";
 import { formatBytes } from "../lib/format";
 import { closeDialog, saveSettings, setName } from "../store/actions";
 import { useStore, type SettingsTab } from "../store/store";
+import { connStatus, debounced, fetchLimitOptions } from "./settingsLogic";
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: "profile", label: "Profile" },
@@ -16,8 +17,6 @@ const TABS: { id: SettingsTab; label: string }[] = [
   { id: "network", label: "Network" },
   { id: "appearance", label: "Appearance" },
 ];
-
-const MB = 1024 * 1024;
 
 function useSave(): { error: string | null; save: (change: Partial<Settings>) => void } {
   const [error, setError] = useState<string | null>(null);
@@ -175,13 +174,19 @@ function LevelMeter() {
   );
 }
 
-/** A 0..200% slider that saves shortly after the last change. */
+/** A 0..200% slider that saves shortly after the last change, and at once when it closes. */
 function VolumeSlider({ id, label, value, onCommit }: { id: string; label: string; value: number; onCommit: (v: number) => void }) {
   const [v, setV] = useState(value);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => {
-    if (timer.current) clearTimeout(timer.current);
-  }, []);
+  const commit = useRef(onCommit);
+  commit.current = onCommit;
+  const [save] = useState(() =>
+    debounced<number>((x) => commit.current(x), 250, {
+      set: (fn, ms) => setTimeout(fn, ms),
+      clear: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
+    }),
+  );
+  // closing Settings or switching tabs within the debounce must not drop the change
+  useEffect(() => () => save.flush(), [save]);
   return (
     <div className="field">
       <label className="field-label" htmlFor={id}>
@@ -198,8 +203,7 @@ function VolumeSlider({ id, label, value, onCommit }: { id: string; label: strin
           onChange={(e) => {
             const next = Number(e.target.value) / 100;
             setV(next);
-            if (timer.current) clearTimeout(timer.current);
-            timer.current = setTimeout(() => onCommit(next), 250);
+            save.push(next);
           }}
         />
         <span className="volume-value">{Math.round(v * 100)}%</span>
@@ -264,12 +268,8 @@ function VoiceTab({ settings, save }: { settings: Settings; save: (c: Partial<Se
   );
 }
 
-const FETCH_LIMITS = [0, 5 * MB, 10 * MB, 25 * MB, 50 * MB, 100 * MB];
-
 function FilesTab({ settings, save }: { settings: Settings; save: (c: Partial<Settings>) => void }) {
-  const limits = FETCH_LIMITS.includes(settings.autoFetchLimit)
-    ? FETCH_LIMITS
-    : [...FETCH_LIMITS, settings.autoFetchLimit].sort((a, b) => a - b);
+  const limits = fetchLimitOptions(settings.autoFetchLimit);
   const [error, setError] = useState<string | null>(null);
   const pick = async () => {
     setError(null);
@@ -361,15 +361,12 @@ function NetworkTab({ settings, save, saveError }: { settings: Settings; save: (
         ) : (
           <ul className="conn-list">
             {servers.map((s) => {
-              const c = s.connection;
-              const path = c.path === "direct" ? "Direct" : c.path === "relay" ? "Relayed" : null;
+              const status = connStatus(s.connection, s.onlineCount);
               return (
                 <li key={s.id} className="conn-row">
                   <span className="truncate">{s.name}</span>
-                  <span className="muted truncate">{hostLine(c, meId)}</span>
-                  <span className={c.path === "direct" ? "conn-direct" : c.path === "relay" ? "conn-relay" : "faint"}>
-                    {path ? (c.rttMs !== null ? `${path}, ${c.rttMs} ms` : path) : "No peers"}
-                  </span>
+                  <span className="muted truncate">{hostLine(s.connection, meId)}</span>
+                  <span className={status.cls}>{status.text}</span>
                 </li>
               );
             })}

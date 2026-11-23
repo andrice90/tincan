@@ -3,7 +3,8 @@
 import { memo, type ReactNode } from "react";
 import type { UserId } from "../api/types";
 import { hashIndex, initials } from "../lib/format";
-import { useSpeaking } from "../store/store";
+import { shortId } from "../lib/names";
+import { useSharesName, useSpeaking } from "../store/store";
 
 interface AvatarProps {
   userId: UserId;
@@ -32,6 +33,36 @@ export const Avatar = memo(function Avatar({ userId, name, size = 32, online, sp
 export function SpeakingAvatar(props: Omit<AvatarProps, "speaking">) {
   const speaking = useSpeaking(props.userId);
   return <Avatar {...props} speaking={speaking} />;
+}
+
+/**
+ * A peer-chosen display name, isolated so its bidi controls can't reorder the text around
+ * it, followed by the short id when someone else the UI knows uses a name that looks the
+ * same. A long name is cut short, never the id after it.
+ */
+export function PersonName({ userId, name, you = false }: { userId: UserId; name: string; you?: boolean }) {
+  return (
+    <span className="person">
+      <bdi className="person-name">{name}</bdi>
+      {you && <span className="person-you"> (you)</span>}
+      <IdSuffix userId={userId} name={name} />
+    </span>
+  );
+}
+
+/** The short id after a name that someone else also uses. */
+export function IdSuffix({ userId, name }: { userId: UserId; name: string }) {
+  const shared = useSharesName(userId, name);
+  return shared ? <bdi className="user-id">{shortId(userId)}</bdi> : null;
+}
+
+/** "ID abcd1234": the short id, shown where one person is looked at (menus, popovers). */
+export function PersonId({ userId }: { userId: UserId }) {
+  return (
+    <span className="person-id">
+      ID <bdi className="mono">{shortId(userId)}</bdi>
+    </span>
+  );
 }
 
 interface IconButtonProps {

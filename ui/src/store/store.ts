@@ -24,6 +24,7 @@ import type {
   BlobHash,
   VoiceSession,
 } from "../api/types";
+import { buildNameIndex, sharesName, type NameIndex } from "../lib/names";
 
 /** What the main area shows. */
 export type View =
@@ -168,6 +169,27 @@ export function useStore<T>(selector: (s: State) => T): T {
   );
 }
 
+let nameMemo: { members: State["members"]; dms: State["dms"]; me: State["me"]; index: NameIndex } | null = null;
+
+/**
+ * Display names of everyone the UI knows (all server members, DM contacts, me), rebuilt when
+ * those lists change.
+ */
+function nameIndex(s: State): NameIndex {
+  if (nameMemo && nameMemo.members === s.members && nameMemo.dms === s.dms && nameMemo.me === s.me) return nameMemo.index;
+  const people: { userId: UserId; name: string }[] = [];
+  for (const list of Object.values(s.members)) people.push(...list);
+  people.push(...s.dms);
+  if (s.me) people.push(s.me);
+  nameMemo = { members: s.members, dms: s.dms, me: s.me, index: buildNameIndex(people) };
+  return nameMemo.index;
+}
+
+/** True when someone else the UI knows uses the same display name as this person. */
+export function useSharesName(userId: UserId, name: string): boolean {
+  return useStore((s) => sharesName(nameIndex(s), userId, name));
+}
+
 /** Key for the messages and typing maps. */
 export function convKey(convId: ConvId, channelId: ChannelId | null): string {
   return `${convId}:${channelId ?? ""}`;
@@ -191,6 +213,11 @@ export class KeyedStore<V> {
     this.values.set(key, value);
     const w = this.watchers.get(key);
     if (w) for (const cb of w) cb();
+  }
+
+  /** Every key and value, for a resync. */
+  entries(): IterableIterator<[string, V]> {
+    return this.values.entries();
   }
 
   /** Removes `key` and wakes its watchers. */

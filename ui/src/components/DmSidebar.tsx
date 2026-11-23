@@ -4,7 +4,7 @@ import { UserPlus } from "lucide-react";
 import { useMemo } from "react";
 import { openDialog, openDms } from "../store/actions";
 import { useStore } from "../store/store";
-import { Avatar, ICON_SM, IconButton } from "./common";
+import { Avatar, ICON_SM, IconButton, PersonName } from "./common";
 
 export function DmSidebar() {
   const dms = useStore((s) => s.dms);
@@ -36,7 +36,9 @@ export function DmSidebar() {
                     onClick={() => openDms(d.convId)}
                   >
                     <Avatar userId={d.userId} name={d.name} size={32} online={d.online} />
-                    <span className="truncate">{d.name}</span>
+                    <span className="truncate">
+                      <PersonName userId={d.userId} name={d.name} />
+                    </span>
                     <span className="sr-only">
                       {d.online ? ", online" : ", offline"}
                       {unread ? ", unread messages" : ""}
