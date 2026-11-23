@@ -301,7 +301,7 @@ async fn voice_room_audio_flows_both_ways() {
 
     // A dead engine thread is replaced and the session keeps its audio.
     a.app.test_crash_audio_engine();
-    wait_for(&mut a.rx, "toast", 10, |t| t["text"] == "Audio stopped working and was restarted.").await;
+    wait_for(&mut a.rx, "toast", 10, |t| t["text"] == "Audio stopped working, so Tincan restarted it.").await;
     assert_eq!(a.app.test_media_counters()["engineRestarts"], 1);
     // The restart lit every ring off first, so this comes from the new engine decoding Bob.
     wait_for(&mut a.rx, "speaking", 10, |s| s["userId"] == b.user.as_str() && s["speaking"] == true).await;

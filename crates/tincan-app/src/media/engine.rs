@@ -278,7 +278,7 @@ impl Media {
                     engine.set_relayed(a.relayed);
                 }
                 self.counters.engine_restarts.fetch_add(1, Ordering::Relaxed);
-                core.toast(ToastKind::Error, "Audio stopped working and was restarted.");
+                core.toast(ToastKind::Error, "Audio stopped working, so Tincan restarted it.");
             }
             Err(e) => core.toast(ToastKind::Error, e),
         }

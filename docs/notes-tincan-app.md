@@ -269,7 +269,7 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
   - `DeviceError`: an error `toast`.
 - Neither `speaking` nor its changes send `members-updated` or `voice-updated`. Both DTOs read the current flags, so the UI's speaking store stays right when they are sent for other reasons.
 - **Engine death:** the engine's event sender lives only on its thread, so the forwarder seeing the channel close outside shutdown means the thread died (a panic unwound it).
-  - The app drops the dead handle, lights every speaking ring off, starts a fresh engine and, if a session is attached, calls `start_call` again with the kept `audio_out`, local track and epoch. A toast says "Audio stopped working and was restarted."
+  - The app drops the dead handle, lights every speaking ring off, starts a fresh engine and, if a session is attached, calls `start_call` again with the kept `audio_out`, local track and epoch. A toast says "Audio stopped working, so Tincan restarted it."
   - `AudioEngine::is_running` is checked too: a stopped engine is never handed out (`engine_handle`), and the next use (`ensure_engine`) replaces it at once, counts the death and restarts the session's call side, even before the forwarder saw the closed channel.
   - At most 3 restarts per 60 s; after that the toast asks to rejoin voice or restart Tincan.
   - The audio pump looks up the current engine per batch, so received packets go to the new engine.
