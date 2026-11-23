@@ -19,7 +19,7 @@ export function leaveCommand(voice: VoiceSession | null, call: CallInfo | null):
 
 /** Where the per-user volume slider starts: this session's choice, else the saved volume. */
 export function initialVolume(chosen: number | undefined, p: VoiceParticipant): number {
-  return chosen ?? p.volume ?? 1;
+  return chosen ?? p.volume;
 }
 
 /** Which parts the call panel shows. */

@@ -41,6 +41,33 @@ pub(crate) struct EngineSlot {
     deaths: VecDeque<Instant>,
 }
 
+impl EngineSlot {
+    /// Record a death at `now`; true when engines died more than [`MAX_RESTARTS`] times
+    /// within [`RESTART_WINDOW`].
+    fn note_death(&mut self, now: Instant) -> bool {
+        self.deaths.push_back(now);
+        while self.deaths.front().is_some_and(|t| now.duration_since(*t) > RESTART_WINDOW) {
+            self.deaths.pop_front();
+        }
+        self.deaths.len() > MAX_RESTARTS
+    }
+
+    /// Take out an engine whose thread stopped (it panicked), counting the death, so the
+    /// next use starts a fresh engine even before the forwarder sees the closed event
+    /// channel. Returns the dead handle (drop it off the async runtime: that joins its
+    /// thread) and whether engines keep dying.
+    pub(super) fn take_dead(&mut self, now: Instant) -> Option<(AudioEngine, bool)> {
+        if self.engine.as_ref()?.is_running() {
+            return None;
+        }
+        let give_up = self.note_death(now);
+        self.engine.take().map(|e| (e, give_up))
+    }
+
+    /// The engine, if its thread runs.
+    pub(super) fn running(&self) -> Option<AudioEngine> { self.engine.clone().filter(AudioEngine::is_running) }
+}
+
 /// Switches of the synthetic microphone used with `TestOptions::no_devices`.
 #[derive(Debug, Default)]
 pub(crate) struct TestAudio {
@@ -48,6 +75,8 @@ pub(crate) struct TestAudio {
     pub voice: AtomicBool,
     /// Panic on the next read (simulates the engine thread dying).
     pub crash: AtomicBool,
+    /// Starting call audio fails (simulates an engine that cannot start).
+    pub fail_start: AtomicBool,
 }
 
 /// 600 ms of speech-like sound, then 400 ms of silence (48 kHz samples).
@@ -136,13 +165,25 @@ pub(super) async fn decode_clip(bytes: Bytes) -> Result<Arc<ClipPcm>, DecodeErro
 }
 
 impl Media {
-    /// The running engine, if any.
-    pub(super) fn engine_handle(&self) -> Option<AudioEngine> { self.engine.lock().engine.clone() }
+    /// The running engine, if any (`None` once its thread stopped; the next
+    /// [`Media::ensure_engine`] or the forwarder replaces it).
+    pub(super) fn engine_handle(&self) -> Option<AudioEngine> { self.engine.lock().running() }
 
     /// The engine, created (with the current settings, mute state and volumes) if needed.
     /// Called with `st` locked (lock order: `st`, then the engine slot).
     pub(super) fn ensure_engine(&self, core: &Arc<Core>, st: &State) -> Result<AudioEngine, String> {
         let mut slot = self.engine.lock();
+        let replaced = match slot.take_dead(Instant::now()) {
+            Some((dead, give_up)) => {
+                tracing::error!(generation = slot.generation, "the audio engine stopped; replacing it");
+                std::thread::spawn(move || drop(dead));
+                if give_up {
+                    return Err("Audio keeps stopping. Leave voice and join again, or restart Tincan.".to_string());
+                }
+                true
+            }
+            None => false,
+        };
         if let Some(e) = &slot.engine {
             return Ok(e.clone());
         }
@@ -159,11 +200,20 @@ impl Media {
         if st.mic_test {
             engine.mic_test(true);
         }
+        // A new generation: the old forwarder's death report is ignored.
         slot.generation += 1;
         let generation = slot.generation;
         slot.engine = Some(engine.clone());
         drop(slot);
         self.apply_volumes(&engine, st);
+        if replaced && let Some(a) = &st.attached {
+            // What `engine_died` would have done for the session.
+            if let Err(e) = engine.start_call(a.local_track, a.epoch, a.audio_out.clone()) {
+                tracing::error!(error = %e, "restarting the call audio failed");
+            }
+            engine.set_relayed(a.relayed);
+            self.counters.engine_restarts.fetch_add(1, Ordering::Relaxed);
+        }
         tokio::spawn(forward(Arc::downgrade(core), events, generation));
         tracing::info!(generation, "audio engine started");
         Ok(engine)
@@ -200,12 +250,8 @@ impl Media {
             if slot.generation != generation || slot.engine.is_none() {
                 return;
             }
-            let now = Instant::now();
-            slot.deaths.push_back(now);
-            while slot.deaths.front().is_some_and(|t| now.duration_since(*t) > RESTART_WINDOW) {
-                slot.deaths.pop_front();
-            }
-            (slot.engine.take(), slot.deaths.len() > MAX_RESTARTS)
+            let give_up = slot.note_death(Instant::now());
+            (slot.engine.take(), give_up)
         };
         tracing::error!(generation, "the audio engine stopped unexpectedly");
         // The dead thread already exited; dropping the handle only joins it.
@@ -241,6 +287,9 @@ impl Media {
     /// Start the engine's call side for a session. Retries once on a fresh engine if the
     /// current one turned out to be dead.
     pub(super) fn start_engine_call(&self, core: &Arc<Core>, st: &State, track: u16, epoch: u8, out: &mpsc::Sender<Bytes>) -> Result<(), String> {
+        if self.test.fail_start.load(Ordering::Acquire) {
+            return Err("Couldn't start audio. Try again.".to_string());
+        }
         let engine = self.ensure_engine(core, st)?;
         match engine.start_call(track, epoch, out.clone()) {
             Ok(()) => Ok(()),
@@ -395,6 +444,37 @@ mod tests {
             assert!(out.iter().all(|s| s.is_finite()), "decoder output stays finite");
         }
         assert_eq!(panics, 0, "the Opus decoder panicked on malformed input");
+    }
+
+    /// Q7: an engine whose thread died is noticed through `is_running`, without waiting for
+    /// its event channel: the slot hands it out for replacement and counts the death.
+    #[test]
+    fn a_dead_engine_is_taken_out_of_the_slot() {
+        let (engine, _events) = AudioEngine::new(AudioConfig::default()).unwrap();
+        let ctl = Arc::new(TestAudio::default());
+        engine.set_io(AudioIo::Custom { source: Box::new(TestSource { pos: 0, ctl: ctl.clone() }), sink: Box::new(NullSink) });
+        let mut slot = EngineSlot { engine: Some(engine.clone()), ..EngineSlot::default() };
+        assert!(slot.take_dead(Instant::now()).is_none(), "a running engine stays");
+        assert!(slot.running().is_some());
+        ctl.crash.store(true, Ordering::Release);
+        engine.mic_test(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.is_running() {
+            assert!(Instant::now() < deadline, "the engine thread did not stop");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(slot.running().is_none(), "a stopped engine is not handed out");
+        let (dead, give_up) = slot.take_dead(Instant::now()).expect("the dead engine is taken out");
+        assert!(!give_up);
+        assert!(slot.engine.is_none());
+        assert_eq!(slot.deaths.len(), 1);
+        drop(dead);
+        // Past MAX_RESTARTS deaths in the window, the slot says to give up.
+        let now = Instant::now();
+        for _ in 0..MAX_RESTARTS {
+            slot.note_death(now);
+        }
+        assert!(slot.note_death(now));
     }
 
     /// Malformed Opus payloads from a peer must not kill the engine thread.

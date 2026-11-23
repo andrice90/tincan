@@ -90,9 +90,6 @@ impl RoomMap {
     fn short_of(&self, user: &UserId) -> Option<u16> { self.short.iter().find(|(_, u)| *u == user).map(|(s, _)| *s) }
 }
 
-/// The peer's short id in a call: the lower user id takes 0 (notes-tincan-net.md).
-pub(super) fn call_peer_short(me: &UserId, peer: &UserId) -> u16 { if peer < me { 0 } else { 1 } }
-
 /// Is the roster of a server in this state current?
 fn roster_current(s: ConnState) -> bool { matches!(s, ConnState::Member | ConnState::Hosting | ConnState::Solo) }
 
@@ -160,6 +157,19 @@ fn save_volumes(core: &Core, volumes: &HashMap<UserId, f32>) {
     }
 }
 
+/// How loud `user` plays for me (0..2), as the UI's volume slider shows it.
+fn volume_of(st: &State, user: &UserId) -> f64 {
+    let v = f64::from(st.volumes.get(user).copied().unwrap_or(1.0));
+    (v * 1000.0).round() / 1000.0
+}
+
+/// Hang up a call whose audio could not start (Net already answered or connected it), so
+/// neither side is left in a silent call that nothing in the UI can end.
+fn hang_up_unattached(core: &Arc<Core>) {
+    let core = core.clone();
+    tokio::spawn(async move { core.net.call_hangup().await });
+}
+
 impl Media {
     /// Mark a session-changing command as in flight.
     pub(super) fn begin_switch(&self) -> Switching<'_> {
@@ -206,6 +216,7 @@ impl Media {
             st.heard.clear();
             self.emit_clips_locked(core, st);
         }
+        st.sound_seen.clear();
         st.pcm.clear();
         st.room = RoomMap::default();
         core.files.set_upload_limit(None);
@@ -218,9 +229,14 @@ impl Media {
         if self.is_closed() {
             return;
         }
+        // Read the network's session only while `st` is held: a command that finished its
+        // switch before we got the lock already sees its new room in `voice_info`, and one
+        // that has not is still counted in `switching`. Read before the lock, a stale `None`
+        // from the middle of `Net::voice_join` would detach the room it just joined.
+        // (Net never calls into Media, and voice_dto already reads Net under `st`.)
+        let mut st = self.st.lock();
         let info = core.net.voice_info();
         let call = core.net.call_info();
-        let mut st = self.st.lock();
         if st.switching == 0 {
             let stale = st.attached.as_ref().is_some_and(|a| match a.kind {
                 Kind::Room { server, channel } => !info.as_ref().is_some_and(|i| i.conv == server && i.channel == Some(channel)),
@@ -236,6 +252,8 @@ impl Media {
                             && let Err(e) = self.attach_locked(core, &mut st, p.session, Kind::Call { peer })
                         {
                             core.toast(ToastKind::Error, e);
+                            // `st` is held here: hang up from a task.
+                            hang_up_unattached(core);
                         }
                     }
                     Some(c) if c.peer == peer && c.state == CallState::RingingOut => {}
@@ -291,7 +309,8 @@ impl Media {
                 }
             }
             Kind::Call { peer } => {
-                next.short.insert(call_peer_short(&core.me, &peer), peer);
+                // The peer's voice packets carry track_id(call_short_id(peer, me), ..).
+                next.short.insert(tincan_net::call_short_id(&peer, &core.me), peer);
                 next.users.insert(peer);
             }
         }
@@ -379,6 +398,9 @@ impl Media {
         let info = core.net.voice_info().filter(|i| i.conv == a.conv);
         let connected = info.as_ref().is_some_and(|i| i.connected);
         let my_share = info.as_ref().and_then(|i| i.sharing);
+        // To the host in a room (None while I host it), to the peer in a call. Net updates
+        // it about once a second and reports only real moves, so it does not churn the DTO.
+        let rtt_ms = info.as_ref().filter(|i| i.connected).and_then(|i| i.rtt_ms);
         // `Connection.path` is None while hosting; the session path says what media rides on.
         let path = match (connected, info.as_ref().is_some_and(|i| i.relayed)) {
             (false, _) => dto::PathKind::None,
@@ -392,6 +414,7 @@ impl Media {
             deafened: st.deafened,
             speaking: st.speaking.contains(&core.me),
             screen_track: my_share,
+            volume: 1.0,
         };
         let mut participants = vec![me];
         let session = match a.kind {
@@ -409,10 +432,10 @@ impl Media {
                             deafened: e.deafened,
                             speaking: st.speaking.contains(&e.user),
                             screen_track: e.sharing,
+                            volume: volume_of(st, &e.user),
                         });
                     }
                 }
-                let rtt_ms = (connected && conn.state == ConnState::Member).then_some(conn.rtt_ms).flatten();
                 // A member's path comes from the connection when it knows one.
                 let path = if connected && conn.state == ConnState::Member && path_kind(conn.path) != dto::PathKind::None {
                     path_kind(conn.path)
@@ -441,6 +464,7 @@ impl Media {
                     deafened: call.as_ref().is_some_and(|c| c.peer_deafened),
                     speaking: st.speaking.contains(&peer),
                     screen_track: call.as_ref().and_then(|c| c.peer_sharing),
+                    volume: volume_of(st, &peer),
                 });
                 dto::VoiceSession {
                     kind: dto::VoiceKind::Call,
@@ -452,7 +476,7 @@ impl Media {
                     deafened: st.deafened,
                     sharing: my_share.is_some(),
                     path,
-                    rtt_ms: None,
+                    rtt_ms,
                 }
             }
         };
@@ -595,12 +619,47 @@ impl Media {
     /// `voice_leave` (also hangs up an active call, like `Net::voice_leave`).
     pub(super) async fn voice_leave(&self, core: &Arc<Core>) {
         let _ops = self.ops.lock().await;
+        self.leave_now(core).await;
+    }
+
+    /// Leave the room or call, with `ops` held.
+    async fn leave_now(&self, core: &Arc<Core>) {
         core.net.voice_leave().await;
         {
             let mut st = self.st.lock();
             self.detach_locked(core, &mut st);
         }
         self.reconcile(core);
+    }
+
+    /// My voice room, if it is one of `server`'s and the owner deleted it.
+    fn deleted_room(&self, core: &Core, server: ServerId) -> Option<ChannelId> {
+        let channel = match self.st.lock().attached.as_ref()?.kind {
+            Kind::Room { server: s, channel } if s == server => channel,
+            _ => return None,
+        };
+        let view = core.view(&server)?;
+        view.all_channels.get(&channel).is_some_and(|c| c.deleted).then_some(channel)
+    }
+
+    /// The channels of `server` changed: if the owner deleted the voice room I am in, leave
+    /// it (the room is gone for everyone, and nobody else could see who is still talking).
+    pub(crate) fn on_channels(&self, core: &Arc<Core>, server: ServerId) {
+        if self.is_closed() || self.deleted_room(core, server).is_none() {
+            return;
+        }
+        let core = core.clone();
+        tokio::spawn(async move {
+            let media = &core.media;
+            let _ops = media.ops.lock().await;
+            // Checked again with `ops` held: a command may have switched rooms meanwhile.
+            if media.is_closed() || media.deleted_room(&core, server).is_none() {
+                return;
+            }
+            tracing::info!(server = %server.short(), "my voice room was deleted; leaving it");
+            media.leave_now(&core).await;
+            core.toast(ToastKind::Info, "The voice room was deleted.");
+        });
     }
 
     /// `call_start`: returns the ringing call; the engine starts once it is accepted.
@@ -620,7 +679,11 @@ impl Media {
                     if info.state == CallState::Active {
                         // They were ringing me: this answered their call.
                         st.pending_call = None;
-                        self.attach_locked(core, &mut st, session, Kind::Call { peer: info.peer }).map(|()| d)
+                        let attached = self.attach_locked(core, &mut st, session, Kind::Call { peer: info.peer });
+                        if attached.is_err() {
+                            hang_up_unattached(core);
+                        }
+                        attached.map(|()| d)
                     } else {
                         st.pending_call = Some(PendingCall { peer: info.peer, session });
                         Ok(d)
@@ -653,6 +716,12 @@ impl Media {
                 (Err(e), _) => Err(net_err(e)),
             }
         };
+        let in_call = self.st.lock().attached.as_ref().is_some_and(|a| matches!(a.kind, Kind::Call { .. }));
+        if out.is_err() && peer.is_some() && !in_call {
+            // Net answered but the audio could not start: end the call instead of leaving
+            // both sides in silence.
+            core.net.call_hangup().await;
+        }
         self.reconcile(core);
         out
     }
@@ -721,6 +790,8 @@ impl Media {
         if let (Some(e), Some(short)) = (self.engine_handle(), st.room.short_of(&user)) {
             e.set_track_volume(track_id(short, KIND_VOICE), v);
         }
+        // `VoiceParticipant.volume` changed.
+        self.emit_voice(core, &mut st);
         Ok(())
     }
 

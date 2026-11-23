@@ -11,6 +11,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,7 @@ use tincan_audio::{AudioError, ClipPcm};
 use tincan_core::storage::Storage;
 use tincan_core::wire::{AddrHint, ClipInfo};
 use tincan_core::{BlobHash, ConvId, UserId, now_ms};
-use tincan_files::{BlobKind, TransferInfo};
+use tincan_files::{BlobKind, FilesError, TransferInfo};
 use tincan_store::ClipRecord;
 
 use super::engine::{DecodeError, decode_clip};
@@ -36,6 +37,29 @@ const PCM_CACHE_CLIPS: usize = 4;
 const PCM_CACHE_SAMPLES: usize = 2_000_000;
 /// kv key of the pending pulls (JSON object: hash hex -> [`Fetch`]).
 const FETCHES_KEY: &str = "app/clip_fetches";
+/// A player's `SoundPlayed` announcements closer together than this are dropped (the net
+/// layer forwards them without a limit; each one costs an event and a store read).
+pub(super) const SOUND_EVERY: Duration = Duration::from_millis(250);
+/// Players remembered by the throttle before old entries are pruned.
+const SOUND_SEEN_MAX: usize = 256;
+
+/// Per-player throttle of `SoundPlayed`: true when `by`'s announcement at `now` goes
+/// through (and is remembered), false when it came within [`SOUND_EVERY`] of the last one
+/// that did.
+pub(super) fn sound_allowed(seen: &mut HashMap<UserId, Instant>, by: UserId, now: Instant) -> bool {
+    if seen.get(&by).is_some_and(|t| now.duration_since(*t) < SOUND_EVERY) {
+        return false;
+    }
+    if seen.len() >= SOUND_SEEN_MAX {
+        seen.retain(|_, t| now.duration_since(*t) < SOUND_EVERY);
+        if seen.len() >= SOUND_SEEN_MAX {
+            // Only room members can announce, so this takes a huge room; start over.
+            seen.clear();
+        }
+    }
+    seen.insert(by, now);
+    true
+}
 
 /// A clip someone played in my session.
 #[derive(Clone, Debug)]
@@ -389,8 +413,12 @@ impl Media {
             return;
         }
         let mut st = self.st.lock();
-        let Some(a) = st.attached.as_ref().filter(|a| a.conv == conv) else { return };
-        let player = match a.kind {
+        let Some(kind) = st.attached.as_ref().filter(|a| a.conv == conv).map(|a| a.kind) else { return };
+        if !sound_allowed(&mut st.sound_seen, by, Instant::now()) {
+            tracing::debug!(by = %by.short(), "dropping a sound announcement that came too soon");
+            return;
+        }
+        let player = match kind {
             Kind::Room { server, .. } => core.view(&server).map(|v| core.author_name(&v, &by)).unwrap_or_else(|| core.user_name(&by)),
             Kind::Call { .. } => core.user_name(&by),
         };
@@ -418,14 +446,39 @@ impl Media {
             save_fetches(core, &st.fetching);
         }
         if core.files.is_complete(&hash) {
-            // Already held (as an attachment): tag it as a clip, which completes the pull.
-            match core.files.read_to_bytes(hash, MAX_CLIP_BYTES).await {
-                Ok(bytes) => {
-                    if let Err(e) = core.files.import_bytes(bytes, BlobKind::Clip).await {
-                        tracing::warn!(error = %e, "tagging a held clip failed");
-                    }
+            // Already held (as an attachment, or as a clip no longer in the library): tag it
+            // as a clip and finish the pull here. A `Completed` event may follow the tag;
+            // `finish_fetch` runs once (the second sees the pull already gone).
+            let fetch = Fetch { name: heard.info.name.clone(), by: heard.by.to_z32() };
+            let tagged = match core.files.read_to_bytes(hash, MAX_CLIP_BYTES).await {
+                Ok(bytes) => core.files.import_bytes(bytes, BlobKind::Clip).await.map(|_| ()).map_err(|e| {
+                    tracing::warn!(error = %e, "tagging a held clip failed");
+                    "Couldn't save the sound. Try again.".to_string()
+                }),
+                Err(FilesError::TooLarge { size, .. }) => {
+                    // A peer announced a held attachment's hash with a small claimed size.
+                    tracing::info!(hash = %hash.short(), size, "a held blob announced as a clip is too large");
+                    self.st.lock().heard.remove(&hash);
+                    Err("That sound is larger than 5 MB, so it wasn't saved.".to_string())
                 }
-                Err(e) => tracing::warn!(error = %e, "reading a held clip failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "reading a held clip failed");
+                    Err("Couldn't save the sound. Try again.".to_string())
+                }
+            };
+            let finished = match tagged {
+                Ok(()) => self.finish_fetch(core, hash, fetch).await,
+                Err(e) => {
+                    self.forget_fetch(core, &hash);
+                    Err(e)
+                }
+            };
+            if let Err(e) = finished {
+                self.emit_clips(core);
+                return Err(e);
+            }
+            if let Some(rec) = self.owned(core, &hash) {
+                return Ok(owned_dto(&rec));
             }
         } else {
             let addr = self.addr_of(core, &heard);
@@ -487,10 +540,24 @@ impl Media {
         // Only pulls: `clip_add` imports fire this too, before their row exists.
         let Some(fetch) = self.st.lock().fetching.get(&hash).cloned() else { return };
         let core = core.clone();
-        tokio::spawn(async move { core.media.finish_fetch(&core, hash, fetch).await });
+        tokio::spawn(async move {
+            if let Err(e) = core.media.finish_fetch(&core, hash, fetch).await {
+                core.toast(ToastKind::Error, e);
+            }
+        });
     }
 
-    async fn finish_fetch(&self, core: &Arc<Core>, hash: BlobHash, fetch: Fetch) {
+    /// Drop a pending pull (persisted).
+    fn forget_fetch(&self, core: &Core, hash: &BlobHash) {
+        let mut st = self.st.lock();
+        if st.fetching.remove(hash).is_some() {
+            save_fetches(core, &st.fetching);
+        }
+    }
+
+    /// Check a pulled clip and add it to the library. Err is the notice for the user when
+    /// it was not a playable sound (already handled: the pull is forgotten).
+    async fn finish_fetch(&self, core: &Arc<Core>, hash: BlobHash, fetch: Fetch) -> Result<(), String> {
         let checked = match core.files.read_to_bytes(hash, MAX_CLIP_BYTES).await {
             Ok(bytes) => {
                 let size = bytes.len() as u64;
@@ -505,7 +572,7 @@ impl Media {
             let mut st = self.st.lock();
             if st.fetching.remove(&hash).is_none() {
                 // Removed meanwhile (clip_remove or a second completion).
-                return;
+                return Ok(());
             }
             save_fetches(core, &st.fetching);
         }
@@ -534,11 +601,14 @@ impl Media {
                 }
                 self.st.lock().heard.remove(&hash);
                 core.announce();
-                core.toast(ToastKind::Error, format!("{} couldn't be played, so it wasn't saved.", fetch.name));
+                self.announce_clips(core);
+                self.emit_clips(core);
+                return Err(format!("{} couldn't be played, so it wasn't saved.", fetch.name));
             }
         }
         self.announce_clips(core);
         self.emit_clips(core);
+        Ok(())
     }
 }
 
@@ -574,6 +644,30 @@ mod tests {
         assert!(c.get(&BlobHash([9; 32])).is_none());
         c.clear();
         assert_eq!(c.samples, 0);
+    }
+
+    /// APP-MEDIA-3: a player's announcements closer than 250 ms are dropped, other players
+    /// are not affected, and the map stays bounded.
+    #[test]
+    fn sound_announcements_are_throttled_per_player() {
+        let (a, b) = (tincan_core::keys::Identity::generate().user(), tincan_core::keys::Identity::generate().user());
+        let mut seen = HashMap::new();
+        let t0 = Instant::now();
+        assert!(sound_allowed(&mut seen, a, t0));
+        assert!(!sound_allowed(&mut seen, a, t0 + Duration::from_millis(100)), "too soon");
+        assert!(sound_allowed(&mut seen, b, t0 + Duration::from_millis(100)), "another player");
+        assert!(sound_allowed(&mut seen, a, t0 + SOUND_EVERY), "after the interval");
+        // A flood of 1000 announcements in one second lets through 4.
+        let mut through = 0;
+        let t1 = t0 + Duration::from_secs(10);
+        for i in 0..1000u64 {
+            through += u32::from(sound_allowed(&mut seen, a, t1 + Duration::from_millis(i)));
+        }
+        assert_eq!(through, 4);
+        for _ in 0..(SOUND_SEEN_MAX * 2) {
+            sound_allowed(&mut seen, tincan_core::keys::Identity::generate().user(), t1 + Duration::from_secs(5));
+        }
+        assert!(seen.len() <= SOUND_SEEN_MAX + 1, "{} remembered", seen.len());
     }
 
     #[test]

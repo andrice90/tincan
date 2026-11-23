@@ -173,6 +173,21 @@ impl App {
     #[doc(hidden)]
     pub fn test_crash_audio_engine(&self) { self.core.media.test_crash_audio() }
 
+    /// Test hook: announce in my voice session that I played a clip with this hash, name,
+    /// size and length, without holding it or checking anything, the way a modified client
+    /// could.
+    #[doc(hidden)]
+    pub async fn test_sound_played(&self, hash_hex: &str, name: &str, size: u64, duration_ms: u32) -> Result<(), String> {
+        let hash = transfers::parse_hash(hash_hex)?;
+        let clip = tincan_core::wire::ClipInfo { hash, name: name.to_string(), size, duration_ms };
+        self.core.net.sound_played(clip).await.map_err(app::net_err)
+    }
+
+    /// Test hook: starting call audio fails while `on`, as if the audio engine could not
+    /// start (voice rooms and calls refuse to attach).
+    #[doc(hidden)]
+    pub fn test_fail_audio_start(&self, on: bool) { self.core.media.test_fail_audio_start(on) }
+
     /// Test hook: allow real screen capture although `TestOptions::no_devices` is set
     /// (audio stays synthetic). For the hardware screen-share test only.
     #[doc(hidden)]

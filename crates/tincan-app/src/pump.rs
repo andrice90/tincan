@@ -437,6 +437,8 @@ impl Pump {
                 Change::Channels => {
                     core.invalidate_view(&conv);
                     self.mark(conv, Refresh { server: true, channels: true, ..Refresh::default() });
+                    // A deleted voice room takes the people in it out.
+                    core.media.on_channels(&core, conv);
                 }
                 Change::Members => {
                     core.invalidate_view(&conv);

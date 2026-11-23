@@ -18,7 +18,7 @@ use tokio::time::Instant;
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const VOICE_KEYS: &[&str] = &["kind", "convId", "channelId", "name", "participants", "muted", "deafened", "sharing", "path", "rttMs"];
-const PARTICIPANT_KEYS: &[&str] = &["userId", "name", "muted", "deafened", "speaking", "screenTrack"];
+const PARTICIPANT_KEYS: &[&str] = &["userId", "name", "muted", "deafened", "speaking", "screenTrack", "volume"];
 const CLIP_KEYS: &[&str] = &["hash", "name", "durationMs", "size", "owned", "heardFrom", "transfer"];
 const CALL_KEYS: &[&str] = &["callId", "userId", "name", "state"];
 
@@ -415,6 +415,10 @@ async fn call_rings_connects_and_hangs_up() {
     let active: [Want; 2] =
         [("call-updated", &|c| c["state"] == "active"), ("voice-updated", &|v| v["kind"] == "call" && v["path"] != "none")];
     wait_each(&mut a.rx, 20, &active).await;
+    // Q6: calls report the RTT of their connection, like rooms.
+    for n in [&a, &b] {
+        eventually("the call's RTT", 20, || async { call(&n.app, "app_snapshot", json!({})).await["voice"]["rttMs"].as_u64().map(|_| ()) }).await;
+    }
     wait_for(&mut a.rx, "speaking", 20, |s| s["userId"] == b.user.as_str() && s["speaking"] == true).await;
     wait_for(&mut b.rx, "speaking", 20, |s| s["userId"] == a.user.as_str() && s["speaking"] == true).await;
     audio_flows(&a.app, "Alice in the call").await;
@@ -435,6 +439,86 @@ async fn call_rings_connects_and_hangs_up() {
     call(&b.app, "call_decline", json!({ "callId": ring["callId"] })).await;
     wait_for(&mut a.rx, "toast", 20, |t| t["text"].as_str().is_some_and(|s| s.ends_with("declined the call."))).await;
     assert!(call(&a.app, "app_snapshot", json!({})).await["call"].is_null());
+
+    // UI-LOGIC-09: when the callee's audio can't start, accepting ends the call instead of
+    // leaving both sides in a silent call nothing in the UI can end.
+    b.app.test_fail_audio_start(true);
+    call(&a.app, "call_start", json!({ "userId": b.user })).await;
+    let ring = wait_for(&mut b.rx, "call-updated", 20, |c| c["state"] == "ringing-in").await;
+    assert_eq!(call_err(&b.app, "call_accept", json!({ "callId": ring["callId"] })).await, "Couldn't start audio. Try again.");
+    for n in [&a, &b] {
+        eventually("the unattached call ended", 15, || async {
+            let s = call(&n.app, "app_snapshot", json!({})).await;
+            (s["call"].is_null() && s["voice"].is_null()).then_some(())
+        })
+        .await;
+    }
+    b.app.test_fail_audio_start(false);
+
+    a.app.shutdown().await;
+    b.app.shutdown().await;
+}
+
+/// Deleting a voice room takes the people in it out (SPEC-GAPS-3); a held attachment
+/// announced as a clip but larger than 5 MB is refused when saved, with no pull left
+/// behind (APP-MEDIA-4); the saved per-user volume is part of the session (UI-LOGIC-13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_room_edges() {
+    let _g = SERIAL.lock().await;
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let files = tempfile::tempdir().unwrap();
+    let mut a = node(da.path(), "Alice").await;
+    let mut b = node(db.path(), "Bob").await;
+    let server = server_with(&a, &[&b], "Edges").await;
+    let general = eventually("a text channel", 20, || async {
+        let chans = call(&a.app, "channels", json!({ "serverId": server })).await;
+        chans.as_array().unwrap().iter().find(|c| c["kind"] == "text").map(|c| c["id"].as_str().unwrap().to_string())
+    })
+    .await;
+
+    // A 6 MB attachment that Bob auto-fetches.
+    let big = write(files.path(), "big.bin", &vec![7u8; 6 * 1024 * 1024]);
+    let sent = call(&a.app, "send_message", json!({ "convId": server, "channelId": general, "text": "", "attachments": [big] })).await;
+    let hash = sent["attachments"][0]["hash"].as_str().unwrap().to_string();
+    eventually("Bob holds the attachment", 60, || async {
+        (call(&b.app, "transfer", json!({ "hash": hash })).await["state"] == "complete").then_some(())
+    })
+    .await;
+
+    let room = voice_room(&a.app, &server).await;
+    call(&a.app, "voice_join", json!({ "serverId": server, "channelId": room })).await;
+    call(&b.app, "voice_join", json!({ "serverId": server, "channelId": room })).await;
+    wait_for(&mut b.rx, "voice-updated", 20, |v| participants(v).len() == 2).await;
+
+    // The volume Bob picks for Alice comes back in the session.
+    call(&b.app, "set_user_volume", json!({ "userId": a.user, "volume": 0.3 })).await;
+    let v = wait_for(&mut b.rx, "voice-updated", 10, |v| participant(v, &a.user).is_some_and(|p| p["volume"] == json!(0.3))).await;
+    assert_voice_shape(&v);
+    assert_eq!(participant(&v, &b.user).unwrap()["volume"], json!(1.0), "my own volume is 1");
+
+    // Alice announces the attachment's hash as a small clip.
+    a.app.test_sound_played(&hash, "Big", 1000, 1000).await.unwrap();
+    let heard = wait_for(&mut b.rx, "sound-played", 20, |s| s["clip"]["hash"] == hash.as_str()).await;
+    assert_eq!(heard["clip"]["owned"], false);
+    assert_eq!(call_err(&b.app, "clip_fetch", json!({ "hash": hash })).await, "That sound is larger than 5 MB, so it wasn't saved.");
+    let clips = call(&b.app, "clips", json!({})).await;
+    assert!(!clips.as_array().unwrap().iter().any(|c| c["hash"] == hash.as_str()), "{clips}");
+    // The heard tile is gone too, so Save can't be clicked again.
+    assert_eq!(call_err(&b.app, "clip_fetch", json!({ "hash": hash })).await, "That sound is no longer available.");
+
+    // The owner deletes the room: both leave it.
+    call(&a.app, "delete_channel", json!({ "serverId": server, "channelId": room })).await;
+    let left: [Want; 2] = [("voice-updated", &Value::is_null), ("toast", &|t| t["text"] == "The voice room was deleted.")];
+    wait_each(&mut b.rx, 20, &left).await;
+    wait_each(&mut a.rx, 20, &left).await;
+    for n in [&a, &b] {
+        assert!(call(&n.app, "app_snapshot", json!({})).await["voice"].is_null());
+    }
+    eventually("nobody in voice", 20, || async {
+        let m = call(&a.app, "members", json!({ "serverId": server })).await;
+        m.as_array().unwrap().iter().all(|x| x["voiceChannelId"].is_null()).then_some(())
+    })
+    .await;
 
     a.app.shutdown().await;
     b.app.shutdown().await;

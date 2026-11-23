@@ -104,6 +104,8 @@ struct State {
     share: Option<screen::ActiveShare>,
     /// Clips heard in this session.
     heard: clips::Heard,
+    /// When each player's last `SoundPlayed` went through (cleared on detach).
+    sound_seen: HashMap<UserId, std::time::Instant>,
     /// Heard clips being pulled into the library (persisted, survives a restart).
     fetching: HashMap<BlobHash, clips::Fetch>,
     /// Decoded clips (bounded, dropped on leaving voice).
@@ -389,10 +391,18 @@ impl Media {
         }
     }
 
-    /// The network event stream lagged: re-read everything.
+    /// The network event stream lagged: re-read everything (a missed channel change may
+    /// have deleted my voice room).
     pub(crate) fn on_lagged(&self, core: &Arc<Core>) {
         if !self.is_closed() {
             self.reconcile(core);
+            let server = self.st.lock().attached.as_ref().and_then(|a| match a.kind {
+                session::Kind::Room { server, .. } => Some(server),
+                session::Kind::Call { .. } => None,
+            });
+            if let Some(server) = server {
+                self.on_channels(core, server);
+            }
         }
     }
 
@@ -474,6 +484,9 @@ impl Media {
     /// thread the way a panic in the decoder would.
     pub(crate) fn test_crash_audio(&self) { self.test.crash.store(true, Ordering::Release); }
 
+    /// Test hook: starting call audio fails while `on` (an engine that cannot start).
+    pub(crate) fn test_fail_audio_start(&self, on: bool) { self.test.fail_start.store(on, Ordering::Release); }
+
     /// Test hook: allow real screen capture despite `no_devices` (audio stays null).
     pub(crate) fn test_allow_capture(&self) { self.allow_capture.store(true, Ordering::Release); }
 
@@ -484,7 +497,7 @@ impl Media {
             "audioIn": c.audio_in.load(Ordering::Relaxed),
             "videoOut": c.video_out.load(Ordering::Relaxed),
             "engineRestarts": c.engine_restarts.load(Ordering::Relaxed),
-            "engineRunning": self.engine.lock().engine.is_some(),
+            "engineRunning": self.engine.lock().running().is_some(),
         })
     }
 }

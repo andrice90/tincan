@@ -51,5 +51,5 @@ test("UI-LOGIC-13: the volume slider starts at the saved volume, not 100%", () =
   const p = { userId: "alex", name: "Alex", muted: false, deafened: false, speaking: false, screenTrack: null, volume: 0.3 };
   eq(initialVolume(undefined, p), 0.3, "saved by the app");
   eq(initialVolume(0.8, p), 0.8, "moved in this session");
-  eq(initialVolume(undefined, { ...p, volume: undefined }), 1, "app without the field");
+  eq(initialVolume(undefined, { ...p, volume: 1 }), 1, "never changed");
 });

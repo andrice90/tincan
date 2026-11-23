@@ -267,6 +267,8 @@ pub struct VoiceParticipant {
     pub speaking: bool,
     /// Screen track while sharing.
     pub screen_track: Option<u16>,
+    /// How loud they play for me (0..2, saved per user; 1 for me).
+    pub volume: f64,
 }
 
 /// `VoiceSession.kind`.
