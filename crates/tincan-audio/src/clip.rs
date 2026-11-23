@@ -14,6 +14,9 @@ pub const CLIP_RATE: u32 = 48_000;
 /// Slack on top of `max_ms` for encoder padding (MP3/AAC priming and final-frame padding).
 pub const CLIP_LENGTH_TOLERANCE_MS: u32 = 100;
 
+/// Edge ramp of a clip in samples (5 ms at 48 kHz).
+const EDGE_RAMP: usize = 240;
+
 /// A decoded clip: 48 kHz mono `f32` samples in -1..1. Wrap it in an `Arc` and reuse it for
 /// every play; the engine never copies the samples.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -22,8 +25,16 @@ pub struct ClipPcm {
 }
 
 impl ClipPcm {
-    /// Wraps 48 kHz mono samples.
-    pub fn from_samples(samples: Vec<f32>) -> Self {
+    /// Wraps 48 kHz mono samples. The first and last 5 ms are ramped, so a clip that starts
+    /// or ends mid-waveform does not click when it starts or stops.
+    pub fn from_samples(mut samples: Vec<f32>) -> Self {
+        let ramp = EDGE_RAMP.min(samples.len() / 2);
+        for i in 0..ramp {
+            let g = i as f32 / ramp as f32;
+            samples[i] *= g;
+            let j = samples.len() - 1 - i;
+            samples[j] *= g;
+        }
         Self { samples }
     }
 
@@ -126,4 +137,19 @@ pub fn decode_clip(bytes: &[u8], max_ms: u32) -> Result<ClipPcm> {
     }
     let samples = resample_clip(&mono, rate, CLIP_RATE)?;
     Ok(ClipPcm::from_samples(samples))
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    #[test]
+    fn clip_edges_are_ramped() {
+        let c = ClipPcm::from_samples(vec![0.5; 4800]);
+        let x = c.samples();
+        assert_eq!(x[0], 0.0);
+        assert!(x[x.len() - 1].abs() < 0.01);
+        assert_eq!(x[2400], 0.5);
+        assert!(x.windows(2).all(|w| (w[1] - w[0]).abs() < 0.01));
+    }
 }

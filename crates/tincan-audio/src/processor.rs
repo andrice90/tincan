@@ -28,8 +28,8 @@ pub(crate) const MAX_TRACKS: usize = 32;
 pub(crate) const MAX_VOICES: usize = 8;
 /// Gain applied to soundboard clips (in the call and locally), -3 dB.
 pub(crate) const SOUNDBOARD_GAIN: f32 = 0.7;
-/// Fade-in length after silence or concealment, to avoid clicks (5 ms).
-const FADE_IN: usize = 240;
+/// Fade-in length after silence or concealment, to avoid clicks (10 ms).
+const FADE_IN: usize = 480;
 /// Capture frames per `MicLevel` event (50 ms -> 20 events per second).
 const METER_FRAMES: u32 = 5;
 
@@ -73,7 +73,20 @@ struct RemoteTrack {
     frame: Vec<f32>,
     cursor: usize,
     silent: bool,
+    /// Peak of the last decoded frame, the yardstick for concealment output.
+    last_peak: f32,
     speaking: RemoteSpeaking,
+}
+
+/// Concealment may continue the last frame, never exceed it by much. unsafe-libopus 0.2 PLC
+/// can emit a near full-scale burst after low-level hybrid frames (room noise between words)
+/// and leave the decoder in that state: heard as a loud click on every late packet.
+fn concealment_is_sane(out: &[f32], last_peak: f32) -> bool {
+    peak(out) <= 2.0 * last_peak + 0.02
+}
+
+fn peak(x: &[f32]) -> f32 {
+    x.iter().fold(0.0, |m, v| m.max(v.abs()))
 }
 
 impl RemoteTrack {
@@ -81,30 +94,40 @@ impl RemoteTrack {
     fn next_frame(&mut self, now_ms: u64) {
         self.cursor = 0;
         match self.jb.pull(now_ms) {
-            Playout::Silence => self.silence(),
+            // A pause right after audio (the end of a talkspurt, or a lone DTX comfort-noise
+            // refresh frame): fade the decoder's continuation out instead of jumping to zero,
+            // which clicks.
+            Playout::Silence => self.fade_to_silence(),
             Playout::Decode(p) => {
                 let r = self.dec.decode(&p, &mut self.frame);
                 self.decoded(r);
             }
             Playout::Fec(p) => {
-                let r = self.dec.decode_fec(&p, &mut self.frame);
-                self.decoded(r);
+                // FEC falls back to PLC when the packet carries none: same sanity check, with
+                // room for a louder recovered frame
+                match self.dec.decode_fec(&p, &mut self.frame) {
+                    Ok(_) if peak(&self.frame) > 4.0 * self.last_peak + 0.1 => self.discard(),
+                    r => self.decoded(r),
+                }
             }
             Playout::Conceal => {
                 // concealment right after silence would only extrapolate old state
-                if self.silent || self.dec.conceal(&mut self.frame).is_err() {
+                if self.silent || !self.conceal() {
                     self.silence();
                 }
             }
-            Playout::ConcealFadeOut => {
-                if !self.silent && self.dec.conceal(&mut self.frame).is_ok() {
-                    fade_out(&mut self.frame);
-                } else {
-                    self.frame.fill(0.0);
-                }
-                self.silent = true;
-            }
+            Playout::ConcealFadeOut => self.fade_to_silence(),
         }
+    }
+
+    /// Ends audible output with one concealed frame faded to zero; zeros when already silent.
+    fn fade_to_silence(&mut self) {
+        if !self.silent && self.conceal() {
+            fade_out(&mut self.frame);
+        } else {
+            self.frame.fill(0.0);
+        }
+        self.silent = true;
     }
 
     fn decoded(&mut self, r: Result<usize>) {
@@ -113,6 +136,7 @@ impl RemoteTrack {
                 if n < FRAME_SAMPLES {
                     self.frame[n..].fill(0.0);
                 }
+                self.last_peak = peak(&self.frame);
                 if self.silent {
                     fade_in(&mut self.frame, FADE_IN);
                 }
@@ -120,11 +144,30 @@ impl RemoteTrack {
             }
             // undecodable packet: conceal instead
             Err(_) => {
-                if self.silent || self.dec.conceal(&mut self.frame).is_err() {
+                if self.silent || !self.conceal() {
                     self.silence();
                 }
             }
         }
+    }
+
+    /// Opus PLC into `self.frame`; false (decoder reset, frame zeroed) when it failed or
+    /// produced a burst instead of a continuation.
+    fn conceal(&mut self) -> bool {
+        match self.dec.conceal(&mut self.frame) {
+            Ok(_) if concealment_is_sane(&self.frame, self.last_peak) => true,
+            _ => {
+                self.discard();
+                false
+            }
+        }
+    }
+
+    /// Drops a bad frame: zeros, a fresh decoder state, and a fade-in on the next packet.
+    fn discard(&mut self) {
+        self.dec.reset();
+        self.last_peak = 0.0;
+        self.silence();
     }
 
     fn silence(&mut self) {
@@ -427,6 +470,7 @@ impl Processor {
                     frame: vec![0.0; FRAME_SAMPLES],
                     cursor: FRAME_SAMPLES,
                     silent: true,
+                    last_peak: 0.0,
                     speaking: RemoteSpeaking::default(),
                 });
                 self.tracks.len() - 1
@@ -823,6 +867,51 @@ mod tests {
         );
         b.remove_track(4);
         assert_eq!(events(&mut evb), vec![AudioEvent::Speaking { track: 4, speaking: false }]);
+    }
+
+    /// The end of a talkspurt and lone DTX comfort-noise frames must fade out, not jump to zero
+    /// (a jump is an audible click on every pause).
+    #[test]
+    fn remote_audio_fades_into_pauses_without_a_click() {
+        let (mut a, _eva) = processor();
+        let (mut b, _evb) = processor();
+        let mut rx_a = start(&mut a, 4);
+        let _rx_b = start(&mut b, 8);
+        let mut cap = vec![0f32; FRAME_10MS];
+        let mut out = vec![0f32; FRAME_10MS];
+        // a quiet room after the speech: low noise, so DTX sends comfort-noise refresh frames
+        let mut seed = 1u32;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 * 0.004 - 0.002
+        };
+        let mut prev = 0f32;
+        let mut max_jump = 0f32;
+        for f in 0..500usize {
+            let now = f as u64 * 10;
+            a.render(&mut out, now, true);
+            for (i, s) in cap.iter_mut().enumerate() {
+                let n = f * FRAME_10MS + i;
+                *s = if f < 100 { speech(n) } else { noise() };
+            }
+            a.capture(&mut cap, now);
+            for pkt in drain(&mut rx_a) {
+                b.push_packet(pkt, now + 30);
+            }
+            b.render(&mut out, now + 30, true);
+            if f >= 90 {
+                for &x in &out {
+                    max_jump = max_jump.max((x - prev).abs());
+                    prev = x;
+                }
+            } else if let Some(&x) = out.last() {
+                prev = x;
+            }
+            cap.fill(0.0);
+            b.capture(&mut cap, now + 30);
+            b.tick(now + 30);
+        }
+        assert!(max_jump < 0.03, "largest sample step {max_jump} around and after the pause");
     }
 
     #[test]
