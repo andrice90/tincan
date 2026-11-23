@@ -115,7 +115,17 @@ Debug build, both instances in a server text channel, not in voice, CDP disconne
 
 ### Release build
 
-Run on 2026-11-23 against `target/release/tincan.exe` from `pnpm tauri build` (`TINCAN_EXE`, offline network, real audio devices), after the final commits. All 49 checks passed on the first run, and no instance logged a warning or error. Timings were within a few ms of the debug run above. After 60 s idle, with the same setup as above:
+Run on 2026-11-23 against `target/release/tincan.exe` from `pnpm tauri build` (`TINCAN_EXE`, offline network, real audio devices). The exe was built from commit 3a32e6e; the next commit changed only one toast's wording, and the installer was then rebuilt from it. All 49 checks passed on the first run, and no instance logged a warning or error.
+
+Most timings were within 5 ms of the debug run above. The exceptions:
+
+| What | Release | Debug |
+|---|---|---|
+| Watch click to first decoded frame | 64 ms | 18 ms |
+| Voice: both in the room | 299 ms | 332 ms |
+| Join: both online on A | 196 ms | 201 ms |
+
+After 60 s idle, with the same setup as above:
 
 | Process | e2e-a | e2e-b |
 |---|---|---|

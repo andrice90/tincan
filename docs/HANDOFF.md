@@ -4,14 +4,16 @@ Status of the Tincan build for the next session. Updated at every milestone comm
 
 ## Where it stands
 
-Testable product (2026-11-23). Every feature in the original request is built and runs end to end between two profiles on one machine:
+Testable product (2026-11-23). Every feature in the original request is built. These run end to end between two profiles on one machine through the real UI:
 
 - text rooms and DMs
-- voice rooms and 1:1 calls
+- voice rooms
 - screen share
-- P2P attachments that keep downloading from other holders when the poster is offline
-- host election and migration
+- P2P attachments
+- host migration
 - the soundboard
+
+1:1 calls and downloading an attachment while its poster is offline are covered by the in-process app tests only.
 
 Three review rounds found security and correctness problems; all confirmed findings but two are fixed (see [`review/findings.md`](review/findings.md)). The two-profile UI e2e passes 49/49 on the debug build and on the release build. The NSIS installer builds but has never been run.
 

@@ -127,5 +127,5 @@ No string that `ui/e2e` selects on changed.
 
 Tasks for the owner:
 
-- [ ] `crates/tincan-app`: the toasts and error texts the UI shows come from the app (mirrored in `src/api/mock.ts`) and were outside this pass. Check them against the same rules.
-- [ ] `docs/HANDOFF.md`: mark "unslop-ui pass on the UI" done.
+- [x] `crates/tincan-app`: the toasts and error texts the UI shows come from the app (mirrored in `src/api/mock.ts`) and were outside this pass. Checked afterwards: one passive toast reworded ("Audio stopped working, so Tincan restarted it.").
+- [x] `docs/HANDOFF.md`: mark "unslop-ui pass on the UI" done.

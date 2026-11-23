@@ -5,7 +5,7 @@ What the other crates need to know beyond the doc comments. Rustdoc: `cargo doc 
 ## Applying events (net)
 
 - Use one `state::PendingBuffer` per conversation. For each incoming `StoredEvent`: `pending.ingest(&mut state, ev, now_ms)` returns the verdict plus every event it applied, in order (the incoming one first if accepted, then anything it unblocked). Persist those with `Storage::insert_event` in that order. On `Change::Deleted { target }`, call `Storage::mark_deleted`.
-- `Verdict::Gap` / `Future` events are buffered by `ingest`. `Stale` (duplicate) and `Reject` events are dropped. A `Reject` is final: the author's later events on that replica stay `Gap`. On `PublishAck { ok: false }` the author must drop the event and reuse its seq.
+- `Verdict::Gap` / `Future` events are buffered by `ingest`. `Stale` (duplicate) and `Reject` events are dropped. A `Reject` is final: the author's later events on that replica stay `Gap`. On `PublishAck { ok: false }` tincan-net keeps the event queued and never reuses its seq, unless the author's own validation also rejects it (see `notes-tincan-net.md`, publish).
 - Before authoring, check `ConvState::can_post(author, channel)` for messages and `ConvState::next_seq(author)` for the seq.
 - Two rules from architecture.md are deliberately not part of validation, because they depend on arrival order and would split replicas permanently:
   - A message to a channel deleted at the same time is accepted. Deleted channels and their messages are hidden.
