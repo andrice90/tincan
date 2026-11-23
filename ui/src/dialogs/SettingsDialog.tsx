@@ -1,8 +1,9 @@
 // Settings: profile, voice, files, network, appearance.
 
 import { useEffect, useRef, useState } from "react";
-import { copyText, errorText, invoke, listen, pickFiles } from "../api/client";
+import { errorText, invoke, listen, pickFiles } from "../api/client";
 import type { AudioDevice, AudioDevices, Settings } from "../api/types";
+import { CopyButton } from "../components/CopyButton";
 import { Modal } from "../components/Modal";
 import { hostLine } from "../components/ChannelSidebar";
 import { formatBytes } from "../lib/format";
@@ -44,16 +45,12 @@ function ProfileTab() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
-  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    if (!copied && !saved) return;
-    const t = setTimeout(() => {
-      setCopied(false);
-      setSaved(false);
-    }, 2000);
+    if (!saved) return;
+    const t = setTimeout(() => setSaved(false), 2000);
     return () => clearTimeout(t);
-  }, [copied, saved]);
+  }, [saved]);
 
   if (!me) return null;
   const save = async () => {
@@ -99,19 +96,90 @@ function ProfileTab() {
           {error}
         </p>
       )}
-      <div className="field">
-        <label className="field-label" htmlFor="profile-id">
-          Your Tincan ID
-        </label>
-        <div className="input-row">
-          <input id="profile-id" className="input mono" readOnly value={me.userCode} onFocus={(e) => e.currentTarget.select()} />
-          <button type="button" className="btn" onClick={() => void copyText(me.userCode).then(setCopied)}>
-            {copied ? "Copied" : "Copy my ID"}
-          </button>
-        </div>
-        <p className="field-note">People add you as a contact with this ID.</p>
+      <FriendCodeField />
+      <div className="field field-start">
+        <CopyButton text={me.userCode} label="Copy full ID" />
+        <p className="field-note">Your full ID never changes, even when you rotate the friend code.</p>
       </div>
     </>
+  );
+}
+
+function FriendCodeField() {
+  const [code, setCode] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [rotating, setRotating] = useState(false);
+  const live = useRef(true);
+
+  useEffect(() => {
+    live.current = true;
+    invoke("get_friend_code", {}).then(
+      (c) => live.current && setCode(c),
+      (err: unknown) => live.current && setError(errorText(err)),
+    );
+    return () => {
+      live.current = false;
+    };
+  }, []);
+
+  const rotate = async () => {
+    setRotating(true);
+    setError(null);
+    try {
+      const c = await invoke("rotate_friend_code", {});
+      if (live.current) setCode(c);
+    } catch (err) {
+      if (live.current) setError(errorText(err));
+    } finally {
+      if (live.current) {
+        setRotating(false);
+        setConfirming(false);
+      }
+    }
+  };
+
+  return (
+    <div className="field">
+      <label className="field-label" htmlFor="profile-friend-code">
+        Friend code
+      </label>
+      <div className="input-row">
+        <input
+          id="profile-friend-code"
+          className="input mono"
+          readOnly
+          value={code ?? ""}
+          placeholder={error ? "" : "Making a code"}
+          onFocus={(e) => e.currentTarget.select()}
+        />
+        {confirming ? (
+          <>
+            <button type="button" className="btn btn-ghost" disabled={rotating} onClick={() => setConfirming(false)}>
+              Cancel
+            </button>
+            <button type="button" className="btn btn-danger" disabled={rotating} onClick={() => void rotate()}>
+              {rotating ? "Rotating" : "Rotate"}
+            </button>
+          </>
+        ) : (
+          <>
+            <CopyButton text={code} label="Copy" />
+            <button type="button" className="btn" disabled={!code} onClick={() => setConfirming(true)}>
+              Rotate
+            </button>
+          </>
+        )}
+      </div>
+      <p className="field-note">
+        {confirming ? "Your current code stops working. Contacts you already have stay." : "People add you as a contact with this code."}
+      </p>
+      {error && (
+        <p className="error-text" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 

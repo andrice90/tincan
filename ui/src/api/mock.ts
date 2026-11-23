@@ -35,6 +35,7 @@ import type {
   VoiceParticipant,
   VoiceSession,
 } from "./types";
+import { parseShortCode, randomShortCode } from "../lib/codes";
 import { baseName, stripExtension } from "../lib/format";
 
 // ------------------------------------------------------------------ ids
@@ -149,6 +150,12 @@ const st = {
   /** Per-user playback volumes (0..2), as saved by set_user_volume. Jordan starts quieter. */
   volumes: new Map<UserId, number>([[people.jordan.id, 0.3]]),
   heardDemoDone: false,
+  /** Short invite code per server ("ABC-DEF"); none until the owner made one. */
+  inviteCodes: new Map<ServerId, string>(),
+  /** My friend code; made on first get_friend_code. */
+  friendCode: null as string | null,
+  /** Codes that were rotated away: they no longer resolve. */
+  retiredCodes: new Set<string>(),
 };
 
 const convKey = (convId: ConvId, channelId: ChannelId | null) => `${convId}:${channelId ?? ""}`;
@@ -959,11 +966,40 @@ const handlers: Handlers = {
     return `tincan1${idFrom(`invite:${serverId}:${Date.now()}`, B32, 118)}`;
   },
 
+  get_invite_code: async ({ serverId }) => {
+    const s = server(serverId);
+    const have = st.inviteCodes.get(serverId);
+    if (have || !s.summary.isOwner) return have ?? null;
+    await sleep(700);
+    const code = randomShortCode();
+    st.inviteCodes.set(serverId, code);
+    return code;
+  },
+
+  rotate_invite_code: async ({ serverId }) => {
+    const s = server(serverId);
+    requireOwner(s, "rotate the invite code");
+    await sleep(700);
+    const old = st.inviteCodes.get(serverId);
+    if (old) st.retiredCodes.add(old);
+    const code = randomShortCode();
+    st.inviteCodes.set(serverId, code);
+    return code;
+  },
+
   join_server: async ({ invite }) => {
-    const code = invite.trim().toLowerCase();
+    const short = parseShortCode(invite);
+    if (short) {
+      await sleep(900);
+      for (const [id, c] of st.inviteCodes) {
+        if (c === short) fail(`You're already in ${server(id).summary.name}.`);
+      }
+      if (st.retiredCodes.has(short) || short.startsWith("X")) fail("No server uses that code. Check it, or ask for a new one.");
+    }
+    const code = short ? `tincan1short${short}` : invite.trim().toLowerCase();
     if (code.startsWith("tincan1u")) fail("That's someone's Tincan ID, not a server invite. Add them as a contact instead.");
     if (!code.startsWith("tincan1")) fail("That isn't a Tincan invite. Invite codes start with tincan1.");
-    if (code.length < 40) fail("That invite is cut off. Copy the whole code and paste it again.");
+    if (!short && code.length < 40) fail("That invite is cut off. Copy the whole code and paste it again.");
     await sleep(1200);
     if (code.includes("offline")) fail("Couldn't reach anyone in that server. Check the invite or try again later.");
     const me = st.me ?? fail("Pick a display name first.");
@@ -988,6 +1024,7 @@ const handlers: Handlers = {
       ],
     };
     st.servers.push(s);
+    st.inviteCodes.set(id, randomShortCode());
     addMessages(id, s.channels[0].id, Date.now() - 50 * MIN, [
       ["morgan", 0, "Movie pick for Saturday?"],
       ["taylor", 12, "Something short, I'm tired"],
@@ -1207,13 +1244,22 @@ const handlers: Handlers = {
 
   dm_watch: () => null,
 
-  add_contact: ({ code }) => {
+  add_contact: async ({ code }) => {
     const raw = code.trim();
-    const id = raw.toLowerCase().startsWith("tincan1u") ? raw.slice(8) : raw;
-    if (id.length !== 52 || [...id].some((ch) => !Z32.includes(ch))) {
-      fail("That isn't a Tincan ID. Paste the code that starts with tincan1u.");
+    const short = parseShortCode(raw);
+    let id: UserId;
+    if (short) {
+      await sleep(600);
+      if (short === st.friendCode) fail("That's your own code. Enter the code of the person you want to message.");
+      if (st.retiredCodes.has(short) || short.startsWith("X")) fail("No one uses that friend code. Check it, or ask for a new one.");
+      id = userId(`friend:${short}`);
+    } else {
+      id = raw.toLowerCase().startsWith("tincan1u") ? raw.slice(8) : raw;
+      if (id.length !== 52 || [...id].some((ch) => !Z32.includes(ch))) {
+        fail("That isn't a friend code or a Tincan ID. A friend code has 6 characters, like K7Q-M2X.");
+      }
     }
-    if (id === st.me?.userId) fail("That's your own ID.");
+    if (id === st.me?.userId) fail("That's your own code. Enter the code of the person you want to message.");
     let p = personById(id);
     if (!p) {
       p = { id, name: "Drew", online: false };
@@ -1222,6 +1268,20 @@ const handlers: Handlers = {
     const dm = dmWith(p);
     emit("dm-updated", dm);
     return dm;
+  },
+
+  get_friend_code: () => {
+    meId();
+    st.friendCode ??= randomShortCode();
+    return st.friendCode;
+  },
+
+  rotate_friend_code: async () => {
+    meId();
+    await sleep(300);
+    if (st.friendCode) st.retiredCodes.add(st.friendCode);
+    st.friendCode = randomShortCode();
+    return st.friendCode;
   },
 
   voice_join: async ({ serverId, channelId }) => {
