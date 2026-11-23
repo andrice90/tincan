@@ -717,6 +717,13 @@ async fn direct_messages_and_offline_delivery() {
         mine.filter(|m| m["pending"] == false)
     })
     .await;
+    // APP-CORE-10: my own message moves the DM's last message time (the DM list order),
+    // with the link already up and no server roster to refresh it. Earlier refreshes settle
+    // first, so the event below can only come from this send.
+    let settled = Instant::now() + Duration::from_millis(1500);
+    while tokio::time::timeout(settled.saturating_duration_since(Instant::now()), a.rx.recv()).await.is_ok() {}
+    let again = call(&a.app, "send_message", json!({ "convId": conv, "channelId": null, "text": "one more", "attachments": [] })).await;
+    wait_for(&mut a.rx, "dm-updated", 5, |d| d["convId"] == conv.as_str() && d["lastMessageAt"] == again["sentAt"]).await;
 
     // Bob goes offline; Alice's message waits in her outbox.
     b.app.shutdown().await;
@@ -736,7 +743,7 @@ async fn direct_messages_and_offline_delivery() {
     let delivered = wait_for(&mut a.rx, "message-updated", 30, |m| m["id"] == waiting["id"]).await;
     assert_eq!(delivered["pending"], false);
     let (texts, _) = all_texts(&b2, &conv, None, 2).await;
-    assert_eq!(texts, ["hello Bob", "hi Alice", "while you were away"]);
+    assert_eq!(texts, ["hello Bob", "hi Alice", "one more", "while you were away"]);
     let snap = call(&b2, "app_snapshot", json!({})).await;
     assert_eq!(snap["me"]["name"], "Bob", "the name survives a restart");
     assert_eq!(snap["dms"][0]["userId"], a.user.as_str());

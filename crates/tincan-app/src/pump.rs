@@ -6,22 +6,29 @@
 //!   changed DTOs (`server-updated`, `channels-updated`, `members-updated`, `dm-updated`),
 //!   each only if it differs from the last one sent.
 //! - Bulk ingest (an initial history sync, a catch-up after being offline) sends thousands of
-//!   `EventAdded` per second. tincan-net does not surface its sync-complete marker, so the
-//!   pump detects bulk itself: more than [`BATCH_BULK`] messages of one conversation in one
-//!   drained batch, more than [`RATE_BULK`] per second, or a bulk window armed by
+//!   `EventAdded` per second. A conversation goes bulk on more than [`BATCH_BULK`] messages
+//!   of it in one drained batch, more than [`RATE_BULK`] per second, or a window armed by
 //!   `join_server`. While bulk, no per-message events go out (attachment bookkeeping and
-//!   auto-fetch still run); after [`QUIET`] without messages one refresh is emitted, plus a
-//!   `snapshot` so the UI reloads its message pages.
+//!   auto-fetch still run). The window ends with one refresh, plus a `snapshot` so the UI
+//!   reloads its message pages, on whichever comes first (see [`Bulks`]):
+//!   - `NetEvent::SyncComplete` for the conversation;
+//!   - [`QUIET`] without burst messages (a message below the rate and batch thresholds does
+//!     not hold the window open);
+//!   - its maximum length, [`MAX_BULK`] ([`MAX_SYNC_BULK`] while a server's history sync
+//!     is running). After a window was cut at its maximum, only a batch over
+//!     [`BATCH_BULK`] opens a new one until the rate drops, so one member who keeps
+//!     posting fast cannot hold every live message back.
 //! - A lagged receiver is treated as "everything changed": full refresh plus `snapshot`.
 //!
 //! No timer runs while nothing is pending.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tincan_core::ConvId;
 use tincan_core::state::{Change, dm_channel};
+use tincan_core::wire::Roster;
+use tincan_core::{ChannelId, ConvId, UserId};
 use tincan_files::FileEvent;
 use tincan_net::{ConnState, NetEvent};
 use tokio::sync::{broadcast, mpsc};
@@ -38,15 +45,27 @@ pub(crate) const DEBOUNCE: Duration = Duration::from_millis(100);
 pub(crate) const BATCH_BULK: usize = 8;
 /// Messages of one conversation per second that mean bulk ingest.
 pub(crate) const RATE_BULK: u32 = 40;
-/// A bulk window ends after this long without messages.
+/// A bulk window ends after this long without burst messages.
 pub(crate) const QUIET: Duration = Duration::from_millis(400);
 /// A window armed by `join_server` lasts at least this long (re-armed when the join
 /// returns, since the history sync starts right after the host's `Welcome`).
 pub(crate) const ARMED_WAIT: Duration = Duration::from_secs(1);
+/// Longest bulk window, unless a server's history sync is running.
+pub(crate) const MAX_BULK: Duration = Duration::from_secs(5);
+/// Longest bulk window while a server's history sync runs (from the connection to the
+/// host until `SyncComplete`). A host that never ends its sync gets this once per
+/// connection.
+pub(crate) const MAX_SYNC_BULK: Duration = Duration::from_secs(60);
 /// Most events taken from the network receiver per drain.
 const MAX_BATCH: usize = 2048;
 /// Parked downloads are re-queried at most this often per hash.
 pub(crate) const REQUERY_EVERY: Duration = Duration::from_secs(10);
+/// After a window was cut at its maximum, the rate must stay under [`RATE_BULK`] this long
+/// before it can open a window again.
+const UNCAP_AFTER: Duration = Duration::from_secs(2);
+/// `update_policy` runs at once on a membership change unless it ran this recently; then
+/// it waits for the next flush.
+const POLICY_EVERY: Duration = Duration::from_millis(100);
 
 /// Commands from the app to the pump.
 #[derive(Debug)]
@@ -55,10 +74,165 @@ pub(crate) enum PumpCmd {
     ArmBulk(ConvId),
 }
 
+/// One bulk window.
 #[derive(Debug)]
-struct Bulk {
+pub(crate) struct Bulk {
+    /// When it opened.
+    started: Instant,
+    /// It ends here unless a burst message moves it.
     quiet_at: Instant,
-    suppressed: usize,
+    /// It ends here at the latest.
+    cap_at: Instant,
+    /// Message events held back.
+    pub suppressed: usize,
+}
+
+/// The bulk windows of every conversation, driven with explicit times so the rules can be
+/// unit-tested.
+#[derive(Debug, Default)]
+pub(crate) struct Bulks {
+    open: HashMap<ConvId, Bulk>,
+    /// The last [`RATE_BULK`] + 1 message times per conversation.
+    rate: HashMap<ConvId, VecDeque<Instant>>,
+    /// Windows cut at their maximum, with the last time the rate was over the threshold:
+    /// the rate alone does not reopen them.
+    capped: HashMap<ConvId, Instant>,
+    /// Servers whose history sync is running (connected to a host, no `SyncComplete` yet).
+    syncing: HashSet<ConvId>,
+    /// When `SyncComplete` last ended a conversation's sync.
+    synced_at: HashMap<ConvId, Instant>,
+}
+
+impl Bulks {
+    /// Is `conv` bulk right now?
+    pub fn contains(&self, conv: &ConvId) -> bool { self.open.contains_key(conv) }
+
+    /// The earliest time a window ends.
+    pub fn next_deadline(&self) -> Option<Instant> { self.open.values().map(|b| b.quiet_at.min(b.cap_at)).min() }
+
+    fn cap_len(&self, conv: &ConvId) -> Duration { if self.syncing.contains(conv) { MAX_SYNC_BULK } else { MAX_BULK } }
+
+    fn open(&mut self, conv: ConvId, now: Instant, quiet: Duration) {
+        let cap_at = now + self.cap_len(&conv);
+        let b = self.open.entry(conv).or_insert_with(|| {
+            tracing::debug!(conv = %conv.short(), "bulk ingest: coalescing message events");
+            Bulk { started: now, quiet_at: now, cap_at, suppressed: 0 }
+        });
+        b.quiet_at = b.quiet_at.max(now + quiet);
+    }
+
+    /// `join_server` is about to sync `conv`. Ignored right after its sync completed (the
+    /// re-arm when `Net::join` returns can come after `SyncComplete`).
+    pub fn arm(&mut self, conv: ConvId, now: Instant) {
+        if self.synced_at.get(&conv).is_some_and(|t| now.duration_since(*t) < ARMED_WAIT) {
+            return;
+        }
+        self.open(conv, now, ARMED_WAIT);
+    }
+
+    /// A server connected to a host: its history sync starts.
+    pub fn sync_started(&mut self, conv: ConvId) {
+        self.syncing.insert(conv);
+        if let Some(b) = self.open.get_mut(&conv) {
+            b.cap_at = b.cap_at.max(b.started + MAX_SYNC_BULK);
+        }
+    }
+
+    /// `SyncComplete`: the sync of `conv` is in. Returns the window it ends, if any.
+    pub fn sync_complete(&mut self, conv: ConvId, now: Instant) -> Option<Bulk> {
+        self.syncing.remove(&conv);
+        self.synced_at.insert(conv, now);
+        self.rate.remove(&conv);
+        self.open.remove(&conv)
+    }
+
+    /// Count a message for the rate check (a sliding second); true when the rate means
+    /// bulk.
+    fn over_rate(&mut self, conv: ConvId, now: Instant) -> bool {
+        let q = self.rate.entry(conv).or_default();
+        while q.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1)) {
+            q.pop_front();
+        }
+        q.push_back(now);
+        if q.len() > RATE_BULK as usize + 1 {
+            q.pop_front();
+        }
+        let over = q.len() > RATE_BULK as usize;
+        // After a window was cut at its maximum, the rate opens windows again only once
+        // it stayed under the threshold for [`UNCAP_AFTER`].
+        if let Some(last_over) = self.capped.get_mut(&conv) {
+            if over {
+                *last_over = now;
+            } else if now.duration_since(*last_over) >= UNCAP_AFTER {
+                self.capped.remove(&conv);
+            }
+        }
+        over
+    }
+
+    /// A message (or deletion) event of `conv`, `in_batch` of them in the drained batch.
+    /// True when it is held back (the conversation is bulk).
+    pub fn on_message(&mut self, conv: ConvId, in_batch: usize, now: Instant) -> bool {
+        let over = self.over_rate(conv, now);
+        let big_batch = in_batch > BATCH_BULK;
+        if !self.open.contains_key(&conv) && (big_batch || (over && !self.capped.contains_key(&conv))) {
+            self.open(conv, now, QUIET);
+        }
+        let Some(b) = self.open.get_mut(&conv) else { return false };
+        b.suppressed += 1;
+        // Only burst traffic holds the window open: one message every few hundred ms lets
+        // it close.
+        if big_batch || over {
+            b.quiet_at = b.quiet_at.max(now + QUIET);
+        }
+        true
+    }
+
+    /// Windows that end at `now`. A window cut at its maximum is remembered as capped,
+    /// and a server sync that ran that long no longer gets the long maximum.
+    pub fn due(&mut self, now: Instant) -> Vec<(ConvId, Bulk)> {
+        let ended: Vec<ConvId> = self.open.iter().filter(|(_, b)| b.quiet_at.min(b.cap_at) <= now).map(|(c, _)| *c).collect();
+        let mut out = Vec::new();
+        for conv in ended {
+            let Some(b) = self.open.remove(&conv) else { continue };
+            if b.cap_at <= now && b.quiet_at > now {
+                tracing::debug!(conv = %conv.short(), "bulk window cut at its maximum");
+                self.capped.insert(conv, now);
+                self.syncing.remove(&conv);
+            } else {
+                self.rate.remove(&conv);
+            }
+            out.push((conv, b));
+        }
+        out
+    }
+
+    /// Forget `conv` (left).
+    pub fn forget(&mut self, conv: &ConvId) {
+        self.open.remove(conv);
+        self.rate.remove(conv);
+        self.capped.remove(conv);
+        self.syncing.remove(conv);
+        self.synced_at.remove(conv);
+    }
+}
+
+/// What the UI shows of a roster: who is online, in which voice room, muted, deafened,
+/// sharing, and who hosts. Roster rebroadcasts that change nothing else (RTT buckets,
+/// addresses, revisions) are skipped by the pump.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RosterSig {
+    host: UserId,
+    online: Vec<(UserId, Option<ChannelId>, bool, bool, bool)>,
+}
+
+impl RosterSig {
+    /// The shown part of `r`.
+    pub fn of(r: &Roster) -> Self {
+        let mut online: Vec<_> = r.online.iter().map(|e| (e.user, e.voice, e.muted, e.deafened, e.sharing.is_some())).collect();
+        online.sort_by_key(|e| e.0);
+        Self { host: r.host, online }
+    }
 }
 
 struct Pump {
@@ -67,10 +241,17 @@ struct Pump {
     dirty_at: Option<Instant>,
     dms_dirty: bool,
     policy_dirty: bool,
+    /// When `update_policy` last ran from a membership change.
+    policy_at: Option<Instant>,
     rosters_changed: bool,
     snapshot_due: bool,
-    bulk: HashMap<ConvId, Bulk>,
-    rate: HashMap<ConvId, (Instant, u32)>,
+    bulks: Bulks,
+    /// Message events per conversation in the batch being handled.
+    batch_counts: HashMap<ConvId, usize>,
+    /// The last roster signature handled per server.
+    rosters: HashMap<ConvId, RosterSig>,
+    /// The last connection state and host per server.
+    conns: HashMap<ConvId, (ConnState, Option<UserId>)>,
 }
 
 /// Run until the network's event stream closes (or the task is aborted on shutdown).
@@ -86,10 +267,13 @@ pub(crate) async fn run(
         dirty_at: None,
         dms_dirty: false,
         policy_dirty: false,
+        policy_at: None,
         rosters_changed: false,
         snapshot_due: false,
-        bulk: HashMap::new(),
-        rate: HashMap::new(),
+        bulks: Bulks::default(),
+        batch_counts: HashMap::new(),
+        rosters: HashMap::new(),
+        conns: HashMap::new(),
     };
     let mut files_open = true;
     loop {
@@ -140,8 +324,7 @@ async fn sleep_until(at: Option<Instant>) {
 
 impl Pump {
     fn next_deadline(&self) -> Option<Instant> {
-        let bulk = self.bulk.values().map(|b| b.quiet_at).min();
-        match (self.dirty_at, bulk) {
+        match (self.dirty_at, self.bulks.next_deadline()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -158,30 +341,7 @@ impl Pump {
         }
     }
 
-    fn arm(&mut self, conv: ConvId) {
-        let quiet_at = Instant::now() + ARMED_WAIT;
-        let b = self.bulk.entry(conv).or_insert(Bulk { quiet_at, suppressed: 0 });
-        b.quiet_at = b.quiet_at.max(quiet_at);
-    }
-
-    fn enter_bulk(&mut self, conv: ConvId) {
-        let quiet_at = Instant::now() + QUIET;
-        self.bulk.entry(conv).or_insert_with(|| {
-            tracing::debug!(conv = %conv.short(), "bulk ingest: coalescing message events");
-            Bulk { quiet_at, suppressed: 0 }
-        });
-    }
-
-    /// Count a message for the rate check; true when the rate means bulk.
-    fn over_rate(&mut self, conv: ConvId) -> bool {
-        let now = Instant::now();
-        let e = self.rate.entry(conv).or_insert((now, 0));
-        if now.duration_since(e.0) >= Duration::from_secs(1) {
-            *e = (now, 0);
-        }
-        e.1 += 1;
-        e.1 > RATE_BULK
-    }
+    fn arm(&mut self, conv: ConvId) { self.bulks.arm(conv, Instant::now()); }
 
     fn lagged(&mut self, missed: u64) {
         tracing::warn!(missed, "network events lagged; refreshing everything");
@@ -189,27 +349,54 @@ impl Pump {
             self.core.invalidate_view(&conv);
             self.dirty.entry(conv).or_default().merge(Refresh::ALL);
         }
+        // A missed roster may differ from the last one handled: compare afresh.
+        self.rosters.clear();
+        self.conns.clear();
         self.policy_dirty = true;
+        self.dms_dirty = true;
+        self.rosters_changed = true;
         self.snapshot_due = true;
         self.schedule();
         self.core.media.on_lagged(&self.core);
     }
 
     fn on_batch(&mut self, batch: Vec<NetEvent>) {
-        let mut counts: HashMap<ConvId, usize> = HashMap::new();
+        self.batch_counts.clear();
         for ev in &batch {
-            if let NetEvent::EventAdded { conv, change: Change::Message { .. }, .. } = ev {
-                *counts.entry(*conv).or_default() += 1;
-            }
-        }
-        for (conv, n) in counts {
-            if n > BATCH_BULK {
-                self.enter_bulk(conv);
+            if let NetEvent::EventAdded { conv, change: Change::Message { .. } | Change::Deleted { .. }, .. } = ev {
+                *self.batch_counts.entry(*conv).or_default() += 1;
             }
         }
         for ev in batch {
             self.on_net(ev);
         }
+    }
+
+    /// A bulk window ended: one refresh of everything in it, a snapshot if messages were
+    /// held back, flushed now rather than after another debounce.
+    fn end_bulk(&mut self, conv: ConvId, b: Bulk, now: Instant) {
+        tracing::debug!(conv = %conv.short(), suppressed = b.suppressed, "bulk ingest ended");
+        self.core.invalidate_view(&conv);
+        self.dirty.entry(conv).or_default().merge(Refresh::ALL);
+        self.policy_dirty = true;
+        if b.suppressed > 0 {
+            self.snapshot_due = true;
+        }
+        self.dirty_at = Some(now);
+    }
+
+    /// Who is in which conversation changed: recompute the access set at once (a new
+    /// member may fetch an attachment right after joining), unless it ran within
+    /// [`POLICY_EVERY`] or the conversation is bulk; then the next flush does it.
+    fn members_changed(&mut self, conv: ConvId) {
+        let now = Instant::now();
+        if self.bulks.contains(&conv) || self.policy_at.is_some_and(|t| now.duration_since(t) < POLICY_EVERY) {
+            self.policy_dirty = true;
+            self.schedule();
+            return;
+        }
+        self.policy_at = Some(now);
+        self.core.update_policy();
     }
 
     fn on_net(&mut self, ev: NetEvent) {
@@ -221,25 +408,19 @@ impl Pump {
         match ev {
             NetEvent::EventAdded { conv, event, change } => match change {
                 Change::Message { .. } => {
-                    if self.over_rate(conv) {
-                        self.enter_bulk(conv);
-                    }
-                    if let Some(b) = self.bulk.get_mut(&conv) {
-                        b.suppressed += 1;
-                        b.quiet_at = Instant::now() + QUIET;
-                    } else {
+                    let n = self.batch_counts.get(&conv).copied().unwrap_or(1);
+                    if !self.bulks.on_message(conv, n, Instant::now()) {
                         core.emit_message(Ev::MessageAdded, &conv, &event);
-                        if event.event.author != core.me {
-                            self.mark(conv, Refresh::UNREAD);
-                        }
+                        // My own messages change a DM's last message time (the DM list
+                        // order); others' also the unread state.
+                        let what = if event.event.author != core.me { Refresh::UNREAD } else { Refresh { dm: true, ..Refresh::default() } };
+                        self.mark(conv, what);
                     }
                     core.auto_fetch(conv, &event);
                 }
                 Change::Deleted { target } => {
-                    if let Some(b) = self.bulk.get_mut(&conv) {
-                        b.suppressed += 1;
-                        b.quiet_at = Instant::now() + QUIET;
-                    } else {
+                    let n = self.batch_counts.get(&conv).copied().unwrap_or(1);
+                    if !self.bulks.on_message(conv, n, Instant::now()) {
                         if let Ok(Some(stored)) = tincan_core::storage::Storage::event(core.storage.as_ref(), &target) {
                             core.emit_message(Ev::MessageUpdated, &conv, &stored);
                         }
@@ -261,24 +442,42 @@ impl Pump {
                     core.invalidate_view(&conv);
                     self.mark(conv, Refresh { server: true, members: true, ..Refresh::default() });
                     self.dms_dirty = true;
-                    if self.bulk.contains_key(&conv) {
-                        self.policy_dirty = true;
-                    } else {
-                        // At once: a new member may fetch an attachment right after joining.
-                        core.update_policy();
-                    }
+                    self.members_changed(conv);
                 }
                 _ => {}
             },
-            NetEvent::RosterUpdated { server, .. } => {
+            NetEvent::RosterUpdated { server, roster } => {
+                // The host rebroadcasts on RTT and address changes the UI does not show.
+                let sig = RosterSig::of(&roster);
+                if self.rosters.get(&server) == Some(&sig) {
+                    return;
+                }
+                self.rosters.insert(server, sig);
                 self.mark(server, Refresh { server: true, members: true, ..Refresh::default() });
                 self.dms_dirty = true;
                 self.rosters_changed = true;
             }
             NetEvent::ConnectionChanged { server, info } => {
                 self.mark(server, Refresh { server: true, members: true, ..Refresh::default() });
+                // Also sent on RTT and path changes; only a new state or host matters here.
+                let now = (info.state, info.host);
+                if self.conns.insert(server, now) != Some(now) {
+                    // Rosters count only while member, hosting or solo: the next one after
+                    // a reconnect or a new host is always handled.
+                    self.rosters.remove(&server);
+                    self.dms_dirty = true;
+                    if info.state == ConnState::Member {
+                        self.bulks.sync_started(server);
+                    }
+                }
                 if matches!(info.state, ConnState::Member | ConnState::Hosting | ConnState::Solo) {
                     core.on_connected(server);
+                }
+            }
+            NetEvent::SyncComplete { conv } => {
+                let now = Instant::now();
+                if let Some(b) = self.bulks.sync_complete(conv, now) {
+                    self.end_bulk(conv, b, now);
                 }
             }
             NetEvent::Typing { conv, channel, user } => {
@@ -306,8 +505,9 @@ impl Pump {
                 core.invalidate_view(&server);
                 core.forget_sent(&server);
                 self.dirty.remove(&server);
-                self.bulk.remove(&server);
-                self.rate.remove(&server);
+                self.bulks.forget(&server);
+                self.rosters.remove(&server);
+                self.conns.remove(&server);
                 self.policy_dirty = true;
                 self.dms_dirty = true;
                 self.snapshot_due = true;
@@ -344,20 +544,8 @@ impl Pump {
 
     fn on_timer(&mut self) {
         let now = Instant::now();
-        let ended: Vec<ConvId> = self.bulk.iter().filter(|(_, b)| b.quiet_at <= now).map(|(c, _)| *c).collect();
-        for conv in ended {
-            if let Some(b) = self.bulk.remove(&conv) {
-                tracing::debug!(conv = %conv.short(), suppressed = b.suppressed, "bulk ingest ended");
-                self.rate.remove(&conv);
-                self.core.invalidate_view(&conv);
-                self.dirty.entry(conv).or_default().merge(Refresh::ALL);
-                self.policy_dirty = true;
-                if b.suppressed > 0 {
-                    self.snapshot_due = true;
-                }
-                // Flush now rather than after another debounce.
-                self.dirty_at = Some(now);
-            }
+        for (conv, b) in self.bulks.due(now) {
+            self.end_bulk(conv, b, now);
         }
         if self.dirty_at.is_some_and(|t| t <= now) {
             self.flush();
@@ -369,7 +557,7 @@ impl Pump {
         let core = self.core.clone();
         let mut deferred = HashMap::new();
         for (conv, what) in std::mem::take(&mut self.dirty) {
-            if self.bulk.contains_key(&conv) {
+            if self.bulks.contains(&conv) {
                 deferred.insert(conv, what);
                 continue;
             }
@@ -392,5 +580,159 @@ impl Pump {
             self.snapshot_due = false;
             core.emit_snapshot();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tincan_core::wire::{AddrHint, RosterEntry};
+
+    fn ms(n: u64) -> Duration { Duration::from_millis(n) }
+
+    fn conv() -> ConvId { ConvId([7; 32]) }
+
+    /// Feed one message per call at `t` (a batch of one) and say whether it was held back.
+    fn feed(b: &mut Bulks, t: Instant) -> bool { b.on_message(conv(), 1, t) }
+
+    /// APP-CORE-05: 41 messages in a second open a window; after that, one message every
+    /// 300 ms lets it close, and the next messages go out live.
+    #[test]
+    fn slow_traffic_after_a_burst_closes_the_window() {
+        let mut b = Bulks::default();
+        let t0 = Instant::now();
+        for i in 0..40 {
+            assert!(!feed(&mut b, t0 + ms(i)), "under the rate is live");
+        }
+        assert!(feed(&mut b, t0 + ms(40)), "the 41st in a second opens a window");
+        let mut t = t0 + ms(40);
+        let mut live_at = None;
+        for _ in 0..20 {
+            t += ms(300);
+            assert!(b.due(t - ms(1)).len() <= 1);
+            if !b.contains(&conv()) {
+                live_at.get_or_insert(t);
+            }
+            let held = feed(&mut b, t);
+            if live_at.is_some() {
+                assert!(!held, "once closed, slow messages stay live");
+            }
+        }
+        let live_at = live_at.expect("the window closed");
+        assert!(live_at <= t0 + ms(2000), "closed {:?} after the burst", live_at - t0);
+    }
+
+    /// APP-CORE-05: a sustained flood (60 a second, one per drain) is cut at the maximum
+    /// length, and the rate alone does not reopen it while the flood goes on.
+    #[test]
+    fn a_flood_is_cut_at_the_maximum_and_stays_live() {
+        let mut b = Bulks::default();
+        let t0 = Instant::now();
+        let mut ended_at = None;
+        let mut held_after = 0;
+        for i in 0..(60 * 12) {
+            let t = t0 + ms(i * 1000 / 60);
+            if !b.due(t).is_empty() {
+                ended_at.get_or_insert(t);
+            }
+            if feed(&mut b, t) && ended_at.is_some() {
+                held_after += 1;
+            }
+        }
+        let ended_at = ended_at.expect("the window was cut");
+        assert!(ended_at - t0 <= MAX_BULK + ms(1100), "cut after {:?}", ended_at - t0);
+        assert_eq!(held_after, 0, "after the cut the flood's messages go out live");
+        // A big batch still opens a window (a real catch-up).
+        let t = t0 + ms(12_100);
+        assert!(b.on_message(conv(), BATCH_BULK + 1, t));
+        // Once the rate drops for a second, the rate opens windows again.
+        let mut b = Bulks::default();
+        for i in 0..41 {
+            feed(&mut b, t0 + ms(i));
+        }
+        let cut = t0 + MAX_BULK + ms(10);
+        assert!(!b.due(cut).is_empty());
+        let later = cut + ms(2500);
+        for i in 0..40 {
+            assert!(!feed(&mut b, later + ms(i)));
+        }
+        assert!(feed(&mut b, later + ms(41)), "a new burst after a quiet second opens a window");
+    }
+
+    /// Q1: `SyncComplete` ends the window at once, and the re-arm when `Net::join`
+    /// returns does not reopen it.
+    #[test]
+    fn sync_complete_ends_the_window() {
+        let mut b = Bulks::default();
+        let t0 = Instant::now();
+        b.arm(conv(), t0);
+        b.sync_started(conv());
+        assert!(b.on_message(conv(), 50, t0 + ms(100)));
+        let ended = b.sync_complete(conv(), t0 + ms(150)).expect("a window was open");
+        assert_eq!(ended.suppressed, 1);
+        assert!(!b.contains(&conv()));
+        b.arm(conv(), t0 + ms(200));
+        assert!(!b.contains(&conv()), "a re-arm right after SyncComplete is ignored");
+        assert!(!feed(&mut b, t0 + ms(210)), "live right after the sync");
+        // Later joins arm again.
+        b.arm(conv(), t0 + ms(5000));
+        assert!(b.contains(&conv()));
+    }
+
+    /// A server's history sync may run past [`MAX_BULK`] without flapping; without
+    /// `SyncComplete` it still ends at [`MAX_SYNC_BULK`].
+    #[test]
+    fn a_running_sync_gets_the_long_maximum() {
+        let mut b = Bulks::default();
+        let t0 = Instant::now();
+        b.sync_started(conv());
+        let mut t = t0;
+        while t < t0 + MAX_BULK + ms(3000) {
+            b.on_message(conv(), 100, t);
+            assert!(b.due(t).is_empty(), "no cut during a long sync at {:?}", t - t0);
+            t += ms(50);
+        }
+        while b.due(t).is_empty() {
+            b.on_message(conv(), 100, t);
+            t += ms(50);
+            assert!(t < t0 + MAX_SYNC_BULK + ms(100), "the long maximum still applies");
+        }
+        // A withheld end of sync gets the long maximum only once.
+        b.on_message(conv(), 100, t);
+        assert!(!b.due(t + MAX_BULK).is_empty());
+    }
+
+    /// A window armed by `join_server` lasts [`ARMED_WAIT`], then closes.
+    #[test]
+    fn an_armed_window_lasts_and_then_closes() {
+        let mut b = Bulks::default();
+        let t0 = Instant::now();
+        b.arm(conv(), t0);
+        assert!(feed(&mut b, t0 + ms(100)));
+        assert!(b.due(t0 + ms(900)).is_empty());
+        assert_eq!(b.due(t0 + ARMED_WAIT).len(), 1);
+        assert!(!feed(&mut b, t0 + ARMED_WAIT + ms(1)));
+    }
+
+    fn entry(user: UserId, rtt: u16) -> RosterEntry {
+        RosterEntry { user, short_id: 1, addr: AddrHint::default(), since_ms: 1, voice: None, muted: false, deafened: false, sharing: None, direct: true, rtt_ms: rtt }
+    }
+
+    /// RESOURCES-9: an RTT or revision change is the same roster for the UI; a mute is not.
+    #[test]
+    fn roster_signature_ignores_what_the_ui_does_not_show() {
+        let (a, b) = (tincan_core::keys::Identity::generate().user(), tincan_core::keys::Identity::generate().user());
+        let r = Roster { epoch: 1, rev: 1, host: a, online: vec![entry(a, 10), entry(b, 20)], succession: vec![b] };
+        let mut moved = r.clone();
+        moved.rev = 2;
+        moved.online[1].rtt_ms = 90;
+        moved.online.reverse();
+        assert_eq!(RosterSig::of(&r), RosterSig::of(&moved));
+        let mut muted = r.clone();
+        muted.online[1].muted = true;
+        assert_ne!(RosterSig::of(&r), RosterSig::of(&muted));
+        let mut gone = r.clone();
+        gone.online.pop();
+        assert_ne!(RosterSig::of(&r), RosterSig::of(&gone));
     }
 }
