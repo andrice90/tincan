@@ -7121,10 +7121,12 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
  "tincan-app",
  "tincan-core",
  "tokio",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
