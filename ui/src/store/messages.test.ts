@@ -1,6 +1,6 @@
 import type { Message } from "../api/types";
 import { eq, ok, test } from "../test/harness";
-import { OFFSCREEN_MAX, applyLive, keepOnSnapshot, mergeNewest, olderPageApplies, prependOlder, refreshSpan } from "./messages";
+import { OFFSCREEN_MAX, applyLive, keepOnSnapshot, mergeNewest, olderPageApplies, prependOlder, refreshRead, refreshSpan } from "./messages";
 import type { ConvMessages } from "./store";
 
 function msg(n: number, extra: Partial<Message> = {}): Message {
@@ -147,4 +147,13 @@ test("UI-LOGIC-15: a large cache of a conversation off screen is dropped instead
   // an update to a message already cached is applied in place
   const upd = applyLive(big, msg(5, { deleted: true }), { loading: false, shown: false });
   eq(upd?.list[4].deleted, true);
+});
+
+test("UI-LOGIC-05: a catch-up too long to reach the cached span installs only the first read", () => {
+  // 600 new messages: the first read (200) and two more pages (400) still miss the cached m41
+  const first = { messages: range(1001, 1200), cursor: "c1001" };
+  const extended = { messages: range(601, 1200), cursor: "c601" };
+  eq(refreshRead(first, extended, "m41"), first, "the newest page, like a plain reload");
+  const reached = { messages: range(41, 1200), cursor: "c41" };
+  eq(refreshRead(first, reached, "m41"), reached, "span reached: the whole read");
 });

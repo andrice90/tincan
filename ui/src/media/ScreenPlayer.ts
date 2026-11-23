@@ -20,6 +20,8 @@ const perTrack = keyedSerial<number>();
 
 /** How each codec string decodes on this PC (null: it can't), probed once per run. */
 const support = new Map<string, Promise<Accel | null>>();
+/** Codec strings come from the sharer's SPS, so the probe cache is bounded. */
+const SUPPORT_MAX = 32;
 
 async function supported(codec: string, hardwareAcceleration: Accel): Promise<boolean> {
   try {
@@ -38,6 +40,7 @@ function decoderSupport(codec: string): Promise<Accel | null> {
       const hw = await supported(codec, "prefer-hardware");
       return pickAccel(hw, hw || (await supported(codec, "no-preference")));
     })();
+    if (support.size >= SUPPORT_MAX) support.clear();
     support.set(codec, p);
   }
   return p;
@@ -189,6 +192,10 @@ export class ScreenPlayer {
   private probe(codec: string, first: Unit): void {
     this.probing = codec;
     this.held = [first];
+    if (this.accelFor.size >= SUPPORT_MAX) {
+      this.accelFor.clear();
+      this.fails.clear();
+    }
     void decoderSupport(codec).then((accel) => {
       this.accelFor.set(codec, accel);
       if (this.stopped || this.probing !== codec) return;
@@ -196,7 +203,7 @@ export class ScreenPlayer {
       const held = this.held;
       this.held = [];
       if (accel === null) {
-        this.onStatus({ kind: "error", text: UNDECODABLE });
+        this.undecodable();
         return;
       }
       for (const u of held) this.feed(u);
@@ -225,10 +232,16 @@ export class ScreenPlayer {
       this.decoder = null;
       this.codec = null;
       this.accelFor.set(codec, null);
-      this.onStatus({ kind: "error", text: UNDECODABLE });
+      this.undecodable();
       console.warn("VideoDecoder configure failed", codec, err);
       return false;
     }
+  }
+
+  /** Shows the can't-decode message; a later codec that decodes shows the video again. */
+  private undecodable(): void {
+    this.playing = false;
+    this.onStatus({ kind: "error", text: UNDECODABLE });
   }
 
   private closeDecoder(): void {
@@ -268,7 +281,7 @@ export class ScreenPlayer {
         break;
       case "unsupported":
         this.accelFor.set(codec, null);
-        this.onStatus({ kind: "error", text: UNDECODABLE });
+        this.undecodable();
         break;
       case "reset":
         break;

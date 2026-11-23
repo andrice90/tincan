@@ -93,6 +93,16 @@ export function pageCovers(page: MessagePage, coverId: string | null): boolean {
   return coverId === null || page.cursor === null || page.messages.some((m) => m.id === coverId);
 }
 
+/**
+ * Which read a refresh installs: the whole read when it reached the cached span (or the start
+ * of the conversation), so the cache keeps its first row. A catch-up too long to reach it
+ * replaces the cache anyway; then only the first read is installed, like a plain reload,
+ * instead of up to a thousand rows the view would render at once.
+ */
+export function refreshRead(first: MessagePage, extended: MessagePage, coverId: string | null): MessagePage {
+  return pageCovers(extended, coverId) ? extended : first;
+}
+
 /** How many messages to ask for when re-reading a cache of `cached` messages. */
 export function refreshLimit(cached: number, pageSize: number): number {
   return Math.min(MAX_PAGE, Math.max(pageSize, cached + pageSize));

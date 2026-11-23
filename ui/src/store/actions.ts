@@ -22,7 +22,7 @@ import { leaveCommand } from "./calls";
 import { addPlayedClip } from "./clips";
 import { staleTransfers, takeTransfer } from "./transfers";
 import { typingTracker } from "./typing";
-import { MAX_PAGE, applyLive, keepOnSnapshot, mergeNewest, olderPageApplies, pageCovers, prependOlder, refreshLimit, refreshSpan } from "./messages";
+import { MAX_PAGE, applyLive, keepOnSnapshot, mergeNewest, olderPageApplies, pageCovers, prependOlder, refreshLimit, refreshRead, refreshSpan } from "./messages";
 import {
   convKey,
   getState,
@@ -192,25 +192,43 @@ const REFRESH_EXTRA_PAGES = 5;
 function refreshMessages(convId: ConvId, channelId: ChannelId | null): void {
   const key = convKey(convId, channelId);
   const gen = cacheGen;
+  let failed = false;
   run(
     once(msgsKey(key), async () => {
       const cached = getState().messages[key];
       if (!cached?.loaded) return;
       const coverId = cached.list[0]?.id ?? null;
-      let page = await invoke("messages", { convId, channelId, before: null, limit: refreshLimit(cached.list.length, PAGE_SIZE) });
-      for (let i = 0; i < REFRESH_EXTRA_PAGES && page.cursor !== null && !pageCovers(page, coverId); i++) {
+      try {
+        const first = await invoke("messages", { convId, channelId, before: null, limit: refreshLimit(cached.list.length, PAGE_SIZE) });
+        let page = first;
+        for (let i = 0; i < REFRESH_EXTRA_PAGES && page.cursor !== null && !pageCovers(page, coverId); i++) {
+          if (gen !== cacheGen) return;
+          const older = await invoke("messages", { convId, channelId, before: page.cursor, limit: MAX_PAGE });
+          page = { messages: [...older.messages, ...page.messages], cursor: older.cursor };
+        }
         if (gen !== cacheGen) return;
-        const older = await invoke("messages", { convId, channelId, before: page.cursor, limit: MAX_PAGE });
-        page = { messages: [...older.messages, ...page.messages], cursor: older.cursor };
+        const read = refreshRead(first, page, coverId);
+        update((s) => {
+          const c = s.messages[key];
+          if (!c) return s;
+          const next = refreshSpan(c, read, coverId);
+          if (!next.loadingOlder) olderReq.delete(key);
+          return { ...s, messages: { ...s.messages, [key]: next } };
+        });
+      } catch (err) {
+        failed = true;
+        throw err;
       }
-      if (gen !== cacheGen) return;
+    }).finally(() => {
+      if (!failed || gen !== cacheGen) return;
+      // the kept cache may have holes and could not be re-read: drop it like any other
       update((s) => {
-        const c = s.messages[key];
-        if (!c) return s;
-        const next = refreshSpan(c, page, coverId);
-        if (!next.loadingOlder) olderReq.delete(key);
-        return { ...s, messages: { ...s.messages, [key]: next } };
+        if (!s.messages[key]) return s;
+        const messages = { ...s.messages };
+        delete messages[key];
+        return { ...s, messages };
       });
+      if (shownKey(getState()) === key) ensureMessages(convId, channelId);
     }),
   );
 }
