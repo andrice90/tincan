@@ -168,19 +168,23 @@ mod tests {
         let (tx, gate) = Gate::<u32>::new();
         tx.send_replace(Phase::Ready(1));
         let (done, handle) = counting();
+        // the fake shutdown finishes only when the test lets it
+        let release = Arc::new(tokio::sync::Notify::new());
         let t = Instant::now();
         let ok = shutdown_within(&gate, Duration::from_millis(50), |_| {
             let done = handle();
+            let release = release.clone();
             async move {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                release.notified().await;
                 done.fetch_add(1, Ordering::SeqCst);
             }
         })
         .await;
         assert!(!ok);
-        assert!(t.elapsed() < Duration::from_millis(190), "gave up at the cap");
+        assert!(t.elapsed() < Duration::from_secs(1), "gave up at the cap");
         assert_eq!(done.load(Ordering::SeqCst), 0);
-        // the shutdown task keeps going and finishes on its own
+        // the shutdown task is still there and finishes once released
+        release.notify_one();
         let deadline = Instant::now() + Duration::from_secs(5);
         while done.load(Ordering::SeqCst) == 0 {
             assert!(Instant::now() < deadline, "the shutdown was cancelled");
