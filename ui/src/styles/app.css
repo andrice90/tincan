@@ -403,6 +403,22 @@ html:has(.resize-handle.is-dragging) {
   border-radius: 50%;
 }
 
+/* A voice room row: the row button with the chat button over its right end. */
+.channel-row-wrap {
+  position: relative;
+}
+
+.channel-row-wrap .channel-row {
+  padding-right: 36px;
+}
+
+.room-chat-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  color: var(--text-3);
+}
+
 .room-people {
   padding: 0 0 var(--sp-1) 32px;
 }
@@ -625,6 +641,13 @@ html:has(.resize-handle.is-dragging) {
   font-size: var(--fs-13);
   font-weight: 400;
   color: var(--text-2);
+}
+
+.main-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
 }
 
 /* ---------------------------------------------------------------- messages */
@@ -1011,11 +1034,40 @@ button.member-row:hover {
 
 /* ---------------------------------------------------------------- voice */
 
-.voice-body {
+/* Tiles on the left, the room's chat panel on the right when open. */
+.voice-split {
   flex: 1;
   min-height: 0;
   display: flex;
+  /* the tile strip's width must not widen the window past the panel: it scrolls instead */
+  contain: inline-size;
+}
+
+.voice-body {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
   flex-direction: column;
+}
+
+.room-chat {
+  flex: none;
+  width: 340px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+}
+
+.room-chat-toggle[aria-pressed="true"] {
+  background: var(--bg-selected);
+  color: var(--text-1);
+}
+
+.room-chat-toggle.is-unread {
+  color: var(--text-1);
+  font-weight: 600;
 }
 
 .voice-empty {

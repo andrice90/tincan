@@ -413,7 +413,11 @@ fn message_rules() {
     fx.seqs.insert(m.user(), e.event.seq);
     assert_eq!(fx.state.message_authors[&e.id], m.user());
 
-    assert!(is_reject(&fx.try_apply(&m, text(fx.voice, "in voice"))));
+    // a voice room has a chat of its own
+    let v = fx.peek(&m, text(fx.voice, "in voice"));
+    assert_eq!(fx.state.apply(&v, NOW), (Verdict::Accept, Change::Message { id: v.id, channel: fx.voice }));
+    fx.seqs.insert(m.user(), v.event.seq);
+    assert_eq!(fx.state.message_authors[&v.id], m.user());
     // unknown channel: another author's ChannelCreate may still arrive
     assert_eq!(fx.try_apply(&m, text(EventId([1; 32]), "where")), Verdict::Gap);
     // ...but the owner's own channels are always known first
@@ -436,8 +440,9 @@ fn message_rules() {
     // empty message
     assert!(is_reject(&fx.try_apply(&m, text(fx.general, ""))));
     assert!(fx.state.can_post(&m.user(), &fx.general));
-    assert!(!fx.state.can_post(&m.user(), &fx.voice));
+    assert!(fx.state.can_post(&m.user(), &fx.voice));
     assert!(!fx.state.can_post(&Identity::generate().user(), &fx.general));
+    assert!(!fx.state.can_post(&Identity::generate().user(), &fx.voice));
 }
 
 #[test]
@@ -449,6 +454,35 @@ fn message_to_a_deleted_channel_is_accepted_but_not_postable() {
     assert!(!fx.state.can_post(&m.user(), &fx.general));
     // a member that had not seen the deletion yet: accepted, so every replica converges
     assert_eq!(fx.try_apply(&m, text(fx.general, "concurrent")), Verdict::Accept);
+}
+
+#[test]
+fn voice_room_chat_follows_the_text_channel_rules() {
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let a = fx.member("a");
+    let b = fx.member("b");
+    // attachments, deletes and their authority work as in a text channel
+    let with_file = Body::Message { channel: fx.voice, text: String::new(), attachments: vec![att("clip.png")] };
+    let ma = fx.ok(&a, with_file).id;
+    let mb = fx.ok(&b, text(fx.voice, "b here")).id;
+    assert!(is_reject(&fx.try_apply(&b, Body::Delete { target: ma })));
+    fx.ok(&a, Body::Delete { target: ma });
+    fx.ok(&o, Body::Delete { target: mb });
+    assert!(fx.state.deleted.contains(&ma) && fx.state.deleted.contains(&mb));
+    // same body rules
+    assert!(is_reject(&fx.try_apply(&a, text(fx.voice, ""))));
+    assert!(is_reject(&fx.try_apply(&a, text(fx.voice, &"x".repeat(MAX_TEXT_CHARS + 1)))));
+    // a non-member cannot post
+    let stranger = Identity::generate();
+    assert!(!fx.state.can_post(&stranger.user(), &fx.voice));
+    // a deleted voice room: not postable, but a concurrent message is accepted, like a text channel
+    fx.ok(&o, Body::ChannelUpdate { channel: fx.voice, name: None, position: None, deleted: Some(true) });
+    assert!(!fx.state.can_post(&a.user(), &fx.voice));
+    assert_eq!(fx.try_apply(&a, text(fx.voice, "concurrent")), Verdict::Accept);
+    // an unknown room: Gap for a member, Reject for the owner (as for text channels)
+    assert_eq!(fx.try_apply(&a, text(EventId([7; 32]), "where")), Verdict::Gap);
+    assert!(is_reject(&fx.try_apply(&o, text(EventId([7; 32]), "where"))));
 }
 
 // ------------------------------------------------------------------ deletes
@@ -671,6 +705,13 @@ fn scenario() -> (ConvId, Vec<StoredEvent>, ConvState) {
     fx.ok(&o, Body::ServerUpdate { name: Some("Renamed".into()) });
     fx.ok(&o, Body::ChannelUpdate { channel: fx.general, name: Some("lobby".into()), position: Some(2), deleted: None });
     fx.ok(&host, named("host 2"));
+    // voice room chat: a message, a delete, and a post that raced the room's deletion
+    let den = fx.ok(&o, Body::ChannelCreate { name: "den".into(), kind: ChannelKind::Voice, position: 1 }).id;
+    let v1 = fx.ok(&a, text(fx.voice, "voice chat")).id;
+    fx.ok(&c, text(den, "in den"));
+    fx.ok(&a, Body::Delete { target: v1 });
+    fx.ok(&o, Body::ChannelUpdate { channel: den, name: None, position: None, deleted: Some(true) });
+    fx.ok(&c, text(den, "posted before seeing the room go"));
 
     // sanity of the reference state
     let st = &fx.state;
@@ -685,7 +726,8 @@ fn scenario() -> (ConvId, Vec<StoredEvent>, ConvState) {
     assert_eq!(st.invites[&inv2].uses, 3);
     assert_eq!(st.invites[&fx.invite].uses, 2);
     assert_eq!(st.name, "Renamed");
-    assert!(st.deleted.contains(&m1) && st.deleted.contains(&m2));
+    assert!(st.deleted.contains(&m1) && st.deleted.contains(&m2) && st.deleted.contains(&v1));
+    assert!(st.channels[&den].deleted);
     (fx.conv, fx.log.clone(), fx.state.clone())
 }
 
@@ -968,7 +1010,7 @@ fn ingest_reports_unblocked_events_in_order() {
     assert_eq!(out[2].1, Change::Message { id: p2.id, channel: fx.general });
     // stale and rejected events are not buffered
     assert_eq!(pending.ingest(&mut fx.state, admit, NOW).0, Verdict::Stale);
-    let bad = raw(&j, fx.conv, 3, hlc_from_ms(fx.clock_ms + 12_000), text(fx.voice, "x"));
+    let bad = raw(&j, fx.conv, 3, hlc_from_ms(fx.clock_ms + 12_000), text(fx.general, ""));
     assert!(is_reject(&pending.ingest(&mut fx.state, bad, NOW).0));
     assert!(pending.is_empty());
 }

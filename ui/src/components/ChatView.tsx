@@ -1,9 +1,9 @@
-// A text channel or a DM: header, history, composer.
+// A text channel, a voice room's chat, or a DM: header, history, composer.
 
 import { useEffect } from "react";
-import { Hash, Phone, Users } from "lucide-react";
+import { Hash, Phone, Users, Volume2 } from "lucide-react";
 import type { Channel, DmSummary, ServerSummary } from "../api/types";
-import { startCall, toggleMembers, watchDm } from "../store/actions";
+import { joinVoice, startCall, toggleMembers, watchDm } from "../store/actions";
 import { convKey, useStore, type TypingEntry } from "../store/store";
 import { Avatar, ICON, IconButton, PersonName } from "./common";
 import { Composer, TypingLine } from "./Composer";
@@ -12,35 +12,58 @@ import { VoiceStage } from "./VoiceView";
 
 const NO_TYPING: TypingEntry[] = [];
 
-/** A server text channel. Mount with key = channel id so local state resets per channel. */
-export function ChannelChat({ server, channel }: { server: ServerSummary; channel: Channel }) {
+/** History, composer and typing line of a server channel; a voice room's chat uses it too. */
+export function ChannelMessages({ server, channel }: { server: ServerSummary; channel: Channel }) {
   const meId = useStore((s) => s.me?.userId ?? "");
-  const showMembers = useStore((s) => s.showMembers);
   const typing = useStore((s) => s.typing[convKey(server.id, channel.id)] ?? NO_TYPING);
-
+  const room = channel.kind === "voice";
   return (
     <>
-      <header className="main-header">
-        <h1 className="main-title">
-          <Hash size={ICON} aria-hidden="true" className="faint" />
-          <span className="truncate">
-            <bdi>{channel.name}</bdi>
-          </span>
-        </h1>
-        <IconButton label={showMembers ? "Hide members" : "Show members"} pressed={showMembers} onClick={toggleMembers}>
-          <Users size={ICON} />
-        </IconButton>
-      </header>
       <MessageList
         convId={server.id}
         channelId={channel.id}
         meId={meId}
         canModerate={server.isOwner}
         pendingName={null}
-        startText={`Start of #${channel.name}`}
+        startText={room ? `Start of the chat in ${channel.name}` : `Start of #${channel.name}`}
       />
-      <Composer convId={server.id} channelId={channel.id} placeholder={`Message #${channel.name}`} />
+      <Composer convId={server.id} channelId={channel.id} placeholder={room ? `Message ${channel.name}` : `Message #${channel.name}`} />
       <TypingLine names={typing.map((t) => t.name)} />
+    </>
+  );
+}
+
+/**
+ * A server text channel, or a voice room's chat as the whole page (opened from the sidebar,
+ * without joining voice). Mount with key = channel id so local state resets per channel.
+ */
+export function ChannelChat({ server, channel }: { server: ServerSummary; channel: Channel }) {
+  const showMembers = useStore((s) => s.showMembers);
+  const room = channel.kind === "voice";
+  const joined = useStore((s) => s.voice?.kind === "room" && s.voice.channelId === channel.id);
+  const inCall = useStore((s) => s.call !== null);
+
+  return (
+    <>
+      <header className="main-header">
+        <h1 className="main-title">
+          {room ? <Volume2 size={ICON} aria-hidden="true" className="faint" /> : <Hash size={ICON} aria-hidden="true" className="faint" />}
+          <span className="truncate">
+            <bdi>{channel.name}</bdi>
+          </span>
+        </h1>
+        <div className="main-actions">
+          {room && !joined && (
+            <button type="button" className="btn btn-primary btn-sm" disabled={inCall} onClick={() => joinVoice(server.id, channel.id)}>
+              Join voice
+            </button>
+          )}
+          <IconButton label={showMembers ? "Hide members" : "Show members"} pressed={showMembers} onClick={toggleMembers}>
+            <Users size={ICON} />
+          </IconButton>
+        </div>
+      </header>
+      <ChannelMessages server={server} channel={channel} />
     </>
   );
 }

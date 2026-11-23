@@ -50,7 +50,7 @@ function MainContent() {
       </div>
     );
   }
-  return channel.kind === "voice" ? (
+  return channel.kind === "voice" && !view.chat ? (
     <VoiceRoomView key={channel.id} server={server} channel={channel} />
   ) : (
     <ChannelChat key={channel.id} server={server} channel={channel} />
@@ -61,10 +61,12 @@ export function Shell() {
   const view = useStore((s) => s.view);
   const server = useStore(currentServer);
   const showMembers = useStore((s) => s.showMembers);
-  const channelKind = useStore((s) => {
+  // The member list goes with a chat page: a text channel or a voice room's chat page.
+  const chatPage = useStore((s) => {
     const v = s.view;
-    if (v.kind !== "server") return null;
-    return s.channels[v.serverId]?.find((c) => c.id === v.channelId)?.kind ?? null;
+    if (v.kind !== "server") return false;
+    const kind = s.channels[v.serverId]?.find((c) => c.id === v.channelId)?.kind;
+    return kind === "text" || (kind === "voice" && v.chat === true);
   });
   const soundboardOpen = useStore((s) => s.soundboardOpen && s.voice !== null);
   const sideWidth = usePanelWidth(SIDEBAR_KEY, SIDEBAR_BOUNDS);
@@ -84,7 +86,7 @@ export function Shell() {
         <MainContent />
         {soundboardOpen && <Soundboard />}
       </main>
-      {view.kind === "server" && server && showMembers && channelKind === "text" && <MemberList serverId={server.id} />}
+      {view.kind === "server" && server && showMembers && chatPage && <MemberList serverId={server.id} />}
     </div>
   );
 }

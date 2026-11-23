@@ -141,7 +141,7 @@ Body:
   ChannelCreate { name, kind: Text|Voice, position }
   ChannelUpdate { channel, name?, position?, deleted? }      owner only
   ServerUpdate  { name? }                                    owner only
-  Message       { channel, text, attachments: [Attachment] }
+  Message       { channel, text, attachments: [Attachment] }   text channel or voice room (its chat)
   Delete        { target }                                   author of target, or owner
   InviteCreate  { invite_pk, expires_ms, max_uses }
   InviteRevoke  { invite_pk }

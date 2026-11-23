@@ -89,6 +89,12 @@ Display names are chosen by each peer and are not unique. When two people the UI
 - Clip limits shown at the add step: 20 s and 5 MB (architecture.md), not the 10 s / 2 MB in design.md. Text lives in `CLIP_LIMIT_TEXT` (`src/dialogs/SoundDialogs.tsx`).
 - Mute and deafen live in the call panel only (design.md also lists a mic button in the user panel; two mute buttons side by side were redundant).
 - Opening a voice room joins it when you are not already in a room or a call.
+- Voice room chat:
+  - The chat button on a room's row (`Open chat for <room>`) opens the chat page (`View.chat`), which never joins voice; clicking the row itself keeps the old behaviour.
+  - The room header's "Chat" button toggles a 340px panel beside the tiles (`State.roomChatPanel`, kept across rooms for the session). `.voice-split` has `contain: inline-size` so the tile strip scrolls instead of widening the window.
+  - `store/chatView.ts` (`shownChat`, `roomChatMode`) is the one answer to "which chat is on screen". Loading, `mark_read`, `markSeen` and the snapshot cache all use it, so a room's chat is never marked read while only its tiles show. The row's unread state (bold, sr-only "unread messages") and the Chat button's follow the same rule.
+  - The member list shows beside a room's chat page, not beside its tiles.
+  - Known gap: a full-window stage (`.stage.is-full`) covers the open panel, but the panel still counts as on screen, so messages arriving then are marked read (the DM call stage has the same gap). The soundboard popover floats over the left of the main area and can overlap the panel in a narrow window.
 - DM typing works: `typing` takes `channelId: null` for a DM and the app sends `typing` events with `channelId: null`, shown under the DM composer.
 - Settings > Network shows "N people connected" for a server this PC hosts (the app reports no path while hosting).
 - The auto-download menu stops at 25 MB, the app's attachment limit.

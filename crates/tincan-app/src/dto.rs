@@ -75,7 +75,7 @@ pub struct ServerSummary {
     pub is_owner: bool,
     /// Connection status.
     pub connection: Connection,
-    /// Any text channel has unread messages.
+    /// Any channel (text or voice room chat) has unread messages.
     pub unread: bool,
     /// Members online, me included.
     pub online_count: u32,
@@ -105,7 +105,7 @@ pub struct Channel {
     pub kind: ChannelKind,
     /// Sort position within its kind.
     pub position: u32,
-    /// Has unread messages (text channels only).
+    /// Has unread messages (a voice room's chat counts).
     pub unread: bool,
 }
 

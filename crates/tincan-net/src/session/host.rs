@@ -1359,7 +1359,7 @@ fn member_frame(s: &mut Session, user: UserId, ctl: Ctl) -> Next {
             Next::Stay
         }
         Ctl::Typing { channel, by } => {
-            // Only for a text channel the member may post in: the budget's keys stay bounded
+            // Only for a channel (text or voice room) the member may post in: the budget's keys stay bounded
             // by members x channels.
             let may = by == user && s.ctx.replica.lock().state.can_post(&user, &channel);
             if may && h.gates.typing.take(&(user, channel), now) {

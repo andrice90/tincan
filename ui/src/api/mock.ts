@@ -317,7 +317,7 @@ function seed(): void {
   const gn = hexId("server:game-night");
   const gnGeneral = channel(gn, "general", "text", 0);
   const gnClips = channel(gn, "clips", "text", 1, true);
-  const gnLounge = channel(gn, "Lounge", "voice", 2);
+  const gnLounge = channel(gn, "Lounge", "voice", 2, true);
   const gnSquad = channel(gn, "Squad up", "voice", 3);
   st.screenTracks.set(people.alex.id, 5);
   st.servers.push({
@@ -426,6 +426,12 @@ function seed(): void {
     }],
     ["priya", 15, "the cat is me every round"],
     ["morgan", 600, "more clips tonight?"],
+  ]);
+  // A voice room's chat: links and notes dropped while people talk.
+  addMessages(gn, gnLounge.id, now - 12 * MIN, [
+    ["jordan", 0, "lobby code is 4471"],
+    ["alex", 2, "can you hear the game audio through my share?"],
+    ["priya", 3, "yes, a bit loud"],
   ]);
 
   // Book club: Riley owns it, Sam is hosting because Riley is offline.
