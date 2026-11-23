@@ -109,9 +109,20 @@ Debug build, both instances in a server text channel, not in voice, CDP disconne
 | Total (7 processes) | 428 MB working set, 175 MB private, 204 threads, 0.15% | 495 MB working set, 233 MB private, 208 threads, 0.45% |
 
 - The Rust process idles at 0% CPU with 9-12 MB of private memory.
-- **The architecture target of under 30 MB RSS for the idle Rust core is not demonstrated.** The debug build's working set is 57-58 MB. Given the 9-11 MB of private bytes, that is likely mostly the debug exe's image pages, but no release build was measured.
+- **The architecture target of under 30 MB RSS for the idle Rust core is not met by working set.** The release build (below) idles at 43-46 MB working set with 9-11 MB of private bytes. The rest is the 28 MB exe image and shared DLL pages that the working set counts. Private memory is well under 30 MB.
 - B's 5 extra threads are likely its audio engine, which stays parked after the first voice use (by design, per the app notes). Its devices were closed, as the logs show.
 - B's larger GPU and renderer processes are likely left over from decoding the screen share. This was not measured separately.
+
+### Release build
+
+Run on 2026-11-23 against `target/release/tincan.exe` from `pnpm tauri build` (`TINCAN_EXE`, offline network, real audio devices), after the final commits. All 49 checks passed on the first run, and no instance logged a warning or error. Timings were within a few ms of the debug run above. After 60 s idle, with the same setup as above:
+
+| Process | e2e-a | e2e-b |
+|---|---|---|
+| tincan.exe | 43.3 MB, 8.9 MB, 14, 0% | 46.1 MB, 10.8 MB, 18, 0% |
+| Total (7 processes) | 416 MB working set, 176 MB private, 202 threads, 4.6% | 495 MB working set, 237 MB private, 214 threads, 1.1% |
+
+e2e-a's 4.6% CPU came from two WebView2 processes during the sample: the browser process at 3.6% and a utility process at 1%. tincan.exe was at 0%. The single 10 s sample can't tell a background task from a steady cost.
 
 ## Bugs found and fixed
 

@@ -1,6 +1,6 @@
 # Review findings
 
-Status of every confirmed finding from the two review rounds on 2026-11-23. Each finding was found by one agent and confirmed by a second agent that tried to refute it. Full scenarios, the verifier's reasoning and the proposed fixes are in `round1-net-confirmed.json` and `round2-app-confirmed.json` next to this file.
+Status of every confirmed finding from the three review rounds on 2026-11-23. Each finding was found by one agent and confirmed by a second agent that tried to refute it. Full scenarios, the verifier's reasoning and the proposed fixes are in `round1-net-confirmed.json`, `round2-app-confirmed.json` and `round3-fixes-confirmed.json` next to this file. The round 3 fixes were reviewed only by the agent that wrote them.
 
 Status values: `open`, `fixed` (with the subjects of the commits that fixed it), `deferred` (with reason). Aliases share their id's row and status.
 
@@ -8,7 +8,7 @@ Round 2 fixes landed on 2026-11-23: four fix branches (`fix/net`, `fix/files-sec
 
 ## Round 3: review of the round 2 fixes
 
-Found and confirmed after the round 2 fixes landed (review of main at `afc192c`). The full entries (scenario, verifier reasoning, proposed fix) were handed to the fix agent and are summarized here.
+Found and confirmed after the round 2 fixes landed (review of main at `afc192c`). The full entries (scenario, verifier reasoning, proposed fix) are in `round3-fixes-confirmed.json`.
 
 | Id | Sev | Where | Finding | Status |
 |---|---|---|---|---|
@@ -29,6 +29,7 @@ Found and confirmed after the round 2 fixes landed (review of main at `afc192c`)
 | REGRESSION-2 | minor | `crates/tincan-app/src/pump.rs:354` | After a lag an RTT-only ConnectionChanged starts a sync that never ends, stretching bulk windows to 60 s | fixed ("Prove blob sizes before refusing, resume only from the origin, keep server shares, fix pump and UI regressions") |
 | REGRESSION-3 | minor | `ui/src/components/Composer.tsx:80` | A send that fails after switching away and back writes its text where the new box never reads it; the next keystroke loses it | fixed ("Prove blob sizes before refusing, resume only from the origin, keep server shares, fix pump and UI regressions") |
 | REGRESSION-4 | minor | `ui/src/components/VoiceView.tsx:261` | Tiles of an unjoined room start the volume slider at 100% and a release without a change overwrites the saved volume (UI-LOGIC-13 was only partly fixed) | fixed ("Prove blob sizes before refusing, resume only from the origin, keep server shares, fix pump and UI regressions") |
+| SEC-CODEC-CACHE | low | `ui/src/media/ScreenPlayer.ts:43` | A sharer cycling codec strings filled the 32-entry probe cache, which then cleared the support map, the acceleration map and the per-codec failure counts, so viewers rebuilt decoders that can't work (found by a security hook, not the review) | fixed ("Evict the oldest codec entry instead of clearing the screen decoder caches") |
 | E2E-R3-1 | minor | `ui/src/store/actions.ts:579` | A `join_server` result built before the history sync replaced the newer `server-updated` in the store, so the header kept the host's short id (found by the e2e run, reachable since bulk windows end at SyncComplete) | fixed ("Keep server-updated over an older join result; test a young server merge") |
 
 Left open by round 3:

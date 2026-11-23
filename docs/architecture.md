@@ -5,7 +5,7 @@ Locked 2026-11-22 from the research in `docs/research/` (every version and API b
 ## Goals and defaults
 
 - Windows 10/11 desktop. No accounts, nobody runs a server. One setup step: pick a display name.
-- Small footprint: one Rust process plus WebView2. Rust core target < 30 MB RSS idle, < 5% of one core in a 6-person voice call.
+- Small footprint: one Rust process plus WebView2. Rust core target < 30 MB RSS idle, < 5% of one core in a 6-person voice call. Measured idle, release build: 43-46 MB working set, 9-11 MB private (`e2e.md`); the voice-call CPU target is not measured.
 - Defaults chosen without asking (change here if wrong):
   - Server size target: up to 50 members, up to 10 in one voice room, one or two screen shares at a time.
   - New members receive full history (Discord behaviour).
