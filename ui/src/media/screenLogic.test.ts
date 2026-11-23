@@ -1,5 +1,5 @@
 import { eq, test } from "../test/harness";
-import { MAX_DECODE_QUEUE, MAX_FAILS_WITHOUT_FRAMES, afterDecoderError, keyedSerial, pickAccel, skipForBackpressure } from "./screenLogic";
+import { MAX_DECODE_QUEUE, MAX_FAILS_WITHOUT_FRAMES, afterDecoderError, keyedSerial, pickAccel, setBounded, skipForBackpressure } from "./screenLogic";
 
 const tick = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -53,4 +53,20 @@ test("RESOURCES-8: delta frames are skipped while the decoder is behind", () => 
   eq(skipForBackpressure(false, MAX_DECODE_QUEUE + 1), true);
   eq(skipForBackpressure(false, 2), false);
   eq(skipForBackpressure(true, MAX_DECODE_QUEUE + 10), false, "a keyframe resets the backlog");
+});
+
+test("SEC-CODEC-CACHE: a full codec cache evicts the oldest entry and keeps the rest", () => {
+  const m = new Map<string, number>();
+  setBounded(m, "bad", 3, 3);
+  setBounded(m, "b", 1, 3);
+  setBounded(m, "c", 1, 3);
+  setBounded(m, "bad", 4, 3); // updating a held key evicts nothing and makes it the newest
+  eq([...m.keys()].join(","), "b,c,bad");
+  for (let i = 0; i < 2; i++) setBounded(m, `junk${i}`, 0, 3);
+  eq(m.size, 3);
+  eq([...m.keys()].join(","), "bad,junk0,junk1");
+  eq(m.get("bad"), 4);
+  setBounded(m, "d", 1, 3);
+  eq(m.size, 3);
+  eq(m.has("bad"), false);
 });

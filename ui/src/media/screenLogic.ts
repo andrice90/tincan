@@ -53,3 +53,18 @@ export const MAX_DECODE_QUEUE = 8;
 export function skipForBackpressure(key: boolean, queueSize: number): boolean {
   return !key && queueSize > MAX_DECODE_QUEUE;
 }
+
+/**
+ * Sets `key` in a map bounded to `max` entries, as the newest entry. A new key evicts the
+ * least recently set entries (Map iteration is insertion order) instead of clearing the map,
+ * so a peer cycling codec strings can't wipe what this PC learned about the codecs in use.
+ */
+export function setBounded<K, V>(map: Map<K, V>, key: K, value: V, max: number): void {
+  if (!map.delete(key)) {
+    for (const oldest of map.keys()) {
+      if (map.size < max) break;
+      map.delete(oldest);
+    }
+  }
+  map.set(key, value);
+}

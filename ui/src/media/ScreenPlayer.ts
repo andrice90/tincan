@@ -5,7 +5,7 @@
 
 import { errorText, frameChannel, invoke, type FrameChannel } from "../api/client";
 import { codecFromAnnexB } from "./h264";
-import { afterDecoderError, keyedSerial, pickAccel, skipForBackpressure, type Accel } from "./screenLogic";
+import { afterDecoderError, keyedSerial, pickAccel, setBounded, skipForBackpressure, type Accel } from "./screenLogic";
 import { isWindowHidden, onWindowHidden } from "./windowState";
 
 const HEADER = 7;
@@ -40,8 +40,7 @@ function decoderSupport(codec: string): Promise<Accel | null> {
       const hw = await supported(codec, "prefer-hardware");
       return pickAccel(hw, hw || (await supported(codec, "no-preference")));
     })();
-    if (support.size >= SUPPORT_MAX) support.clear();
-    support.set(codec, p);
+    setBounded(support, codec, p, SUPPORT_MAX);
   }
   return p;
 }
@@ -192,12 +191,8 @@ export class ScreenPlayer {
   private probe(codec: string, first: Unit): void {
     this.probing = codec;
     this.held = [first];
-    if (this.accelFor.size >= SUPPORT_MAX) {
-      this.accelFor.clear();
-      this.fails.clear();
-    }
     void decoderSupport(codec).then((accel) => {
-      this.accelFor.set(codec, accel);
+      setBounded(this.accelFor, codec, accel, SUPPORT_MAX);
       if (this.stopped || this.probing !== codec) return;
       this.probing = null;
       const held = this.held;
@@ -231,7 +226,7 @@ export class ScreenPlayer {
     } catch (err) {
       this.decoder = null;
       this.codec = null;
-      this.accelFor.set(codec, null);
+      setBounded(this.accelFor, codec, null, SUPPORT_MAX);
       this.undecodable();
       console.warn("VideoDecoder configure failed", codec, err);
       return false;
@@ -272,15 +267,15 @@ export class ScreenPlayer {
     this.needKey = true;
     if (!codec || this.stopped) return;
     const fails = this.frames > 0 ? 0 : (this.fails.get(codec) ?? 0) + 1;
-    this.fails.set(codec, fails);
+    setBounded(this.fails, codec, fails, SUPPORT_MAX);
     // Chromium reports an unsupported config as OperationError, and a hardware-only failure
     // the same way: decide from whether this decoder ever produced a frame, not the name.
     switch (afterDecoderError(this.accel, this.frames > 0, fails)) {
       case "retry-software":
-        this.accelFor.set(codec, "no-preference");
+        setBounded(this.accelFor, codec, "no-preference", SUPPORT_MAX);
         break;
       case "unsupported":
-        this.accelFor.set(codec, null);
+        setBounded(this.accelFor, codec, null, SUPPORT_MAX);
         this.undecodable();
         break;
       case "reset":
