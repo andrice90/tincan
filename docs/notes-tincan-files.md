@@ -47,4 +47,5 @@ A closure `Fn(&UserId) -> bool + Send + Sync` implements both: it allows every b
 
 - `router.shutdown()` took about 3 s in the test whose node had just timed out dialing an offline provider (8 ms otherwise). The time is spent after `Files::shutdown` returned, in iroh's endpoint close; the cause is not confirmed.
 - GC was checked with a 300 ms interval in a scratch copy: tagged partial and complete blobs survived (including across a restart), a removed blob was deleted, a referenced source file was not. iroh-blobs logs `ERROR error during gc run` if a GC run overlaps store shutdown, and its GC loop stops for the rest of the session after any GC error (iroh-blobs behaviour).
+- Images (avatars, server icons): `BlobKind::Image` (tag `img-<hex>`, cap `MAX_IMAGE_BYTES` = 64 KiB, the same proven-size rules as the other kinds). `Files::held_size(hash)` gives the verified size of a complete blob without IO; the app uses it with a read-back check before it shows an image.
 - No Observe-before-fetch on the download side: a partial holder is discovered by trying it (it serves what it has, then the next provider completes the rest).

@@ -94,7 +94,7 @@ pub fn inspect(bytes: &[u8]) -> Result<ImageInfo, String> {
         return Err("That image is larger than 64 KB. Pick a smaller one.".into());
     }
     let mime = sniff(bytes).ok_or_else(|| "That isn't a PNG or WebP image.".to_string())?;
-    let (width, height) = dimensions(bytes, mime).ok_or_else(|| "That image file is damaged.".to_string())?;
+    let (width, height) = dimensions(bytes, mime).ok_or_else(|| "That image file is damaged. Pick another one.".to_string())?;
     if width == 0 || height == 0 || width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE {
         return Err(format!("That image is {width}x{height}. Use one of at most {MAX_IMAGE_SIDE}x{MAX_IMAGE_SIDE} pixels."));
     }

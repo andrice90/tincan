@@ -183,6 +183,14 @@ Throttling:
   - `file_url` returns `file_url_base + hashHex` once the blob is complete.
   - `file_for_url` reads at most 25 MiB and hands the store's buffer over without a second copy (`Vec::from(Bytes)`). The MIME is sniffed from magic bytes for common images, else the type of the cleaned file name if that is a raster image, audio or video (never the peer's declared type). Everything else, SVG and HTML included, is served as `application/octet-stream`, so nothing runs script on the app origin.
 
+## Avatars and server icons (`images.rs`)
+
+- **Upload:** `set_avatar { bytes | null }` and `set_server_icon { serverId, bytes | null }` run `tincan_core::image::inspect` on the bytes (never trusting the UI), import them as `BlobKind::Image` and mark them checked. My avatar is saved in kv `app/avatar` (JSON), given to `Net::set_avatar` (DM contacts) and published as `ProfileImage` in every server where the state differs (`ensure_avatar`, one publish in flight per server, again on each connection, like `ensure_profile`). An icon is indexed with me as author, shared with its server and published as `ServerIcon`.
+- **URLs:** `image_url(conv, dm, author, img)` returns the file URL only for an image in state `ImgState::Ok`: held, at most 64 KiB (`Files::held_size`) and read back through `inspect`. Otherwise it indexes the image as a reference (`AttRef` named `image.png` / `image.webp`) and queues `FetchReq::Image` once per session (`Core::images`, 4096 hashes). The worker downloads it as `BlobKind::Image` from the author and the holders, or checks it when already held; completion (`FileEvent::Completed` with the image kind) queues the check, and a passing check refreshes every conversation referencing the hash, the DMs, the voice DTO and, for my avatar, the snapshot. `TooLarge` marks it `Bad`; `Failed` forgets it so the next DTO retries. Image transfers emit no `transfer-updated`.
+- **Which image:** only the current one per member and server (DTOs are built from the state), so a history sync full of old avatars fetches nothing old. A DM contact's avatar is the one they announced over the DM (`Net::dm_peer_avatar`, referenced in the DM conversation), else their avatar in any shared server.
+- **Access:** see Blob access. My own current avatar is open to every peer allowed to connect (`Access::set_own_avatar`), loaded at start from kv.
+- **Tests:** `index::tests::my_avatar_goes_to_my_peers_only`, e2e `avatars_and_icons_travel_and_follow_access` (upload checks, a member fetches and shows the avatar and the icon, a DM shows the contact's avatar, a newcomer gets the avatar from a member while its author is offline, naming a DM-only blob as an avatar still gets it refused, removal).
+
 ## Blob access
 
 Admitted members and DM contacts are untrusted, and hashes are not secret: tincan-net sends one `Have` list to every host and DM peer, and anyone who can post can name any hash in a message. So knowing or naming a hash grants nothing.
