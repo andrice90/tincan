@@ -259,14 +259,21 @@ impl Core {
                 if tokio::time::timeout(Duration::from_secs(3), self.media.shutdown(self)).await.is_err() {
                     tracing::warn!("media shutdown timed out");
                 }
-                if tokio::time::timeout(NET_SHUTDOWN_BUDGET, self.net.shutdown()).await.is_err() {
-                    tracing::warn!("network shutdown timed out");
-                }
-                // Router shutdown already closed the store; this is idempotent and covers a
-                // timed-out network shutdown.
-                if tokio::time::timeout(Duration::from_secs(5), self.files.shutdown()).await.is_err() {
-                    tracing::warn!("file store shutdown timed out");
-                }
+                // The file store is flushed alongside the handoff, not after it: when Windows
+                // ends the session the shell gives the whole shutdown only a few seconds, and
+                // a slow handoff must not keep the store from being synced. The handoff needs
+                // no blobs; Router shutdown also calls `Files::shutdown` (idempotent).
+                let net = async {
+                    if tokio::time::timeout(NET_SHUTDOWN_BUDGET, self.net.shutdown()).await.is_err() {
+                        tracing::warn!("network shutdown timed out");
+                    }
+                };
+                let files = async {
+                    if tokio::time::timeout(Duration::from_secs(5), self.files.shutdown()).await.is_err() {
+                        tracing::warn!("file store shutdown timed out");
+                    }
+                };
+                tokio::join!(net, files);
                 for t in self.tasks.lock().drain(..) {
                     t.abort();
                 }
