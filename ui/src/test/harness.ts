@@ -22,7 +22,8 @@ function show(v: unknown): string {
 export function eq(actual: unknown, expected: unknown, what = "value"): void {
   const a = show(actual);
   const e = show(expected);
-  if (a !== e) throw new Error(`${what}: expected ${e}, got ${a}`);
+  const cut = (s: string) => (s.length > 400 ? `${s.slice(0, 400)}...` : s);
+  if (a !== e) throw new Error(`${what}: expected ${cut(e)}, got ${cut(a)}`);
 }
 
 /** Fails unless `cond` is true. */

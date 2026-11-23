@@ -6,12 +6,10 @@ import { errorText, pickFiles } from "../api/client";
 import type { Clip } from "../api/types";
 import { formatSeconds } from "../lib/format";
 import { fetchClip, openDialog, playClip, pushToast, removeClip, setSoundboardOpen } from "../store/actions";
+import { CLIP_EXTENSIONS } from "../store/clips";
 import { usePlaying, useStore } from "../store/store";
 import { ICON_SM, IconButton } from "./common";
 import { Menu, useMenu } from "./Menu";
-
-/** Audio files the clip picker offers. */
-export const CLIP_EXTENSIONS = ["mp3", "wav", "ogg", "flac", "m4a", "opus"];
 
 const OwnedTile = memo(function OwnedTile({ clip, disabled }: { clip: Clip; disabled: boolean }) {
   const playing = usePlaying(clip.hash);

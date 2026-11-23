@@ -2,6 +2,9 @@
 
 import type { Clip } from "../api/types";
 
+/** Audio files the clip picker offers: the formats the app decodes (no Opus decoder). */
+export const CLIP_EXTENSIONS = ["mp3", "wav", "ogg", "flac", "m4a"];
+
 /** Heard clips the app keeps per session (MAX_HEARD in tincan-app media/clips.rs). */
 export const MAX_HEARD = 50;
 

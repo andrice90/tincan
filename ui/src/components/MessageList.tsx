@@ -6,6 +6,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "rea
 import { copyText } from "../api/client";
 import type { ChannelId, ConvId, Message, UserId } from "../api/types";
 import { dayStart, formatDay, formatFull, formatTime } from "../lib/format";
+import { anchorStep } from "../lib/scroll";
 import { loadOlder, openDialog } from "../store/actions";
 import { convKey, useStore } from "../store/store";
 import { Attachment } from "./Attachment";
@@ -153,6 +154,7 @@ export function MessageList({ convId, channelId, meId, canModerate, pendingName,
   const lastKey = lastRow?.key;
   const lastMine = lastRow?.kind === "msg" && lastRow.m.authorId === meId;
   const prevLast = useRef<string | undefined>(undefined);
+  const prevFirst = useRef<string | undefined>(undefined);
 
   const requestOlder = () => {
     const el = scroller.current;
@@ -173,12 +175,16 @@ export function MessageList({ convId, channelId, meId, canModerate, pendingName,
     // my own new message always brings the view to the bottom
     if (lastKey !== prevLast.current && lastMine && prevLast.current !== undefined) stick.current = true;
     prevLast.current = lastKey;
-    if (anchor.current !== null) {
+    const step = anchorStep(anchor.current, firstKey, prevFirst.current);
+    prevFirst.current = firstKey;
+    if (step === "apply" && anchor.current !== null) {
       el.scrollTop = el.scrollHeight - anchor.current;
       anchor.current = null;
-    } else if (stick.current) {
-      el.scrollTop = el.scrollHeight;
+      return;
     }
+    if (stick.current) el.scrollTop = el.scrollHeight;
+    // rows changed below the older page still loading: keep its anchor exact
+    if (step === "recapture") anchor.current = el.scrollHeight - el.scrollTop;
   }, [rows, firstKey, lastKey, lastMine]);
 
   // Images and cards change height after render; stay pinned to the bottom when we were there.
@@ -187,7 +193,11 @@ export function MessageList({ convId, channelId, meId, canModerate, pendingName,
     const inner = content.current;
     if (!el || !inner) return;
     const ro = new ResizeObserver(() => {
-      if (stick.current && anchor.current === null) el.scrollTop = el.scrollHeight;
+      if (!stick.current) return;
+      el.scrollTop = el.scrollHeight;
+      // an older page still loading (a short first page): keep its anchor at the new bottom,
+      // or the growth would be lost once the anchor is applied
+      if (anchor.current !== null) anchor.current = el.scrollHeight - el.scrollTop;
     });
     ro.observe(inner);
     // the viewport shrinks when the composer grows or a call stage appears

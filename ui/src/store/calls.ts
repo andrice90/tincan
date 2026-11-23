@@ -1,6 +1,6 @@
 // Pure decisions for voice rooms and calls, kept apart from the store so they can be tested.
 
-import type { CallInfo, VoiceSession } from "../api/types";
+import type { CallInfo, VoiceParticipant, VoiceSession } from "../api/types";
 
 /** The command the call panel's red button sends. */
 export type LeaveCommand = "voice_leave" | "call_hangup" | null;
@@ -15,6 +15,11 @@ export function leaveCommand(voice: VoiceSession | null, call: CallInfo | null):
   if (voice?.kind === "room") return "voice_leave";
   if (voice?.kind === "call" || call) return "call_hangup";
   return null;
+}
+
+/** Where the per-user volume slider starts: this session's choice, else the saved volume. */
+export function initialVolume(chosen: number | undefined, p: VoiceParticipant): number {
+  return chosen ?? p.volume ?? 1;
 }
 
 /** Which parts the call panel shows. */

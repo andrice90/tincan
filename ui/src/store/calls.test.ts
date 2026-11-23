@@ -1,6 +1,6 @@
 import type { CallInfo, VoiceSession } from "../api/types";
 import { eq, test } from "../test/harness";
-import { callPanelParts, leaveCommand } from "./calls";
+import { callPanelParts, initialVolume, leaveCommand } from "./calls";
 
 function voice(kind: "room" | "call"): VoiceSession {
   return {
@@ -45,4 +45,11 @@ test("UI-LOGIC-09: an active call without a voice session still gets a Hang up p
   eq(callPanelParts(null, call("active")), { calling: false, voice: false, callNoAudio: true });
   eq(callPanelParts(voice("call"), call("active")), { calling: false, voice: true, callNoAudio: false });
   eq(callPanelParts(null, null), { calling: false, voice: false, callNoAudio: false });
+});
+
+test("UI-LOGIC-13: the volume slider starts at the saved volume, not 100%", () => {
+  const p = { userId: "alex", name: "Alex", muted: false, deafened: false, speaking: false, screenTrack: null, volume: 0.3 };
+  eq(initialVolume(undefined, p), 0.3, "saved by the app");
+  eq(initialVolume(0.8, p), 0.8, "moved in this session");
+  eq(initialVolume(undefined, { ...p, volume: undefined }), 1, "app without the field");
 });

@@ -1,6 +1,6 @@
 import type { Clip } from "../api/types";
 import { eq, test } from "../test/harness";
-import { MAX_HEARD, addPlayedClip } from "./clips";
+import { CLIP_EXTENSIONS, MAX_HEARD, addPlayedClip } from "./clips";
 
 function clip(hash: string, owned: boolean, name = hash): Clip {
   return { hash, name, durationMs: 1000, size: 1000, owned, heardFrom: owned ? null : "peer", transfer: null };
@@ -29,4 +29,9 @@ test("APP-MEDIA-3: an owned clip never counts against the cap and is not duplica
   const list = [clip("mine", true), clip("a", false)];
   eq(addPlayedClip(list, clip("mine", true)), list, "unchanged");
   eq(hashes(addPlayedClip(list, clip("new-owned", true))), ["mine", "a", "new-owned"]);
+});
+
+test("SPEC-GAPS-8: the Add sound picker offers only formats the app can decode", () => {
+  // tincan-audio decodes with symphonia (mp3, aac/m4a, wav, ogg vorbis, flac); it has no Opus decoder
+  eq(CLIP_EXTENSIONS, ["mp3", "wav", "ogg", "flac", "m4a"]);
 });

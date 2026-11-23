@@ -211,6 +211,11 @@ export class KeyedStore<V> {
     if (w) for (const cb of w) cb();
   }
 
+  /** Every key and value, for a resync. */
+  entries(): IterableIterator<[string, V]> {
+    return this.values.entries();
+  }
+
   /** Removes `key` and wakes its watchers. */
   delete(key: string): void {
     if (!this.values.has(key)) return;

@@ -127,6 +127,11 @@ export interface VoiceParticipant {
   speaking: boolean;
   /** Present while they share their screen. */
   screenTrack: number | null;
+  /**
+   * How loud they are for me (0..2, saved per user). Optional until the app sends it;
+   * the volume slider starts at 100% without it.
+   */
+  volume?: number;
 }
 
 export interface VoiceSession {
