@@ -6,6 +6,7 @@
 //!   `server = [0; 32]` and belongs to the conversation named by its own id.
 //! - `insert_event` is idempotent by id (returns false for a duplicate) and does not
 //!   validate (the caller already ran ConvState). It stores the `deleted` flag as given.
+//!   `insert_events` does the same for a slice, with one result per event.
 //! - `heads(conv)` = highest seq per author among stored events of that conv, sorted by author.
 //! - `events_range(conv, author, from, to)` inclusive, ascending seq.
 //! - `messages(conv, channel, before, limit)` = Message events of that channel (all channels
@@ -74,6 +75,11 @@ pub trait Storage: Send + Sync + 'static {
     /// an already stored (conv, author, seq) is refused with `CoreError::Storage` (equivocation
     /// is never persisted).
     fn insert_event(&self, ev: &StoredEvent) -> Result<bool>;
+    /// Store several events (a sync page), each with the semantics of `insert_event`. One
+    /// result per event, in order: a refused event does not affect the others. Implementations
+    /// may use one transaction (SQLite does: one commit per page instead of one per event).
+    /// The default calls `insert_event` for each.
+    fn insert_events(&self, evs: &[&StoredEvent]) -> Vec<Result<bool>> { evs.iter().map(|e| self.insert_event(e)).collect() }
     /// One event by id.
     fn event(&self, id: &EventId) -> Result<Option<StoredEvent>>;
     /// Highest seq per author, sorted by author.
@@ -429,6 +435,22 @@ mod tests {
         s.set_kv("k", b"v2").unwrap();
         assert_eq!(s.get_kv("k").unwrap(), Some(b"v2".to_vec()));
         assert!(format!("{s:?}").starts_with("MemStorage("));
+    }
+
+    #[test]
+    fn insert_events_reports_per_event() {
+        let s = MemStorage::new();
+        let a = Identity::generate();
+        let conv = ConvId([1; 32]);
+        let ch = EventId([2; 32]);
+        let m1 = msg(&a, conv, 1, 10, ch);
+        let m2 = msg(&a, conv, 2, 20, ch);
+        let other2 = ev(&a, conv, 2, 21, Body::Profile { name: "x".into() });
+        let res = s.insert_events(&[&m1, &m2, &m1, &other2]);
+        assert!(matches!(res[..], [Ok(true), Ok(true), Ok(false), Err(_)]), "{res:?}");
+        assert_eq!(s.heads(&conv).unwrap(), vec![(a.user(), 2)]);
+        assert_eq!(s.event(&m2.id).unwrap(), Some(m2), "the refused event did not replace the stored one");
+        assert!(s.insert_events(&[]).is_empty());
     }
 
     #[test]

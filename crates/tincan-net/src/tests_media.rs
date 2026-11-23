@@ -899,3 +899,59 @@ async fn n6_audio_flood_is_policed_at_the_sfu() {
         n.net.shutdown().await;
     }
 }
+
+#[test]
+fn call_short_ids_are_distinct_and_exported() {
+    let (x, y) = (UserId([1; 32]), UserId([2; 32]));
+    assert_eq!((crate::call_short_id(&x, &y), crate::call_short_id(&y, &x)), (0, 1));
+}
+
+/// Q6: the voice session reports the RTT of its media path (to the host as a member, none
+/// while hosting), and a call reports the peer's short id and the DM connection's RTT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_and_calls_report_rtt_and_the_peers_short_id() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    wire(&[&a, &b]);
+    let server = cluster(&a, &[&b]).await;
+    let voice = voice_channel(&a, &server);
+    let _sb = join_voice(&b, server, voice).await;
+    let _sa = join_voice(&a, server, voice).await;
+    connected(&[&a, &b]).await;
+    until("member RTT", Duration::from_secs(5), || b.net.voice_info().is_some_and(|v| v.rtt_ms.is_some())).await;
+    assert_eq!(a.net.voice_info().and_then(|v| v.rtt_ms), None, "no RTT while hosting");
+    a.net.voice_leave().await;
+    b.net.voice_leave().await;
+    let mut a_ev = a.net.subscribe();
+    let mut b_ev = b.net.subscribe();
+    let (info, _ca) = within("call_start", Duration::from_secs(10), a.net.call_start(b.net.me())).await.expect("call_start");
+    assert_eq!(info.peer_short_id, call_short_id(&b.net.me(), &a.net.me()));
+    assert!(info.rtt_ms.is_some(), "the DM connection is up while ringing");
+    let id = next_event(&mut b_ev, "ring", Duration::from_secs(5), |e| match e {
+        NetEvent::CallInvite { call } => Some(call.call_id),
+        _ => None,
+    })
+    .await;
+    let _cb = within("call_accept", Duration::from_secs(5), b.net.call_accept(id)).await.expect("call_accept");
+    let active = next_event(&mut a_ev, "active", Duration::from_secs(5), |e| match e {
+        NetEvent::CallUpdated { call } if call.state == CallState::Active => Some(call.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(active.rtt_ms.is_some(), "CallUpdated carries the RTT");
+    let at_b = b.net.call_info().expect("call at bob");
+    assert_eq!(at_b.peer_short_id, call_short_id(&a.net.me(), &b.net.me()));
+    assert_ne!(at_b.peer_short_id, info.peer_short_id);
+    assert!(at_b.rtt_ms.is_some());
+    until("call RTT in voice_info", Duration::from_secs(5), || a.net.voice_info().is_some_and(|v| v.peer.is_some() && v.rtt_ms.is_some())).await;
+    a.net.call_hangup().await;
+    let ended = next_event(&mut a_ev, "ended", Duration::from_secs(5), |e| match e {
+        NetEvent::CallUpdated { call } if call.state == CallState::Ended => Some(call.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(ended.rtt_ms, None);
+    for n in [a, b] {
+        n.net.shutdown().await;
+    }
+}

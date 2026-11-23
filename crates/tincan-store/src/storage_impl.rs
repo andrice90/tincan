@@ -228,6 +228,36 @@ impl Storage for SqliteStorage {
         insert_one(&self.conn(), ev)
     }
 
+    /// One transaction for the whole slice: one WAL commit per sync page instead of one per
+    /// event. A conflicting `(author, seq)` fails only its own statement (SQLite keeps the
+    /// transaction), so the rest of the page is still stored. If the transaction cannot be
+    /// opened or committed, the events are inserted one by one instead.
+    fn insert_events(&self, evs: &[&StoredEvent]) -> Vec<Result<bool>> {
+        if evs.len() < 2 {
+            return evs.iter().map(|e| self.insert_event(e)).collect();
+        }
+        let batched = {
+            let mut conn = self.conn();
+            match conn.transaction() {
+                Ok(tx) => {
+                    let res: Vec<Result<bool>> = evs.iter().map(|e| insert_one(&tx, e)).collect();
+                    match tx.commit() {
+                        Ok(()) => Some(res),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "committing a batch of events failed; inserting one by one");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "starting a batch of events failed; inserting one by one");
+                    None
+                }
+            }
+        };
+        batched.unwrap_or_else(|| evs.iter().map(|e| self.insert_event(e)).collect())
+    }
+
     fn event(&self, id: &EventId) -> Result<Option<StoredEvent>> {
         let raw = {
             let conn = self.conn();

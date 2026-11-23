@@ -6,14 +6,16 @@
 
 - `SqliteStorage::open(profile_dir.join("tincan.db"))` creates missing parent directories. `open_in_memory()` is for tests.
 - Connection settings: WAL, `synchronous=NORMAL`, `busy_timeout` 5 s, `foreign_keys=ON`, `journal_size_limit` 4 MiB, statement cache of 64.
+- Switching a fresh file to WAL needs an exclusive lock, and SQLite answers `SQLITE_BUSY` for it at once instead of calling the busy handler. Two first opens of one profile at the same moment (a double launch) used to fail with "database is locked". `PRAGMA journal_mode = WAL` is now retried on busy or locked, with pauses growing from 2 to 50 ms, until the 5 s busy timeout has passed. `simultaneous_first_open_migrates_once` (now 8 openers) failed 9 of 10 runs without the retry and passed 20 of 20 with it.
 - Schema version is `PRAGMA user_version` (`SCHEMA_VERSION = 1`). A file with a higher version is refused, not opened. Add migrations by appending to `MIGRATIONS` in `src/schema.rs`; never edit a step that has shipped.
 - Share it as `Arc<SqliteStorage>`, and coerce to `Arc<dyn Storage>` for tincan-net. It is one connection behind a mutex. Calls are short and blocking.
 
 ## Semantics chosen where the trait docs are silent
 
 - The conversation of an event is `Event.server`, except `Genesis`: it is stored under `ConvId::from_event(&id)`, because its `server` field is all zeros.
-- `insert_event`: returns `false` for a duplicate id. A *different* event with an already stored `(conv, author, seq)` returns `Err(CoreError::Storage)` and is logged at `warn`. `MemStorage` stores both, which is the one known difference. A test feeds the same events to `SqliteStorage` and `MemStorage` and checks that every other read matches.
-- `insert_events_batch(&[StoredEvent]) -> usize` (inherent method, not on the trait) inserts in one transaction. Use it for sync pages: about 70 ms for 10k events on this machine. All-or-nothing.
+- `insert_event`: returns `false` for a duplicate id. A *different* event with an already stored `(conv, author, seq)` returns `Err(CoreError::Storage)` and is logged at `warn`. `MemStorage` refuses it the same way (it used to store both). A test feeds the same events to `SqliteStorage` and `MemStorage` and checks that every other read matches.
+- `insert_events_batch(&[StoredEvent]) -> usize` (inherent method, not on the trait) inserts in one transaction: about 70 ms for 10k events on this machine. All-or-nothing.
+- `Storage::insert_events(&[&StoredEvent]) -> Vec<Result<bool>>` (the trait method tincan-net uses for every received page) also runs in one transaction, but per event: a conflicting `(author, seq)` fails only its own statement (SQLite keeps the transaction), so the rest of the page is stored. If the transaction cannot be opened or committed, the events are inserted one by one instead. 1000 events on a file database: about 81 ms one by one, 4-5 ms through `insert_events` (`insert_events_is_one_commit` prints both).
 - `messages(conv, None, ..)` pages every message of the conversation regardless of channel. This is the DM path: DM messages still carry some `channel` in `Body::Message`.
 - `state_events` returns every non-Message event, Deletes included, ordered by `(author, seq)`. As the core docs say, this is not enough for `ConvState::rebuild`. Rebuild from `heads` plus `events_range(conv, author, 1, head)`.
 - `heads` is ordered by author. `peers` is ordered by `last_seen_ms` descending, then user id. `convs` is ordered by `joined_ms`, then id.

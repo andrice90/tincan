@@ -79,8 +79,8 @@ impl Net {
         inner.media.hangup(inner);
     }
 
-    /// The current call, if any.
-    pub fn call_info(&self) -> Option<CallInfo> { self.inner().media.call_info() }
+    /// The current call, if any, with the current RTT of its DM connection.
+    pub fn call_info(&self) -> Option<CallInfo> { self.inner().media.call_info_with_rtt(self.inner()) }
 
     /// Test hook: stop (or resume) reading incoming video streams, like a viewer that cannot
     /// keep up.

@@ -169,6 +169,13 @@ impl AudioEngine {
         }
     }
 
+    /// True while the engine thread runs. False once it has stopped: it panicked (a panic
+    /// unwinds the thread and every later command fails with [`AudioError::EngineStopped`]),
+    /// or the last handle is being dropped. A stopped engine never comes back; make a new one.
+    pub fn is_running(&self) -> bool {
+        self.inner.shared.alive.load(Ordering::Acquire)
+    }
+
     /// Lists audio devices. Device ids are stable strings (cpal `DeviceId`, e.g. `wasapi:...`)
     /// to store in settings and pass to [`AudioEngine::set_devices`].
     pub fn devices() -> Result<AudioDevices> {

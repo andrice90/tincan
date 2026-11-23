@@ -28,10 +28,15 @@ Implementation notes for whoever wires `tincan-audio` into `tincan-app`. The des
 - PLC runs for at most 5 frames, then one faded frame, then silence. A 5 ms fade-in follows any silence.
 - A sequence jump of 64 or more frames in either direction resets the stream (the sender restarted).
 
+## Is the engine alive?
+
+- `AudioEngine::is_running()` is false once the engine thread has stopped: a panic unwound it, or the last handle is being dropped. Every later command then fails with `AudioError::EngineStopped` (or is dropped, for the fire-and-forget ones). A stopped engine never restarts; drop it and make a new one.
+- The event receiver closing outside shutdown means the same thing; `is_running` lets the app check without owning the receiver. Test: `tests/e2e.rs` `is_running_turns_false_when_the_engine_thread_dies` (a custom source that panics on the engine thread).
+
 ## What the app supplies
 
 - `local_track` = `track_id(short_id, KIND_VOICE)`. Remote tracks are created on their first packet (32 at most) and keyed by `header.track`. Map track to user with `track_short_id`.
-- In DM calls there is no host to hand out short ids, so both sides must use distinct track ids. A suggestion: the lower `UserId` takes short id 0.
+- In DM calls there is no host to hand out short ids, so both sides must use distinct track ids. tincan-net uses the rule "the lower `UserId` takes short id 0" and exports it as `tincan_net::call_short_id(me, peer)`; `CallInfo.peer_short_id` is the peer's.
 - `set_epoch(e)` after a host migration. Jitter-buffer state survives because track ids are stable.
 - `set_relayed(true)` when the path to the host is relay-only (raises the jitter maximum to 300 ms).
 - `set_loss_hint(pct)` from receiver reports.

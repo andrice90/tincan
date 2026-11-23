@@ -6,7 +6,13 @@
 //! applying something, which tells the sender how far its events were delivered
 //! (`NetEvent::DmDelivered`, persisted in kv). Undelivered events are retried on a backoff
 //! (30 s, 1, 2, 5, 15 min, then every 15 min) and whenever the contact shows up in a roster
-//! or an address for it is learned.
+//! or an address for it is learned. A dial asked for while one is in flight goes out at once
+//! when that dial fails and the contact's address changed meanwhile.
+//!
+//! Once a connection is up both sides send `DmProfile{name}` (their display name, again when
+//! it changes). A watched contact (`Net::dm_watch`) stays connected: a lost or failed
+//! connection is redialed on a short backoff, and a `Tick` every `dm_keepalive` keeps the
+//! contact's side from closing it as idle (every version ignores a `Tick` on a DM link).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,10 +22,10 @@ use bytes::Bytes;
 use iroh::endpoint::{Connection, SendStream};
 use parking_lot::Mutex;
 use tincan_core::event::{Body, StoredEvent};
-use tincan_core::state::{ConvState, Verdict, dm_channel};
+use tincan_core::state::{ConvState, Verdict, dm_channel, validate_name};
 use tincan_core::storage::ConvRecord;
 use tincan_core::sync::Heads;
-use tincan_core::wire::Ctl;
+use tincan_core::wire::{AddrHint, Ctl};
 use tincan_core::{ALPN_DM, BlobHash, ConvId, UserId, build, now_ms};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
@@ -35,6 +41,8 @@ use crate::replica::{Replica, ReplicaRef, send_missing};
 
 fn ack_key(conv: &ConvId) -> String { format!("net/dm_ack/{}", conv.to_hex()) }
 
+fn name_key(conv: &ConvId) -> String { format!("net/dm_name/{}", conv.to_hex()) }
+
 /// The live connection to a contact.
 #[derive(Debug)]
 struct DmLink {
@@ -49,11 +57,23 @@ struct DmLink {
 struct DmPeer {
     link: Option<DmLink>,
     dialing: bool,
+    /// The address the dial in flight started with.
+    dial_hint: Option<AddrHint>,
+    /// A dial was asked for while one was in flight.
+    redial: bool,
     failures: usize,
     retry: Option<AbortHandle>,
     ack: u64,
     ack_loaded: bool,
     holds: usize,
+    /// `DmWatch` guards alive.
+    watches: usize,
+    /// The display name the contact announced (validated), once kv was read.
+    name: Option<String>,
+    name_loaded: bool,
+    /// Reachability probes that failed in a row, and when the last one failed.
+    probe_failures: usize,
+    probe_failed_at: Option<Instant>,
 }
 
 /// Stranger DM connections (no stored conversation, no shared server) held at once.
@@ -72,6 +92,9 @@ const CALL_INVITE_BURST: u32 = 5;
 /// Call state updates per contact.
 const CALL_STATE_EVERY: Duration = Duration::from_millis(500);
 const CALL_STATE_BURST: u32 = 4;
+/// Name changes per contact that are stored and announced: a burst of 3, then one per 5 s.
+const DM_PROFILE_EVERY: Duration = Duration::from_secs(5);
+const DM_PROFILE_BURST: u32 = 3;
 
 /// Per-contact budgets of what a DM peer can make this device emit.
 #[derive(Debug)]
@@ -80,6 +103,7 @@ struct DmGates {
     typing: Buckets<UserId>,
     call_invite: Buckets<UserId>,
     call_state: Buckets<UserId>,
+    profile: Buckets<UserId>,
 }
 
 impl Default for DmGates {
@@ -89,6 +113,7 @@ impl Default for DmGates {
             typing: Buckets::new(DM_TYPING_EVERY, 1),
             call_invite: Buckets::new(CALL_INVITE_EVERY, CALL_INVITE_BURST),
             call_state: Buckets::new(CALL_STATE_EVERY, CALL_STATE_BURST),
+            profile: Buckets::new(DM_PROFILE_EVERY, DM_PROFILE_BURST),
         }
     }
 }
@@ -134,6 +159,35 @@ impl Drop for DmHold {
     }
 }
 
+/// Keeps the DM connection to a contact up while held, for presence and calls from an open
+/// DM view (`Net::dm_watch`). Dropping it lets the connection idle out as usual.
+#[derive(Debug)]
+pub struct DmWatch {
+    net: std::sync::Weak<Inner>,
+    peer: UserId,
+}
+
+impl Drop for DmWatch {
+    fn drop(&mut self) {
+        if let Some(net) = self.net.upgrade() {
+            let mut peers = net.dm.peers.lock();
+            if let Some(p) = peers.get_mut(&self.peer) {
+                p.watches = p.watches.saturating_sub(1);
+            }
+        }
+    }
+}
+
+/// The frame a watcher sends to keep the contact's side of the connection from idling out.
+/// `Tick` is ignored on DM links by every version, so older peers accept it too.
+fn keepalive() -> Ctl { Ctl::Tick { epoch: 0, t_ms: now_ms() } }
+
+/// My display name as announced to contacts, if it is a valid name.
+fn my_name(net: &Inner) -> Option<String> {
+    let name = net.cfg.read().display_name.trim().to_string();
+    validate_name(&name).ok().map(|()| name)
+}
+
 impl DmManager {
     fn bump(&self) { self.changed.send_modify(|v| *v = v.wrapping_add(1)); }
 
@@ -174,6 +228,9 @@ impl DmManager {
         Self::my_head(net, &conv) > self.ack(net, &conv, peer)
     }
 
+    /// Is a `DmWatch` on `peer` alive?
+    pub fn watched(&self, peer: &UserId) -> bool { self.peers.lock().get(peer).is_some_and(|p| p.watches > 0) }
+
     /// Record the peer's heads: update and persist the delivery ack.
     fn note_heads(&self, net: &Inner, conv: &ConvId, peer: &UserId, heads: &Heads) {
         let theirs = heads.to_map().get(&net.me).copied().unwrap_or(0);
@@ -189,11 +246,12 @@ impl DmManager {
         }
     }
 
-    /// Contacts seen online somewhere: deliver pending DMs now.
+    /// Contacts seen online somewhere (or a new address): deliver pending DMs now, and
+    /// reconnect watched contacts.
     pub fn peers_seen(&self, net: &Arc<Inner>, users: &[UserId]) {
         for u in users {
             let known = self.peers.lock().contains_key(u) || net.replica(&ConvId::dm(&net.me, u)).is_some();
-            if known && self.has_pending(net, u) {
+            if known && (self.has_pending(net, u) || self.watched(u)) {
                 self.ensure_connect(net, *u);
             }
         }
@@ -205,25 +263,49 @@ impl DmManager {
         DmHold { net: Arc::downgrade(net), peer }
     }
 
-    /// Dial `peer` unless connected or dialing.
+    /// Watch `peer`: connect now (or refresh the contact's idle timer when connected), keep
+    /// the connection up while the guard lives.
+    pub fn watch(&self, net: &Arc<Inner>, peer: UserId) -> DmWatch {
+        let guard = DmWatch { net: Arc::downgrade(net), peer };
+        if peer == net.me {
+            return guard;
+        }
+        self.peers.lock().entry(peer).or_default().watches += 1;
+        // Connected: a keepalive now, so the contact's idle timer restarts before mine checks.
+        if !self.send(&peer, &keepalive()) {
+            self.ensure_connect(net, peer);
+        }
+        guard
+    }
+
+    /// Dial `peer` unless connected or dialing. A request while a dial is in flight is
+    /// remembered: if that dial fails and the address changed meanwhile, the next dial goes
+    /// out at once instead of after the backoff.
     pub fn ensure_connect(&self, net: &Arc<Inner>, peer: UserId) {
         if peer == net.me || net.closed.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
+        let hint = net.hint(&peer);
         {
             let mut peers = self.peers.lock();
             let p = peers.entry(peer).or_default();
-            if p.link.is_some() || p.dialing {
+            if p.link.is_some() {
+                return;
+            }
+            if p.dialing {
+                p.redial = true;
                 return;
             }
             p.dialing = true;
+            p.redial = false;
+            p.dial_hint = hint.clone();
             if let Some(r) = p.retry.take() {
                 r.abort();
             }
         }
         let net2 = net.clone();
         net.tasks.spawn(async move {
-            let res = dial(&net2, peer).await;
+            let res = dial(&net2, peer, hint).await;
             match res {
                 Ok(d) => net2.dm.register(&net2, peer, d, net2.me),
                 Err(e) => {
@@ -236,14 +318,44 @@ impl DmManager {
 
     fn dial_failed(&self, net: &Arc<Inner>, peer: UserId) {
         let pending = self.has_pending(net, &peer);
-        let mut peers = self.peers.lock();
-        let p = peers.entry(peer).or_default();
-        p.dialing = false;
-        if !pending {
+        let hint_now = net.hint(&peer);
+        let redial_now = {
+            let mut peers = self.peers.lock();
+            let p = peers.entry(peer).or_default();
+            p.dialing = false;
+            // Someone asked again while this dial was out, and the address moved since it
+            // started (a contact that restarted on a new port): the old address was the
+            // reason it failed, so try the new one now.
+            let moved = std::mem::take(&mut p.redial) && p.dial_hint != hint_now;
+            p.dial_hint = None;
+            if p.link.is_some() {
+                // The contact dialed me meanwhile: nothing to retry.
+                false
+            } else if moved {
+                p.failures += 1;
+                true
+            } else {
+                self.schedule_retry(net, peer, p, pending);
+                false
+            }
+        };
+        if redial_now {
+            tracing::debug!(peer = %peer.short(), "DM address changed during a failed dial; redialing at once");
+            self.ensure_connect(net, peer);
+        }
+        // Waiters (probes) re-check whether a dial is still out.
+        self.bump();
+    }
+
+    /// Dial again later if the contact is still wanted: undelivered events (the DM backoff)
+    /// or a watch (the shorter watch backoff).
+    fn schedule_retry(&self, net: &Arc<Inner>, peer: UserId, p: &mut DmPeer, pending: bool) {
+        let watched = p.watches > 0;
+        if !pending && !watched {
             p.failures = 0;
             return;
         }
-        let delay = net.timings.dm_retry_delay(p.failures);
+        let delay = if watched { net.timings.dm_watch_retry_delay(p.failures) } else { net.timings.dm_retry_delay(p.failures) };
         p.failures += 1;
         let net2 = net.clone();
         let h = net.tasks.spawn(async move {
@@ -251,7 +363,9 @@ impl DmManager {
             if let Some(p) = net2.dm.peers.lock().get_mut(&peer) {
                 p.retry = None;
             }
-            net2.dm.ensure_connect(&net2, peer);
+            if net2.dm.has_pending(&net2, &peer) || net2.dm.watched(&peer) {
+                net2.dm.ensure_connect(&net2, peer);
+            }
         });
         if let Some(old) = p.retry.replace(h) {
             old.abort();
@@ -273,6 +387,50 @@ impl DmManager {
                 Err(_) => return Err(NetError::Unreachable("Couldn't reach them right now.".into())),
             }
         }
+    }
+
+    /// Probe: is `peer` reachable now? See `Net::dm_reachable`.
+    pub async fn reachable(&self, net: &Arc<Inner>, peer: UserId) -> bool {
+        if self.is_connected(&peer) {
+            return true;
+        }
+        if peer == net.me || net.replica(&ConvId::dm(&net.me, &peer)).is_none() {
+            return false;
+        }
+        {
+            let peers = self.peers.lock();
+            if let Some(p) = peers.get(&peer)
+                && let Some(at) = p.probe_failed_at
+                && at.elapsed() < net.timings.dm_watch_retry_delay(p.probe_failures.saturating_sub(1))
+            {
+                return false;
+            }
+        }
+        let mut rx = self.changed.subscribe();
+        self.ensure_connect(net, peer);
+        let deadline = Instant::now() + net.timings.dial + net.timings.dial;
+        let ok = loop {
+            if self.is_connected(&peer) {
+                break true;
+            }
+            if !self.peers.lock().get(&peer).is_some_and(|p| p.dialing) {
+                break false;
+            }
+            match tokio::time::timeout_at(deadline, rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => break self.is_connected(&peer),
+            }
+        };
+        let mut peers = self.peers.lock();
+        let p = peers.entry(peer).or_default();
+        if ok {
+            p.probe_failures = 0;
+            p.probe_failed_at = None;
+        } else {
+            p.probe_failures += 1;
+            p.probe_failed_at = Some(Instant::now());
+        }
+        ok
     }
 
     /// The DM connection to `peer` and its control link's live queue (calls ride on it).
@@ -302,6 +460,80 @@ impl DmManager {
         }
     }
 
+    /// My display name changed: announce it on every DM connection.
+    pub fn broadcast_profile(&self, net: &Inner) {
+        let Some(name) = my_name(net) else { return };
+        let Some(b) = link::encode(&Ctl::DmProfile { name }) else { return };
+        for p in self.peers.lock().values() {
+            if let Some(l) = &p.link {
+                let _ = l.live.try_send(b.clone());
+            }
+        }
+    }
+
+    /// Read the persisted announced name of `conv`'s contact into `p` (once).
+    fn load_name(net: &Inner, conv: &ConvId, p: &mut DmPeer) {
+        if p.name_loaded {
+            return;
+        }
+        p.name_loaded = true;
+        if let Ok(Some(v)) = net.storage.get_kv(&name_key(conv))
+            && let Ok(s) = String::from_utf8(v)
+            && validate_name(&s).is_ok()
+        {
+            p.name = Some(s);
+        }
+    }
+
+    /// The display name `peer` announced in `conv`.
+    pub fn peer_name(&self, net: &Inner, conv: &ConvId, peer: &UserId) -> Option<String> {
+        let mut peers = self.peers.lock();
+        let p = peers.entry(*peer).or_default();
+        Self::load_name(net, conv, p);
+        p.name.clone()
+    }
+
+    /// `peer` announced `raw` as its name. Kept if valid, new and within the budget; stored
+    /// and announced to the app when the conversation exists (`stored`), otherwise kept in
+    /// memory until the stranger's first message opens it.
+    fn note_name(&self, net: &Inner, peer: &UserId, conv: &ConvId, raw: &str, stored: bool) {
+        let name = raw.trim();
+        if validate_name(name).is_err() {
+            tracing::debug!(peer = %peer.short(), "ignoring an invalid DM display name");
+            return;
+        }
+        {
+            let mut peers = self.peers.lock();
+            let p = peers.entry(*peer).or_default();
+            Self::load_name(net, conv, p);
+            if p.name.as_deref() == Some(name) {
+                return;
+            }
+            if !self.gates.lock().profile.take(peer, Instant::now()) {
+                return;
+            }
+            p.name = Some(name.to_string());
+        }
+        if stored {
+            Self::persist_name(net, peer, conv, name);
+        }
+    }
+
+    /// A stranger's conversation was just opened: store the name they announced before.
+    fn flush_name(&self, net: &Inner, peer: &UserId, conv: &ConvId) {
+        let name = self.peers.lock().get(peer).and_then(|p| p.name.clone());
+        if let Some(name) = name {
+            Self::persist_name(net, peer, conv, &name);
+        }
+    }
+
+    fn persist_name(net: &Inner, peer: &UserId, conv: &ConvId, name: &str) {
+        if let Err(e) = net.storage.set_kv(&name_key(conv), name.as_bytes()) {
+            tracing::warn!(error = %e, "persisting a DM display name failed");
+        }
+        net.emit(NetEvent::DmNameChanged { conv: *conv, peer: *peer, name: name.to_string() });
+    }
+
     /// Close every DM connection.
     pub fn close_all(&self) {
         let mut peers = self.peers.lock();
@@ -319,12 +551,16 @@ impl DmManager {
     fn register(&self, net: &Arc<Inner>, peer: UserId, d: Dialed, dialer: UserId) {
         let Ctl::DmHello { conv, heads, .. } = d.reply.clone() else {
             link::close_conn(&d.conn, tincan_core::CLOSE_REJECTED, "expected DmHello");
-            self.peers.lock().entry(peer).or_default().dialing = false;
+            if dialer == net.me {
+                self.dial_failed(net, peer);
+            }
             return;
         };
         if conv != ConvId::dm(&net.me, &peer) {
             link::close_conn(&d.conn, tincan_core::CLOSE_REJECTED, "wrong conversation");
-            self.peers.lock().entry(peer).or_default().dialing = false;
+            if dialer == net.me {
+                self.dial_failed(net, peer);
+            }
             return;
         }
         let id = {
@@ -335,30 +571,40 @@ impl DmManager {
         let (tx, rx) = mpsc::channel(256);
         let sync_tx = tx.clone();
         let new_link = Link::spawn(&net.tasks, id, d.conn.clone(), d.send, d.reader, tx);
+        // One lock for "the dial is over" and "the link is up", so a waiter (`reachable`)
+        // never sees neither.
         let keep_new = {
             let mut peers = self.peers.lock();
             let p = peers.entry(peer).or_default();
             if dialer == net.me {
                 p.dialing = false;
+                p.dial_hint = None;
+                p.redial = false;
             }
             // Simultaneous dials: keep the connection dialed by the lower user id.
-            p.link.as_ref().is_none_or(|existing| dialer <= existing.dialer)
+            let keep = p.link.as_ref().is_none_or(|existing| dialer <= existing.dialer);
+            if keep {
+                if let Some(existing) = &p.link {
+                    link::close_conn(&existing.conn, tincan_core::CLOSE_NORMAL, "duplicate");
+                }
+                p.link = Some(DmLink { id, dialer, conn: d.conn.clone(), live: new_link.live() });
+                p.failures = 0;
+                p.probe_failures = 0;
+                p.probe_failed_at = None;
+                if let Some(r) = p.retry.take() {
+                    r.abort();
+                }
+            }
+            keep
         };
         if !keep_new {
             new_link.close(tincan_core::CLOSE_NORMAL, "duplicate");
+            // Waiters re-check: the dial is over and the kept connection is up.
+            self.bump();
             return;
         }
-        {
-            let mut peers = self.peers.lock();
-            let p = peers.entry(peer).or_default();
-            if let Some(existing) = &p.link {
-                link::close_conn(&existing.conn, tincan_core::CLOSE_NORMAL, "duplicate");
-            }
-            p.link = Some(DmLink { id, dialer, conn: d.conn.clone(), live: new_link.live() });
-            p.failures = 0;
-            if let Some(r) = p.retry.take() {
-                r.abort();
-            }
+        if let Some(name) = my_name(net) {
+            let _ = new_link.send(&Ctl::DmProfile { name });
         }
         self.bump();
         net.media.dm_link(net, peer);
@@ -384,14 +630,23 @@ impl DmManager {
             self.bump();
             net.media.dm_link(net, peer);
             net.emit(NetEvent::DmLinkDown { peer });
-            if self.has_pending(net, &peer) {
-                self.dial_failed(net, peer);
+            // Undelivered events or a watch: dial again on the backoff (a dial already out
+            // reschedules itself when it fails).
+            let pending = self.has_pending(net, &peer);
+            {
+                let mut peers = self.peers.lock();
+                if let Some(p) = peers.get_mut(&peer)
+                    && p.link.is_none()
+                    && !p.dialing
+                {
+                    self.schedule_retry(net, peer, p, pending);
+                }
             }
             // A stranger that left nothing behind is forgotten.
             let conv = ConvId::dm(&net.me, &peer);
             if net.replica(&conv).is_none() {
                 let mut peers = self.peers.lock();
-                if peers.get(&peer).is_some_and(|p| p.link.is_none() && p.holds == 0 && p.retry.is_none() && !p.dialing) {
+                if peers.get(&peer).is_some_and(|p| p.link.is_none() && p.holds == 0 && p.watches == 0 && p.retry.is_none() && !p.dialing) {
                     peers.remove(&peer);
                 }
             }
@@ -535,9 +790,8 @@ pub(crate) fn publish(net: &Arc<Inner>, conv: ConvId, body: Body) -> Result<Stor
     Ok(stored)
 }
 
-async fn dial(net: &Arc<Inner>, peer: UserId) -> std::result::Result<Dialed, link::DialError> {
+async fn dial(net: &Arc<Inner>, peer: UserId, hint: Option<AddrHint>) -> std::result::Result<Dialed, link::DialError> {
     let (conv, _) = open_conv(net, peer).map_err(|e| link::DialError::Unreachable(e.to_string()))?;
-    let hint = net.hint(&peer);
     let conn = link::connect(&net.endpoint, &peer, hint.as_ref(), ALPN_DM, net.timings.dial).await?;
     let hello = dm_hello(net, &conv);
     link::exchange(conn, &hello, net.timings.dial).await
@@ -616,6 +870,9 @@ impl DmSync {
     }
 }
 
+/// The empty last page of a `send_missing` run (live events never come as an empty page).
+fn is_sync_end(ctl: &Ctl) -> bool { matches!(ctl, Ctl::Events { events, more: false } if events.is_empty()) }
+
 /// Drive one DM connection until it closes or goes idle. A stranger's connection runs
 /// without a conversation until their first valid message opens one.
 async fn run_conn(
@@ -629,18 +886,38 @@ async fn run_conn(
 ) {
     let mut replica: Option<ReplicaRef> = net.replica(&conv);
     let mut sync = DmSync { running: false, queued: None, done: sync_tx };
+    // The contact's initial sync: done at once when their hello shows nothing I lack,
+    // otherwise with the empty last page of their `send_missing` (sent whenever I lack
+    // something, by every version).
+    let mut sync_pending = false;
+    // A stranger whose first message opens the conversation below: their history follows
+    // if they had any when we connected.
+    let stranger_history = first_heads.0.iter().any(|(_, s)| *s > 0);
     if let Some(r) = &replica {
+        let mine = r.lock().state.sync_heads();
+        if first_heads.missing_in(&mine).is_empty() {
+            net.emit(NetEvent::SyncComplete { conv });
+        } else {
+            sync_pending = true;
+        }
         on_heads(&net, &peer, &conv, r, &link, &mut sync, first_heads);
     }
     let idle = net.timings.dm_idle;
+    let keepalive_every = net.timings.dm_keepalive;
     let mut idle_at = Instant::now() + idle;
+    let mut ping_at = Instant::now() + keepalive_every;
     loop {
         tokio::select! {
             ev = rx.recv() => match ev {
                 Some(LinkEvent::Frame { ctl, .. }) => {
                     idle_at = Instant::now() + idle;
                     let ctl = *ctl;
+                    let mut opened_live = false;
                     if replica.is_none() {
+                        if let Ctl::DmProfile { name } = &ctl {
+                            net.dm.note_name(&net, &peer, &conv, name, false);
+                            continue;
+                        }
                         replica = stranger_frame(&net, &peer, &conv, &ctl);
                         if replica.is_none() {
                             if is_extra(&ctl) && net.dm.allow(&peer, &ctl) {
@@ -648,9 +925,16 @@ async fn run_conn(
                             }
                             continue;
                         }
+                        sync_pending = stranger_history;
+                        opened_live = !stranger_history;
                     }
                     if let Some(r) = &replica {
+                        let end = sync_pending && is_sync_end(&ctl);
                         on_frame(&net, &peer, &conv, r, &link, &mut sync, ctl);
+                        if end || opened_live {
+                            sync_pending = false;
+                            net.emit(NetEvent::SyncComplete { conv });
+                        }
                     }
                 }
                 Some(LinkEvent::SyncSent { .. }) => {
@@ -660,14 +944,23 @@ async fn run_conn(
                 }
                 Some(LinkEvent::Closed { .. }) | None => break,
             },
-            _ = tokio::time::sleep_until(idle_at) => {
-                let held = net.dm.peers.lock().get(&peer).is_some_and(|p| p.holds > 0);
-                if held || net.dm.has_pending(&net, &peer) {
-                    idle_at = Instant::now() + idle;
-                } else {
-                    tracing::debug!(peer = %peer.short(), "closing idle DM connection");
-                    link.close(tincan_core::CLOSE_NORMAL, "idle");
-                    break;
+            _ = tokio::time::sleep_until(idle_at.min(ping_at)) => {
+                let now = Instant::now();
+                let (held, watched) = net.dm.peers.lock().get(&peer).map(|p| (p.holds > 0, p.watches > 0)).unwrap_or_default();
+                if now >= ping_at {
+                    ping_at = now + keepalive_every;
+                    if watched {
+                        let _ = link.send(&keepalive());
+                    }
+                }
+                if now >= idle_at {
+                    if held || watched || net.dm.has_pending(&net, &peer) {
+                        idle_at = now + idle;
+                    } else {
+                        tracing::debug!(peer = %peer.short(), "closing idle DM connection");
+                        link.close(tincan_core::CLOSE_NORMAL, "idle");
+                        break;
+                    }
                 }
             }
         }
@@ -695,6 +988,7 @@ fn stranger_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, ctl: &Ctl) -> 
     match open_conv(net, *peer) {
         Ok(_) => {
             net.dm.strangers.lock().remove(peer);
+            net.dm.flush_name(net, peer, conv);
             net.replica(conv)
         }
         Err(e) => {
@@ -713,12 +1007,10 @@ fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef
             let mut applied = Vec::new();
             {
                 let mut r = replica.lock();
-                for signed in events {
-                    let Ok(stored) = StoredEvent::from_signed(signed) else { continue };
-                    if stored.conv() != *conv {
-                        continue;
-                    }
-                    applied.extend(r.ingest(net.storage.as_ref(), &net.hlc, stored).applied);
+                let verified: Vec<StoredEvent> =
+                    events.into_iter().filter_map(|signed| StoredEvent::from_signed(signed).ok()).filter(|s| s.conv() == *conv).collect();
+                for res in r.ingest_many(net.storage.as_ref(), &net.hlc, verified) {
+                    applied.extend(res.applied);
                 }
             }
             if !applied.is_empty() {
@@ -735,6 +1027,9 @@ fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef
             }
         }
         Ctl::DmHello { heads, .. } => on_heads(net, peer, conv, replica, link, sync, heads),
+        Ctl::DmProfile { name } => net.dm.note_name(net, peer, conv, &name, true),
+        // A watching contact's keepalive; receiving it already restarted the idle timer.
+        Ctl::Tick { .. } => {}
         other if is_extra(&other) => {
             if net.dm.allow(peer, &other) {
                 net.extra(CtlSource::Dm { peer: *peer }, other);

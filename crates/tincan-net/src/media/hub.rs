@@ -149,7 +149,46 @@ impl Drop for MemberMedia {
 
 fn emit_all(net: &Inner, events: Vec<NetEvent>) {
     for e in events {
-        net.emit(e);
+        net.emit(with_rtt(net, e));
+    }
+}
+
+/// A fresh call record (no peer state yet, no RTT).
+fn new_call_info(net: &Inner, peer: UserId, call_id: u64, state: CallState) -> CallInfo {
+    CallInfo {
+        call_id,
+        peer,
+        conv: ConvId::dm(&net.me, &peer),
+        state,
+        ended: None,
+        peer_muted: false,
+        peer_deafened: false,
+        peer_sharing: None,
+        peer_short_id: call_short_id(&peer, &net.me),
+        rtt_ms: None,
+    }
+}
+
+/// RTT of the DM connection a call rides on (None once it ended or with no connection).
+pub(crate) fn call_rtt(net: &Inner, call: &CallInfo) -> Option<u32> {
+    if call.state == CallState::Ended {
+        return None;
+    }
+    net.dm.connection(&call.peer).and_then(|c| crate::addr::path_snapshot(&c).rtt_ms)
+}
+
+/// Fill the current RTT into call events.
+fn with_rtt(net: &Inner, ev: NetEvent) -> NetEvent {
+    match ev {
+        NetEvent::CallUpdated { mut call } => {
+            call.rtt_ms = call_rtt(net, &call);
+            NetEvent::CallUpdated { call }
+        }
+        NetEvent::CallInvite { mut call } => {
+            call.rtt_ms = call_rtt(net, &call);
+            NetEvent::CallInvite { call }
+        }
+        other => other,
     }
 }
 
@@ -348,16 +387,7 @@ impl MediaHub {
                 net.dm.send(&peer, &Ctl::CallDecline { call_id });
             }
             _ => {
-                let info = CallInfo {
-                    call_id,
-                    peer,
-                    conv: ConvId::dm(&net.me, &peer),
-                    state: CallState::RingingIn,
-                    ended: None,
-                    peer_muted: false,
-                    peer_deafened: false,
-                    peer_sharing: None,
-                };
+                let info = new_call_info(net, peer, call_id, CallState::RingingIn);
                 let hold = net.dm.hold(net, peer);
                 let link = net.dm.connection(&peer).map(|c| c.stable_id());
                 let timer = Some(ring_timer(net, call_id));
@@ -545,16 +575,7 @@ impl MediaHub {
         let conn = net.dm.connect(net, peer).await?;
         let call_id = u64::from_le_bytes(random_bytes()).max(1);
         let conv = ConvId::dm(&net.me, &peer);
-        let info = CallInfo {
-            call_id,
-            peer,
-            conv,
-            state: CallState::RingingOut,
-            ended: None,
-            peer_muted: false,
-            peer_deafened: false,
-            peer_sharing: None,
-        };
+        let info = new_call_info(net, peer, call_id, CallState::RingingOut);
         if let Some(answer) = self.answer_ringing_from(net, peer) {
             return answer;
         }
@@ -571,6 +592,7 @@ impl MediaHub {
             st.call = Some(Call { info: info.clone(), voice: Some(handle), hold: Some(hold), timer, link: Some(conn.stable_id()) });
             session
         };
+        let info = CallInfo { rtt_ms: call_rtt(net, &info), ..info };
         net.emit(NetEvent::CallUpdated { call: info.clone() });
         Ok((info, session))
     }
@@ -578,7 +600,7 @@ impl MediaHub {
     /// Calling someone who is ringing me: answer their call instead.
     fn answer_ringing_from(&self, net: &Arc<Inner>, peer: UserId) -> Option<Result<(CallInfo, MediaSession)>> {
         let id = self.st.lock().call.as_ref().filter(|c| c.info.peer == peer && c.info.state == CallState::RingingIn).map(|c| c.info.call_id)?;
-        Some(self.call_accept(net, id).map(|s| (self.call_info().unwrap_or_else(|| ended_info(net, peer, id)), s)))
+        Some(self.call_accept(net, id).map(|s| (self.call_info_with_rtt(net).unwrap_or_else(|| ended_info(net, peer, id)), s)))
     }
 
     /// Answer a ringing call.
@@ -641,8 +663,13 @@ impl MediaHub {
         emit_all(net, events);
     }
 
-    /// The current call, if any.
+    /// The current call, if any (no RTT: see `call_info_with_rtt`).
     pub fn call_info(&self) -> Option<CallInfo> { self.st.lock().call.as_ref().map(|c| c.info.clone()) }
+
+    /// The current call with the current RTT of its DM connection.
+    pub fn call_info_with_rtt(&self, net: &Inner) -> Option<CallInfo> {
+        self.call_info().map(|c| CallInfo { rtt_ms: call_rtt(net, &c), ..c })
+    }
 
     /// Shutdown: end the call, leave the room.
     pub async fn shutdown(&self, net: &Arc<Inner>) {
@@ -656,16 +683,7 @@ impl MediaHub {
 
 /// Info of a call that already ended (it raced with an answer).
 fn ended_info(net: &Inner, peer: UserId, call_id: u64) -> CallInfo {
-    CallInfo {
-        call_id,
-        peer,
-        conv: ConvId::dm(&net.me, &peer),
-        state: CallState::Ended,
-        ended: Some(CallEnd::Lost),
-        peer_muted: false,
-        peer_deafened: false,
-        peer_sharing: None,
-    }
+    CallInfo { ended: Some(CallEnd::Lost), ..new_call_info(net, peer, call_id, CallState::Ended) }
 }
 
 /// Arm the ringing timeout of `call_id`.

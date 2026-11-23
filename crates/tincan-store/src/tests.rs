@@ -111,8 +111,10 @@ fn refuses_database_from_newer_version() {
 fn simultaneous_first_open_migrates_once() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("race.db");
-    let barrier = Arc::new(std::sync::Barrier::new(4));
-    let openers: Vec<_> = (0..4)
+    // Eight openers: switching a fresh file to WAL used to fail at once with "database is
+    // locked" (no busy wait) for every opener but the first.
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let openers: Vec<_> = (0..8)
         .map(|_| {
             let (path, barrier) = (path.clone(), Arc::clone(&barrier));
             std::thread::spawn(move || {
@@ -234,6 +236,52 @@ fn conflicting_author_seq_is_refused() {
     assert!(s.insert_events_batch(&[fresh.clone(), other]).is_err());
     assert_eq!(s.event(&fresh.id).expect("get"), None);
     assert_eq!(s.heads(&conv).expect("heads"), vec![(a.user(), 1)]);
+}
+
+#[test]
+fn insert_events_refuses_only_the_conflicting_event() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let s = SqliteStorage::open(dir.path().join("t.db")).expect("open");
+    let a = Identity::generate();
+    let conv = ConvId([1; 32]);
+    let first = msg(&a, conv, 1, hlc(1), chan(1), "one");
+    let other = msg(&a, conv, 1, hlc(2), chan(1), "equivocation");
+    let two = msg(&a, conv, 2, hlc(3), chan(1), "two");
+    let three = msg(&a, conv, 3, hlc(4), chan(1), "three");
+    let res = s.insert_events(&[&first, &first, &other, &two, &three]);
+    assert!(matches!(res[..], [Ok(true), Ok(false), Err(_), Ok(true), Ok(true)]), "{res:?}");
+    assert_eq!(s.heads(&conv).expect("heads"), vec![(a.user(), 3)]);
+    assert_eq!(s.event(&other.id).expect("get"), None);
+    assert_eq!(s.event(&first.id).expect("get"), Some(first.clone()));
+    // Everything was committed.
+    drop(s);
+    let s = SqliteStorage::open(dir.path().join("t.db")).expect("reopen");
+    assert_eq!(ids(&s.events_range(&conv, &a.user(), 1, 3).expect("range")), vec![first.id, two.id, three.id]);
+    assert!(s.insert_events(&[]).is_empty());
+    assert!(matches!(s.insert_events(&[&first])[..], [Ok(false)]));
+}
+
+/// One commit per sync page instead of one per event: prints both timings for 1000 events
+/// on a file database.
+#[test]
+fn insert_events_is_one_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = Identity::generate();
+    let conv = ConvId([1; 32]);
+    let events: Vec<StoredEvent> = (1..=1000u64).map(|i| msg(&a, conv, i, hlc(i), chan(1), "a short message")).collect();
+    let one_by_one = SqliteStorage::open(dir.path().join("single.db")).expect("open");
+    let t0 = Instant::now();
+    for e in &events {
+        assert!(one_by_one.insert_event(e).expect("insert"));
+    }
+    let single = t0.elapsed();
+    let batched = SqliteStorage::open(dir.path().join("batch.db")).expect("open");
+    let refs: Vec<&StoredEvent> = events.iter().collect();
+    let t0 = Instant::now();
+    assert!(batched.insert_events(&refs).iter().all(|r| matches!(r, Ok(true))));
+    let batch = t0.elapsed();
+    eprintln!("1000 events: one by one {single:?}, insert_events {batch:?}");
+    assert_eq!(batched.heads(&conv).expect("heads"), vec![(a.user(), 1000)]);
 }
 
 #[test]

@@ -609,9 +609,8 @@ impl Voice {
                 self.emit(NetEvent::TargetBitrate { track: s.track.track, bps });
             }
         }
-        if self.info.lock().relayed != relayed {
-            self.publish_info();
-        }
+        // Relayed flag and RTT (emits only on a material change).
+        self.publish_info();
     }
 
     /// Leave for good: tell the host, clear the status.
@@ -638,14 +637,19 @@ impl Voice {
         let mut info = self.info.lock();
         info.connected = false;
         info.sharing = None;
+        info.rtt_ms = None;
     }
 
-    /// Refresh the shared info; tell the app if it changed.
+    /// Refresh the shared info; tell the app if it changed (the RTT counts only when it moved
+    /// materially, so the once-a-second refresh does not turn into one event per second).
     fn publish_info(&self) {
-        let (connected, relayed) = match &self.transport {
-            Transport::None => (false, false),
-            Transport::Remote { conn, .. } => (true, crate::addr::path_snapshot(conn).relay),
-            Transport::Sfu { .. } => (true, false),
+        let (connected, relayed, rtt_ms) = match &self.transport {
+            Transport::None => (false, false, None),
+            Transport::Remote { conn, .. } => {
+                let p = crate::addr::path_snapshot(conn);
+                (true, p.relay, p.rtt_ms)
+            }
+            Transport::Sfu { .. } => (true, false, None),
         };
         let mut watching: Vec<u16> = self.subs.lock().iter().copied().collect();
         watching.sort_unstable();
@@ -661,9 +665,12 @@ impl Voice {
                 relayed,
                 sharing: self.share.as_ref().map(|s| s.track.track),
                 watching,
+                rtt_ms,
             };
-            let changed = *info != next;
-            *info = next;
+            let changed = VoiceInfo { rtt_ms: info.rtt_ms, ..next.clone() } != *info || crate::session::rtt_moved(info.rtt_ms, next.rtt_ms);
+            if changed {
+                *info = next;
+            }
             changed
         };
         if changed {
