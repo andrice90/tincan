@@ -52,6 +52,30 @@
 //! 8. DM conversations (`ConvState::new_dm(a, b)`): only `Message` and `Delete` bodies, the
 //!    author must be a or b, `Message.channel` must be `dm_channel(conv)`, a Delete may only
 //!    target the author's own message. No membership events.
+//! 9. MemberRemove: owner only, and never naming the owner (`Reject`). It needs nothing
+//!    else: a removal may arrive before the admission it ends.
+//!
+//! # Removal: void events (not part of the verdict)
+//!
+//! A removal is a cut in the removed user's own seq space, not in time: hlc cannot bound
+//! a member who keeps publishing, because an author only has to move past their own previous
+//! hlc. Rule 6 ignores removals, so the chain stays monotonic and contiguous (a re-join needs
+//! the seqs in between). Instead, validity is derived from the applied set:
+//! - `MemberRemove { user, last_seq }` makes `user`'s events with seq > `last_seq` void until
+//!   a re-admit clears it: a `MemberAdmit` naming `user` that comes after the removal by
+//!   (hlc, id), has `from_seq > last_seq` and was signed at a valid seq (the owner's always
+//!   are). Admits that came before the removal, such as the user's old admission, never clear
+//!   it. Signer validity depends on other removals, so the cleared set is a least fixpoint
+//!   (`refresh_removals`), which also stops two removed users from re-admitting each other.
+//! - A void event is stored and synced, with no effect: void messages are hidden
+//!   ([`ConvState::event_valid`]), a void Profile does not name anyone, an invite created at
+//!   a void seq admits nobody ([`ConvState::invite_status`]), and a void admit does not clear
+//!   a removal. `is_member` is false while a removal is uncleared.
+//! - Still applied from void events: a Delete of the author's own message, InviteRevoke,
+//!   MemberLeave, and a MemberAdmit of someone else. They only reach replicas through a
+//!   member that relays a removed user's events (honest hosts refuse them), and that member
+//!   could do the same with its own events.
+//! - Events up to `last_seq` stay valid whenever they arrive.
 //!
 //! # Convergence (deviations from the literal architecture rules)
 //!
@@ -159,6 +183,57 @@ pub struct Member {
     pub last_leave: Option<u64>,
     /// Lowest hlc among the events that admitted the user (Genesis for the owner).
     pub admitted_hlc: u64,
+    /// Every `MemberAdmit` naming the user, by (hlc, id).
+    pub admit_log: Vec<AdmitRecord>,
+    /// Every `MemberRemove` naming the user, by (hlc, id), with what cleared each.
+    pub removals: Vec<RemovalRecord>,
+    /// Every Profile the user signed, by (hlc, seq). `name` is the latest valid one.
+    pub profiles: Vec<ProfileRecord>,
+}
+
+/// One `MemberAdmit` naming a member.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmitRecord {
+    /// hlc of the admit.
+    pub hlc: u64,
+    /// Id of the admit.
+    pub id: EventId,
+    /// Its `from_seq`.
+    pub from_seq: u64,
+    /// Who signed it.
+    pub by: UserId,
+    /// The signer's seq for it.
+    pub by_seq: u64,
+}
+
+/// One `MemberRemove` naming a member.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalRecord {
+    /// hlc of the removal.
+    pub hlc: u64,
+    /// Id of the removal.
+    pub id: EventId,
+    /// The member's last valid seq before it.
+    pub last_seq: u64,
+    /// Derived: the lowest `from_seq` of a re-admit that clears it (after it by (hlc, id),
+    /// `from_seq > last_seq`, signed at a valid seq). None while the member stays removed.
+    pub cleared_from: Option<u64>,
+}
+
+/// One Profile a member signed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileRecord {
+    /// hlc of the Profile.
+    pub hlc: u64,
+    /// The member's seq for it.
+    pub seq: u64,
+    /// The name.
+    pub name: String,
+}
+
+/// Is a seq valid under these removals? (See [`Member::seq_valid`].)
+fn valid_under(removals: &[RemovalRecord], seq: u64) -> bool {
+    removals.iter().all(|r| r.last_seq >= seq || r.cleared_from.is_some_and(|f| f <= seq))
 }
 
 impl Member {
@@ -172,6 +247,31 @@ impl Member {
             admits: Vec::new(),
             last_leave: None,
             admitted_hlc,
+            admit_log: Vec::new(),
+            removals: Vec::new(),
+            profiles: Vec::new(),
+        }
+    }
+
+    /// Is the user's own event at `seq` valid as far as removals go? Every removal whose
+    /// `last_seq` is below `seq` must be cleared by a re-admit with `from_seq <= seq`.
+    /// Otherwise the event is void: stored and synced for seq continuity, with no effect.
+    pub fn seq_valid(&self, seq: u64) -> bool { valid_under(&self.removals, seq) }
+
+    /// Removed by the owner and not re-admitted since.
+    pub fn removed(&self) -> bool { self.removals.iter().any(|r| r.cleared_from.is_none()) }
+
+    /// `name` is the latest Profile (by hlc) signed at a valid seq.
+    fn refresh_name(&mut self) {
+        match self.profiles.iter().rev().find(|p| valid_under(&self.removals, p.seq)) {
+            Some(p) => {
+                self.name = p.name.clone();
+                self.name_hlc = p.hlc;
+            }
+            None => {
+                self.name = String::new();
+                self.name_hlc = 0;
+            }
         }
     }
 
@@ -221,6 +321,9 @@ pub struct InviteState {
     pub uses: u32,
     /// Revoked by its creator or the owner.
     pub revoked: bool,
+    /// The creator's seq for the InviteCreate. An invite created at a void seq (its creator
+    /// had been removed) admits nobody: `ConvState::invite_status` calls it Revoked.
+    pub created_seq: u64,
 }
 
 /// Why an invite cannot be used to admit someone now.
@@ -365,7 +468,25 @@ impl ConvState {
         if self.is_dm {
             return self.dm_parties.contains(user);
         }
-        self.members.get(user).map(|m| m.left_at.is_none() && !m.admits.is_empty()).unwrap_or(false)
+        self.members.get(user).map(|m| m.left_at.is_none() && !m.admits.is_empty() && !m.removed()).unwrap_or(false)
+    }
+
+    /// Was `user` removed by the owner and not re-admitted since? (Servers only.)
+    pub fn is_removed(&self, user: &UserId) -> bool { !self.is_dm && self.members.get(user).is_some_and(Member::removed) }
+
+    /// Is `author`'s event at `seq` valid, as opposed to void because the owner removed the
+    /// author before it (see [`Member::seq_valid`])? Display code hides void messages.
+    /// Always true in DMs and for authors who were never removed.
+    pub fn event_valid(&self, author: &UserId, seq: u64) -> bool {
+        self.is_dm || self.members.get(author).is_none_or(|m| m.seq_valid(seq))
+    }
+
+    /// The removal of `user` in effect now (the latest uncleared one), if any.
+    pub fn active_removal(&self, user: &UserId) -> Option<&RemovalRecord> {
+        if self.is_dm {
+            return None;
+        }
+        self.members.get(user)?.removals.iter().rev().find(|r| r.cleared_from.is_none())
     }
 
     /// Is `user` the server owner?
@@ -386,11 +507,23 @@ impl ConvState {
         self.is_member(author) && self.channels.get(channel).is_some_and(|c| c.kind == ChannelKind::Text && !c.deleted)
     }
 
+    /// Is `ev` an owner-signed removal of `me` in this server that nothing I hold has
+    /// cleared? For a removal heard directly from a host (when it refuses my Hello) that may
+    /// not apply yet because my history is behind. `ev` must be verified already.
+    pub fn removal_of(&self, ev: &StoredEvent, me: &UserId) -> bool {
+        let Body::MemberRemove { user, last_seq } = &ev.event.body else { return false };
+        if self.is_dm || ev.event.server != self.conv || user != me || self.owner != Some(ev.event.author) || *user == ev.event.author {
+            return false;
+        }
+        let key = (ev.event.hlc, ev.id);
+        !self.members.get(me).is_some_and(|m| m.admit_log.iter().any(|a| (a.hlc, a.id) > key && a.from_seq > *last_seq))
+    }
+
     /// Can the invite admit a joiner at `now_ms`? Hosts check this before authoring a
     /// `MemberAdmit` (revocation and `max_uses` are not part of event validation).
     pub fn invite_status(&self, invite_pk: &[u8; 32], now_ms: u64) -> Result<&InviteState, InviteProblem> {
         let inv = self.invites.get(invite_pk).ok_or(InviteProblem::Unknown)?;
-        if inv.revoked {
+        if inv.revoked || !self.event_valid(&inv.creator, inv.created_seq) {
             Err(InviteProblem::Revoked)
         } else if now_ms > inv.expires_ms {
             Err(InviteProblem::Expired)
@@ -601,6 +734,14 @@ impl ConvState {
         if matches!(ev.body, Body::ChannelCreate { .. } | Body::ChannelUpdate { .. } | Body::ServerUpdate { .. }) && !by_owner {
             return reject("only the owner can change channels or the server");
         }
+        if let Body::MemberRemove { user, .. } = &ev.body {
+            if !by_owner {
+                return reject("only the owner can remove members");
+            }
+            if *user == owner {
+                return reject("the owner cannot be removed");
+            }
+        }
         // 6. membership
         let member = self.members.get(&ev.author).is_some_and(|m| m.valid_at(ev.seq));
         if !member && mode != Mode::Forced {
@@ -608,9 +749,12 @@ impl ConvState {
         }
         // 7. references
         match &ev.body {
-            Body::Genesis { .. } | Body::Profile { .. } | Body::ChannelCreate { .. } | Body::ServerUpdate { .. } | Body::MemberLeave { .. } => {
-                Verdict::Accept
-            }
+            Body::Genesis { .. }
+            | Body::Profile { .. }
+            | Body::ChannelCreate { .. }
+            | Body::ServerUpdate { .. }
+            | Body::MemberLeave { .. }
+            | Body::MemberRemove { .. } => Verdict::Accept,
             Body::ChannelUpdate { channel, .. } => {
                 if self.channels.contains_key(channel) {
                     Verdict::Accept
@@ -676,7 +820,7 @@ impl ConvState {
                 }
                 validate_message(text, attachments)
             }
-            Body::Delete { .. } | Body::InviteCreate { .. } | Body::InviteRevoke { .. } => Ok(()),
+            Body::Delete { .. } | Body::InviteCreate { .. } | Body::InviteRevoke { .. } | Body::MemberRemove { .. } => Ok(()),
             Body::MemberAdmit { from_seq, .. } => {
                 if *from_seq == 0 {
                     Err("admission from_seq starts at 1".into())
@@ -708,12 +852,15 @@ impl ConvState {
                 Change::ServerRenamed
             }
             Body::Profile { name } => match self.members.get_mut(&ev.author) {
-                Some(m) if ev.hlc >= m.name_hlc => {
-                    m.name = name.clone();
-                    m.name_hlc = ev.hlc;
-                    Change::Members
+                Some(m) => {
+                    let rec = ProfileRecord { hlc: ev.hlc, seq: ev.seq, name: name.clone() };
+                    let pos = m.profiles.partition_point(|p| (p.hlc, p.seq) < (rec.hlc, rec.seq));
+                    m.profiles.insert(pos, rec);
+                    let before = m.name_hlc;
+                    m.refresh_name();
+                    if m.name_hlc != before { Change::Members } else { Change::Nothing }
                 }
-                _ => Change::Nothing,
+                None => Change::Nothing,
             },
             Body::ChannelCreate { name, kind, position } => {
                 self.channels.insert(*id, Channel { id: *id, name: name.clone(), kind: *kind, position: *position, deleted: false });
@@ -757,6 +904,7 @@ impl ConvState {
                     max_uses: *max_uses,
                     uses: 0,
                     revoked: false,
+                    created_seq: ev.seq,
                 });
                 Change::Invites
             }
@@ -770,7 +918,12 @@ impl ConvState {
                 if let Some(i) = self.invites.get_mut(invite_pk) {
                     i.uses = i.uses.saturating_add(1);
                 }
-                self.members.entry(*user).or_insert_with(|| Member::new(*user, ev.hlc)).add_admit(*from_seq, ev.hlc);
+                let m = self.members.entry(*user).or_insert_with(|| Member::new(*user, ev.hlc));
+                m.add_admit(*from_seq, ev.hlc);
+                let rec = AdmitRecord { hlc: ev.hlc, id: *id, from_seq: *from_seq, by: ev.author, by_seq: ev.seq };
+                let pos = m.admit_log.partition_point(|a| (a.hlc, a.id) < (rec.hlc, rec.id));
+                m.admit_log.insert(pos, rec);
+                self.refresh_removals();
                 Change::Members
             }
             Body::MemberLeave { last_seq } => {
@@ -778,6 +931,71 @@ impl ConvState {
                     m.add_leave(*last_seq);
                 }
                 Change::Members
+            }
+            Body::MemberRemove { user, last_seq } => {
+                let m = self.members.entry(*user).or_insert_with(|| Member::new(*user, u64::MAX));
+                let rec = RemovalRecord { hlc: ev.hlc, id: *id, last_seq: *last_seq, cleared_from: None };
+                let pos = m.removals.partition_point(|r| (r.hlc, r.id) < (rec.hlc, rec.id));
+                m.removals.insert(pos, rec);
+                self.refresh_removals();
+                Change::Members
+            }
+        }
+    }
+
+    /// Recompute which removals are cleared, and with them which seqs are void, who is
+    /// removed and the affected display names. A re-admit clears a removal only if it comes
+    /// after it by (hlc, id), has `from_seq > last_seq`, and its signer was valid at the
+    /// admit's seq (the owner always is). Signer validity depends on other removals, so this
+    /// is a least fixpoint: start with nothing cleared and widen until stable. It is a pure
+    /// function of the applied admits and removals, so every delivery order ends the same.
+    fn refresh_removals(&mut self) {
+        let mut removed: Vec<UserId> = self.members.iter().filter(|(_, m)| !m.removals.is_empty()).map(|(u, _)| *u).collect();
+        if removed.is_empty() {
+            return;
+        }
+        removed.sort();
+        for u in &removed {
+            if let Some(m) = self.members.get_mut(u) {
+                for r in &mut m.removals {
+                    r.cleared_from = None;
+                }
+            }
+        }
+        let owner = self.owner;
+        loop {
+            let mut changed = false;
+            for u in &removed {
+                let Some(m) = self.members.get(u) else { continue };
+                let mut updates = Vec::new();
+                for (i, r) in m.removals.iter().enumerate() {
+                    let best = m
+                        .admit_log
+                        .iter()
+                        .filter(|a| (a.hlc, a.id) > (r.hlc, r.id) && a.from_seq > r.last_seq)
+                        .filter(|a| Some(a.by) == owner || self.members.get(&a.by).is_none_or(|s| s.seq_valid(a.by_seq)))
+                        .map(|a| a.from_seq)
+                        .min();
+                    if best != r.cleared_from {
+                        updates.push((i, best));
+                    }
+                }
+                if !updates.is_empty() {
+                    changed = true;
+                    if let Some(m) = self.members.get_mut(u) {
+                        for (i, best) in updates {
+                            m.removals[i].cleared_from = best;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for u in &removed {
+            if let Some(m) = self.members.get_mut(u) {
+                m.refresh_name();
             }
         }
     }
