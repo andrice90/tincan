@@ -146,11 +146,16 @@ pub enum Body {
         /// The author's last valid seq: this event's seq or the one before.
         last_seq: u64,
     },
-    /// Index 11 is reserved for `MemberRemove` (kicking members), built on another branch.
-    /// This placeholder only keeps the image bodies below at 12 and 13: drop it when that
-    /// branch is merged. Every replica rejects it.
-    #[doc(hidden)]
-    ReservedMemberRemove,
+    /// Owner only, never naming the owner. `user`'s events with seq > `last_seq` are void
+    /// (stored and synced for seq continuity, with no effect) until a later re-admit: a
+    /// `MemberAdmit` after this event by (hlc, id), with `from_seq > last_seq`, whose own
+    /// author was valid at that seq. Their events up to `last_seq` stay valid.
+    MemberRemove {
+        /// The member removed.
+        user: UserId,
+        /// `user`'s last valid seq: the owner's head for `user` when signing.
+        last_seq: u64,
+    },
     /// The author's avatar (`None` clears it). Latest by (hlc, id) wins, like `Profile`.
     ProfileImage {
         /// The image, or none.
@@ -178,7 +183,7 @@ impl Body {
             Body::InviteRevoke { .. } => "invite_revoke",
             Body::MemberAdmit { .. } => "member_admit",
             Body::MemberLeave { .. } => "member_leave",
-            Body::ReservedMemberRemove => "reserved_11",
+            Body::MemberRemove { .. } => "member_remove",
             Body::ProfileImage { .. } => "profile_image",
             Body::ServerIcon { .. } => "server_icon",
         }
@@ -405,7 +410,7 @@ mod tests {
             Body::InviteRevoke { invite_pk: [0; 32] }.kind_tag(),
             Body::MemberAdmit { user: UserId::default(), invite_pk: [0; 32], from_seq: 1 }.kind_tag(),
             Body::MemberLeave { last_seq: 0 }.kind_tag(),
-            Body::ReservedMemberRemove.kind_tag(),
+            Body::MemberRemove { user: UserId::default(), last_seq: 0 }.kind_tag(),
             Body::ProfileImage { image: None }.kind_tag(),
             Body::ServerIcon { image: None }.kind_tag(),
         ];
@@ -420,7 +425,7 @@ mod tests {
         assert_eq!(idx(&Body::Genesis { name: String::new(), owner: UserId::default(), nonce: [0; 16] }), 0);
         assert_eq!(idx(&Body::Message { channel: EventId::default(), text: String::new(), attachments: vec![] }), 5);
         assert_eq!(idx(&Body::MemberLeave { last_seq: 0 }), 10);
-        assert_eq!(idx(&Body::ReservedMemberRemove), 11);
+        assert_eq!(idx(&Body::MemberRemove { user: UserId::default(), last_seq: 0 }), 11);
         assert_eq!(idx(&Body::ProfileImage { image: None }), 12);
         assert_eq!(idx(&Body::ServerIcon { image: None }), 13);
     }

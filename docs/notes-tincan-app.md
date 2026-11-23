@@ -53,6 +53,7 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 3. `Files::load(blobs, endpoint, policy)`. The policy is `index::Policy` over `Arc<RwLock<Access>>` (see Blob access below). It starts empty, so nobody can connect until step 5 fills in the conversations. Then the shares of every held blob are read from kv (`load_shares`).
    - Conversation membership is rebuilt from the cached views on startup, joins and leaves.
    - It is rebuilt at once on a `Members` change, so a new member can fetch right after joining.
+   - A removal is a `Members` change too: the removed user is no current member, so nobody serves them through that server. A server I was removed from is left out of the set entirely (`update_policy` skips it), so its members fetch nothing from me through it and its host is told nothing.
 4. `Net::start(.., |b| b.accept(tincan_files::ALPN, files.protocol()))`. Then subscribe to both event streams. The `Have` list is set in step 5 (`update_policy` calls `announce`).
 5. Warm every view and DM delivery mark. Spawn the pump and the fetch worker. Read `files.partial_downloads()` for resuming later.
 
@@ -117,6 +118,8 @@ Rules from api.md and the task:
 | `SyncComplete` | ends the conversation's bulk window at once (one refresh plus the `snapshot`) |
 | `DmAvatarChanged` | `dm-updated` and the call or voice DTO for that contact (the avatar is fetched when the DM summary is built) |
 | `FileEvent::Completed` (image) | queues the read-back check; a passing check refreshes what shows the image |
+| `EventAdded` + a `MemberRemove` of someone else | stops sharing their avatar with that server (`drop_naming`); outside a bulk window, `toast` "X was removed from Y." |
+| `Removed` (I was removed) | leaves my voice room there, view invalidated, `snapshot` (`removed: true`), `toast` "You were removed from Y." |
 | `DmNameChanged` | `dm-updated`, the contact record's name, `call-updated` / `voice-updated` when they show the contact (no `snapshot`: a peer can send names often) |
 | `ConvUpdated` + `Channels` deleting my voice room | `Media::on_channels`: I leave the room ("The voice room was deleted.") |
 | `Typing` | `typing` (`channelId` null for DMs), never for my own typing |

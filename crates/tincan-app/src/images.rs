@@ -297,6 +297,13 @@ impl Core {
         self.image_url(view.conv, view.is_dm, *user, img)
     }
 
+    /// The owner removed `user` from `server`: their avatar is no longer named there, so I
+    /// stop sharing it with that server (unless someone else there names the same image).
+    pub(crate) fn on_member_removed(&self, server: ConvId, user: UserId) {
+        let Some(Some(img)) = self.net.with_state(&server, |st| st.members.get(&user).and_then(|m| m.avatar.clone())) else { return };
+        self.update_info(img.hash, |i| i.drop_naming(server, &user));
+    }
+
     /// The URL of a server's icon.
     pub(crate) fn icon_url(&self, view: &crate::views::ConvView) -> Option<String> {
         let img = view.icon.as_ref()?;

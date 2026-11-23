@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 import { Hash, Phone, Users, Volume2 } from "lucide-react";
 import type { Channel, DmSummary, ServerSummary } from "../api/types";
-import { joinVoice, startCall, toggleMembers, watchDm } from "../store/actions";
+import { joinVoice, openDialog, startCall, toggleMembers, watchDm } from "../store/actions";
 import { convKey, useStore, type TypingEntry } from "../store/store";
 import { Avatar, ICON, IconButton, PersonName } from "./common";
 import { Composer, TypingLine } from "./Composer";
@@ -27,8 +27,14 @@ export function ChannelMessages({ server, channel }: { server: ServerSummary; ch
         pendingName={null}
         startText={room ? `Start of the chat in ${channel.name}` : `Start of #${channel.name}`}
       />
-      <Composer convId={server.id} channelId={channel.id} placeholder={room ? `Message ${channel.name}` : `Message #${channel.name}`} />
-      <TypingLine names={typing.map((t) => t.name)} />
+      {server.removed ? (
+        <RemovedNote />
+      ) : (
+        <>
+          <Composer convId={server.id} channelId={channel.id} placeholder={room ? `Message ${channel.name}` : `Message #${channel.name}`} />
+          <TypingLine names={typing.map((t) => t.name)} />
+        </>
+      )}
     </>
   );
 }
@@ -53,7 +59,7 @@ export function ChannelChat({ server, channel }: { server: ServerSummary; channe
           </span>
         </h1>
         <div className="main-actions">
-          {room && !joined && (
+          {room && !joined && !server.removed && (
             <button type="button" className="btn btn-primary btn-sm" disabled={inCall} onClick={() => joinVoice(server.id, channel.id)}>
               Join voice
             </button>
@@ -65,6 +71,20 @@ export function ChannelChat({ server, channel }: { server: ServerSummary; channe
       </header>
       <ChannelMessages server={server} channel={channel} />
     </>
+  );
+}
+
+/** In place of the composer once the owner removed me: the history stays readable. */
+function RemovedNote() {
+  return (
+    <div className="composer-wrap">
+      <div className="removed-note" role="status">
+        <span>You were removed from this server.</span>
+        <button type="button" className="btn btn-ghost" onClick={() => openDialog({ kind: "join-server" })}>
+          Join again
+        </button>
+      </div>
+    </div>
   );
 }
 

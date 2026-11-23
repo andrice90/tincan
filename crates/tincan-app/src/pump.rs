@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tincan_core::event::Body;
 use tincan_core::state::{Change, dm_channel};
 use tincan_core::wire::{AddrHint, Roster};
 use tincan_core::{ChannelId, ConvId, UserId};
@@ -37,7 +38,7 @@ use tokio::time::Instant;
 use crate::app::Core;
 use crate::dto::{self, ToastKind};
 use crate::emit::Ev;
-use crate::views::Refresh;
+use crate::views::{Refresh, display};
 
 /// Debounce of non-message refreshes.
 pub(crate) const DEBOUNCE: Duration = Duration::from_millis(100);
@@ -473,6 +474,11 @@ impl Pump {
         match ev {
             NetEvent::EventAdded { conv, event, change } => match change {
                 Change::Message { .. } => {
+                    // A void message (signed by a removed member after the removal) is
+                    // stored for seq continuity only: not shown, not fetched.
+                    if core.view(&conv).is_some_and(|v| !v.event_valid(&event.event.author, event.event.seq)) {
+                        return;
+                    }
                     let n = self.batch_counts.get(&conv).copied().unwrap_or(1);
                     if !self.bulks.on_message(conv, n, Instant::now()) {
                         core.emit_message(Ev::MessageAdded, &conv, &event);
@@ -482,6 +488,22 @@ impl Pump {
                         self.mark(conv, what);
                     }
                     core.auto_fetch(conv, &event);
+                }
+                Change::Members => {
+                    // A removal of someone else (my own comes as `NetEvent::Removed`): their
+                    // avatar is no longer shared through this server. Only a live one is
+                    // toasted; removals replayed by a history sync stay quiet.
+                    if let Body::MemberRemove { user, .. } = &event.event.body
+                        && *user != core.me
+                    {
+                        core.on_member_removed(conv, *user);
+                        if !self.bulks.contains(&conv)
+                            && let Some(view) = core.view(&conv)
+                        {
+                            let who = core.author_name(&view, user);
+                            core.toast(ToastKind::Info, format!("{who} was removed from {}.", display(&view.name, "the server")));
+                        }
+                    }
                 }
                 Change::Deleted { target } => {
                     let n = self.batch_counts.get(&conv).copied().unwrap_or(1);
@@ -590,6 +612,17 @@ impl Pump {
                 self.dms_dirty = true;
                 self.snapshot_due = true;
                 self.schedule();
+            }
+            NetEvent::Removed { server } => {
+                core.media.on_removed(&core, server);
+                core.invalidate_view(&server);
+                self.mark(server, Refresh::ALL);
+                self.policy_dirty = true;
+                self.snapshot_due = true;
+                self.schedule();
+                if let Some(view) = core.view(&server) {
+                    core.toast(ToastKind::Info, format!("You were removed from {}.", display(&view.name, "a server")));
+                }
             }
             NetEvent::Error { message, .. } => core.toast(ToastKind::Error, message),
             NetEvent::DmLinkUp { peer } => {

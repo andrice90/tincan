@@ -45,7 +45,9 @@ Pure UI logic has dependency-free tests: from `ui/`, run `node --experimental-st
 
 Used automatically outside Tauri (`window.__TAURI_INTERNALS__` missing). Loaded with a dynamic import, so the production bundle only fetches it in a browser.
 
-URL flags: `?fresh` (name picker, no servers), `?noenc` (screen_start fails with `no-hardware-encoder`), `?ring` (incoming call from Alex), `?noanswer` (outgoing calls ring for 45 s, then "X didn't answer."). Console helpers on `window.tincanMock`:
+URL flags: `?fresh` (name picker, no servers), `?noenc` (screen_start fails with `no-hardware-encoder`), `?ring` (incoming call from Alex), `?noanswer` (outgoing calls ring for 45 s, then "X didn't answer."), `?removed` (Sam starts removed from Book club; any valid-looking invite brings him back).
+
+Removing a member: the owner's member menu (click or right-click a member) has "Remove from server", confirmed by a dialog. A server with `removed: true` shows "You were removed" in its header, a note with "Join again" in place of the composer, and "Join again" in its menu instead of "Invite people". `withCreatedServer` lets a re-join result replace the removed copy. Console helpers on `window.tincanMock`:
 
 - `ring(name)`, `online(name)`, `offline(name)` (Riley coming online delivers pending DMs), `migrate()` (Game night host moves to Morgan), `toast(text)`.
 - For scripted checks: `state()` (the mock's voice and call), `addMember(name, server?)` (a name clash), `soundFlood(count)` (heard clips nobody owns), `snapshot()`, `delay(command, ms, reply?)` (latency before the command runs, or with `reply` after it ran, so events sent meanwhile arrive before its result), `post(name, text, channel?)` and `typing(name, channel?)` (Game night channels), `finishQuietly(fileName)` (a download completes with its final event dropped).

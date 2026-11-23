@@ -12,7 +12,8 @@ import { ICON_SM, IconButton, PersonName, SpeakingAvatar, UnreadBadge } from "./
 import { Menu, useMenu, type MenuItem } from "./Menu";
 
 /** One line of host state for the header. */
-export function hostLine(c: Connection, meId: string | undefined): string {
+export function hostLine(c: Connection, meId: string | undefined, removed = false): string {
+  if (removed) return "You were removed";
   switch (c.state) {
     case "connecting":
       return "Connecting";
@@ -46,9 +47,9 @@ export function ChannelSidebar({ server }: { server: ServerSummary }) {
   const rooms = sorted.filter((c) => c.kind === "voice");
   const conn = server.connection;
 
-  const items: MenuItem[] = [
-    { label: "Invite people", icon: <UserPlus size={ICON_SM} />, onSelect: () => openDialog({ kind: "invite", serverId: server.id }) },
-  ];
+  const items: MenuItem[] = server.removed
+    ? [{ label: "Join again", icon: <UserPlus size={ICON_SM} />, onSelect: () => openDialog({ kind: "join-server" }) }]
+    : [{ label: "Invite people", icon: <UserPlus size={ICON_SM} />, onSelect: () => openDialog({ kind: "invite", serverId: server.id }) }];
   if (server.isOwner) {
     items.push(
       { label: "Rename server", icon: <Pencil size={ICON_SM} />, onSelect: () => openDialog({ kind: "rename-server", serverId: server.id }) },
@@ -86,8 +87,8 @@ export function ChannelSidebar({ server }: { server: ServerSummary }) {
           <span className="side-title truncate">
             <bdi>{server.name}</bdi>
           </span>
-          <span className={conn.state === "offline" || conn.state === "connecting" ? "side-sub is-warn" : "side-sub"}>
-            {hostLine(conn, meId)}
+          <span className={server.removed || conn.state === "offline" || conn.state === "connecting" ? "side-sub is-warn" : "side-sub"}>
+            {hostLine(conn, meId, server.removed)}
           </span>
         </span>
         <ChevronDown size={ICON_SM} aria-hidden="true" />

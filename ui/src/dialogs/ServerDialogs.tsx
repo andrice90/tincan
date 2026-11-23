@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { errorText, invoke } from "../api/client";
-import type { ChannelId, ChannelKind, Message, ServerId } from "../api/types";
+import type { ChannelId, ChannelKind, Message, ServerId, UserId } from "../api/types";
 import {
   addContact,
   closeDialog,
@@ -11,6 +11,7 @@ import {
   deleteChannel,
   deleteMessage,
   joinServer,
+  kickMember,
   leaveServer,
   renameChannel,
   renameServer,
@@ -320,6 +321,22 @@ export function ConfirmLeaveServer({ serverId }: { serverId: ServerId }) {
       body="You can rejoin with a new invite."
       label="Leave server"
       action={() => leaveServer(serverId)}
+    />
+  );
+}
+
+export function ConfirmKickMember({ serverId, userId, name }: { serverId: ServerId; userId: UserId; name: string }) {
+  const server = useStore((s) => s.servers.find((x) => x.id === serverId));
+  return (
+    <ConfirmDialog
+      title={
+        <>
+          Remove <bdi>{name}</bdi> from <bdi>{server?.name ?? "this server"}</bdi>?
+        </>
+      }
+      body="They're disconnected right away. They can rejoin with any invite code that still works."
+      label="Remove"
+      action={() => kickMember(serverId, userId)}
     />
   );
 }

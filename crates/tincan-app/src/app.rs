@@ -308,6 +308,11 @@ impl Core {
     pub(crate) fn update_policy(&self) {
         let mut convs = HashMap::new();
         for conv in self.net.convs() {
+            // A server I was removed from is no conversation of mine any more: its members
+            // fetch nothing from me through it, and its host is told nothing.
+            if self.net.is_removed(&conv) {
+                continue;
+            }
             if let Some(v) = self.view(&conv) {
                 let users: HashSet<UserId> = if v.is_dm { v.peer.into_iter().collect() } else { v.members.iter().copied().collect() };
                 convs.insert(conv, Members { dm: v.is_dm, users });

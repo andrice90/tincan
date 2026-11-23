@@ -7,6 +7,7 @@ import {
   AddContactDialog,
   ConfirmDeleteChannel,
   ConfirmDeleteMessage,
+  ConfirmKickMember,
   ConfirmLeaveServer,
   CreateChannelDialog,
   CreateServerDialog,
@@ -40,6 +41,9 @@ export function Dialogs() {
         break;
       case "leave-server":
         node = <ConfirmLeaveServer serverId={d.serverId} />;
+        break;
+      case "kick-member":
+        node = <ConfirmKickMember serverId={d.serverId} userId={d.userId} name={d.name} />;
         break;
       case "create-channel":
         node = <CreateChannelDialog serverId={d.serverId} initialKind={d.channelKind} />;

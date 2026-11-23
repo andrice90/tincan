@@ -102,6 +102,18 @@ impl HashInfo {
         true
     }
 
+    /// Forgets that `author` named the hash in `conv`, and stops sharing it with `conv` once
+    /// nobody else there names it. True if anything changed.
+    pub fn drop_naming(&mut self, conv: ConvId, author: &UserId) -> bool {
+        let before = (self.refs.len(), self.shared.len());
+        self.refs.retain(|r| !(r.conv == conv && r.author == *author));
+        if !self.refs.iter().any(|r| r.conv == conv) {
+            self.shared.retain(|c| *c != conv);
+            self.shared_dm.retain(|c| *c != conv);
+        }
+        before != (self.refs.len(), self.shared.len())
+    }
+
     /// The first reference (name, size and MIME shown for hash-only commands).
     pub fn primary(&self) -> Option<&AttRef> { self.refs.first() }
 
@@ -360,6 +372,21 @@ mod tests {
         assert!(j.add_ref(r(50, false, 1)));
         assert!(!j.convs().contains(&conv(1)), "the DM reference went first");
         assert!(j.convs().contains(&conv(10)));
+    }
+
+    #[test]
+    fn dropping_the_last_naming_in_a_conversation_unshares_it() {
+        let mut i = HashInfo::default();
+        i.add_ref(r(1, false, 1));
+        i.add_ref(r(1, false, 2));
+        i.add_ref(r(2, false, 1));
+        i.share(conv(1), false);
+        i.share(conv(2), false);
+        assert!(i.drop_naming(conv(1), &user(1)));
+        assert_eq!(i.shared, vec![conv(1), conv(2)], "user 2 still names it in conv 1");
+        assert!(i.drop_naming(conv(1), &user(2)));
+        assert_eq!(i.shared, vec![conv(2)]);
+        assert!(!i.drop_naming(conv(1), &user(2)));
     }
 
     #[test]

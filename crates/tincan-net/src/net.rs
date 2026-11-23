@@ -29,7 +29,7 @@ use crate::codes;
 use crate::config::{NetConfig, take_mdns};
 use crate::dm::{self, DmHold, DmManager, DmWatch};
 use crate::error::{NetError, Result, capitalize};
-use crate::events::{ConnectionInfo, NetEvent};
+use crate::events::{ConnState, ConnectionInfo, NetEvent};
 use crate::hooks::ExtraCtlHandler;
 use crate::inner::{Announced, EVENT_CAPACITY, Inner, Local};
 use crate::link::{self, Dialed, Tasks};
@@ -153,6 +153,9 @@ impl Net {
             };
             if is_dm {
                 dm_peers.extend(peer);
+            } else if rep.lock().removed(inner.storage.as_ref(), &me) {
+                // Removed by the owner: kept readable, no session until a re-join.
+                tracing::info!(server = %id.short(), "removed from this server; not connecting");
             } else {
                 let handle = session::spawn(&inner, id, rep, StartMode::ColdOpen);
                 inner.sessions.lock().insert(id, handle);
@@ -462,7 +465,11 @@ impl Net {
     pub async fn join_invite(&self, invite: Invite) -> Result<ServerId> {
         let inner = &self.inner;
         let server = invite.server;
-        if inner.replica(&server).is_some() {
+        // Re-joining after a removal: once a host accepts, start over from a fresh copy (sync
+        // brings the history back). The own-seq floor is kept, so my seqs continue. A refused
+        // attempt keeps the old copy readable.
+        let rejoin = self.is_removed(&server);
+        if !rejoin && inner.replica(&server).is_some() {
             return Ok(server);
         }
         if invite.is_expired(now_ms()) {
@@ -478,6 +485,9 @@ impl Net {
             Err(_) => return Err(NetError::Unreachable(NO_ONE_REACHABLE.into())),
         };
         let acc = build::verify_join_accepted(&dialed.reply, &invite, &inner.me).map_err(NetError::from_core_user)?;
+        if rejoin {
+            self.forget(server)?;
+        }
         let server_name = match &acc.genesis.event.body {
             Body::Genesis { name, .. } => name.clone(),
             _ => invite.name_hint.clone(),
@@ -539,6 +549,12 @@ impl Net {
     /// off if hosting, delete the local copy and emit `Left`.
     pub async fn leave(&self, server: ServerId) -> Result<()> {
         let inner = &self.inner;
+        if self.is_removed(&server) {
+            // Nothing to tell anyone: just drop the local copy.
+            self.forget(server)?;
+            inner.emit(NetEvent::Left { server });
+            return Ok(());
+        }
         let tx = inner.sessions.lock().get(&server).map(|s| s.tx.clone()).ok_or(NetError::UnknownConv)?;
         inner.media.leave_server(inner, server).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), self.publish(server, Body::MemberLeave { last_seq: 0 })).await;
@@ -553,6 +569,40 @@ impl Net {
         Ok(())
     }
 
+    /// Was I removed from `server` by its owner (and not re-admitted since)? Its local copy
+    /// stays readable and nothing connects for it.
+    pub fn is_removed(&self, server: &ServerId) -> bool {
+        self.inner.replica(server).is_some_and(|r| r.lock().removed(self.inner.storage.as_ref(), &self.inner.me))
+    }
+
+    /// Remove `user` from `server` (owner only): publishes `MemberRemove` with my head for
+    /// them as the cut. The host then drops their connection and refuses them until a
+    /// re-admit; they can come back only through an invite that still works.
+    pub async fn remove_member(&self, server: ServerId, user: UserId) -> Result<StoredEvent> {
+        let ok = self.inner.replica(&server).map(|r| {
+            let r = r.lock();
+            (r.state.is_owner(&self.inner.me), r.state.is_member(&user))
+        });
+        match ok {
+            None => return Err(NetError::UnknownConv),
+            Some((false, _)) => return Err(NetError::Invalid("Only the server owner can remove members.".into())),
+            Some((_, false)) => return Err(NetError::Invalid("They're not a member of this server.".into())),
+            Some(_) if user == self.inner.me => return Err(NetError::Invalid("You can't remove yourself.".into())),
+            Some(_) => {}
+        }
+        self.publish(server, Body::MemberRemove { user, last_seq: 0 }).await
+    }
+
+    /// Drop the local copy of a server without telling anyone (after a removal).
+    fn forget(&self, server: ServerId) -> Result<()> {
+        let inner = &self.inner;
+        inner.sessions.lock().remove(&server);
+        inner.replicas.write().remove(&server);
+        inner.storage.delete_conv(&server)?;
+        crate::replica::clear_notice(inner.storage.as_ref(), &server);
+        Ok(())
+    }
+
     /// Author an event in `conv` with my next seq and a fresh hlc.
     ///
     /// Servers: sent to the host and returned once it acknowledged (applied locally then);
@@ -562,6 +612,9 @@ impl Net {
     pub async fn publish(&self, conv: ConvId, body: Body) -> Result<StoredEvent> {
         if dm::peer_of(&self.inner, &conv).is_some() {
             return dm::publish(&self.inner, conv, body);
+        }
+        if self.is_removed(&conv) {
+            return Err(NetError::Rejected("You were removed from this server.".into()));
         }
         let tx = self.inner.sessions.lock().get(&conv).map(|s| s.tx.clone()).ok_or(NetError::UnknownConv)?;
         let (reply, rx) = oneshot::channel();
@@ -595,7 +648,9 @@ impl Net {
 
     /// Connection status of a server (default/Offline for unknown servers).
     pub fn connection(&self, server: &ServerId) -> ConnectionInfo {
-        self.inner.sessions.lock().get(server).map(|s| s.shared.info.lock().clone()).unwrap_or_default()
+        let info = self.inner.sessions.lock().get(server).map(|s| s.shared.info.lock().clone());
+        // A server I was removed from runs no session: it is offline, not connecting.
+        info.unwrap_or_else(|| if self.is_removed(server) { ConnectionInfo { state: ConnState::Offline, ..ConnectionInfo::default() } } else { ConnectionInfo::default() })
     }
 
     /// Change my mute or deafen state (voice and sharing are set by `voice_join` and

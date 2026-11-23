@@ -44,6 +44,7 @@ export type DialogState =
   | { kind: "invite"; serverId: ServerId }
   | { kind: "rename-server"; serverId: ServerId }
   | { kind: "leave-server"; serverId: ServerId }
+  | { kind: "kick-member"; serverId: ServerId; userId: UserId; name: string }
   | { kind: "create-channel"; serverId: ServerId; channelKind: ChannelKind }
   | { kind: "rename-channel"; serverId: ServerId; channelId: ChannelId }
   | { kind: "delete-channel"; serverId: ServerId; channelId: ChannelId }

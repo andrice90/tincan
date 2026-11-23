@@ -459,7 +459,7 @@ function NetworkTab({ settings, save, saveError }: { settings: Settings; save: (
                   <span className="truncate">
                     <bdi>{s.name}</bdi>
                   </span>
-                  <span className="muted truncate">{hostLine(s.connection, meId)}</span>
+                  <span className="muted truncate">{hostLine(s.connection, meId, s.removed)}</span>
                   <span className={status.cls}>{status.text}</span>
                 </li>
               );

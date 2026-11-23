@@ -319,6 +319,11 @@ pub(super) struct Ctx {
     /// New members a host may make me admit, over every host of this session (a malicious
     /// host gets no fresh budget by reconnecting me).
     pub host_admits: crate::limits::Bucket,
+    /// Membership changed since the last step: re-check who may stay linked and whether I
+    /// was removed.
+    pub members_dirty: std::cell::Cell<bool>,
+    /// My own removal was handled (the session is stopping).
+    removed_handled: bool,
 }
 
 /// Reply channel of a `who_has` request.
@@ -390,6 +395,9 @@ pub(crate) fn spawn(net: &Arc<Inner>, server: ServerId, replica: ReplicaRef, mod
         persisted: HashMap::new(),
         roster_sig: None,
         host_admits: member::host_admit_budget(),
+        // Check once at start: a removal may have arrived while the session was down.
+        members_dirty: std::cell::Cell::new(true),
+        removed_handled: false,
     };
     let session = Session { ctx, role: Role::Offline { retry_at: Instant::now() } };
     net.tasks.spawn(session.run(mode, cmd_rx, link_rx, dial_rx));
@@ -451,11 +459,66 @@ impl Session {
                     Next::Stop
                 }
             };
+            let next = self.after_step(next);
             if self.apply(next) {
                 break;
             }
         }
         self.finish();
+    }
+
+    /// After every step: when membership changed, drop the links of anyone no longer a member
+    /// (hosting), and stop if the owner removed me.
+    fn after_step(&mut self, next: Next) -> Next {
+        if !self.ctx.members_dirty.replace(false) || self.ctx.removed_handled {
+            return next;
+        }
+        let removed = self.ctx.replica.lock().removed(self.ctx.net.storage.as_ref(), &self.ctx.me);
+        if removed {
+            return self.on_removed();
+        }
+        if let Role::Host(h) = &mut self.role {
+            h.prune_non_members(&self.ctx);
+        }
+        next
+    }
+
+    /// The owner removed me: fail what I was publishing, release seqs nobody stored, tell
+    /// the app, and stop (handing the host role over first when I hold it).
+    fn on_removed(&mut self) -> Next {
+        self.ctx.removed_handled = true;
+        tracing::info!(server = %self.ctx.server.short(), "removed from the server by its owner");
+        let gone = || NetError::Rejected("You were removed from this server.".into());
+        for q in self.ctx.pubs.queued.drain(..) {
+            let _ = q.reply.send(Err(gone()));
+        }
+        if let Some(i) = self.ctx.pubs.inflight.take()
+            && let Some(r) = i.reply
+        {
+            let _ = r.send(Err(gone()));
+        }
+        {
+            let storage = self.ctx.net.storage.clone();
+            let mut r = self.ctx.replica.lock();
+            let cut = r
+                .state
+                .active_removal(&self.ctx.me)
+                .map(|x| x.last_seq)
+                .or_else(|| match crate::replica::load_notice(storage.as_ref(), &self.ctx.server).map(|n| n.event.body) {
+                    Some(Body::MemberRemove { last_seq, .. }) => Some(last_seq),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            r.reset_floor_after_removal(storage.as_ref(), &self.ctx.me, cut);
+        }
+        self.ctx.net.emit(NetEvent::Removed { server: self.ctx.server });
+        match &mut self.role {
+            Role::Host(h) if !h.links.is_empty() => {
+                let (reply, _rx) = oneshot::channel();
+                h.start_handoff(&mut self.ctx, host::AfterHandoff::Stop(reply))
+            }
+            _ => Next::Stop,
+        }
     }
 
     /// Apply a role change. True if the actor must stop.
@@ -564,6 +627,10 @@ impl Session {
         match cmd {
             SessionCmd::Incoming { conn, send, reader, first } => self.on_incoming(conn, send, reader, first),
             SessionCmd::Publish { body, reply } => {
+                if self.ctx.removed_handled {
+                    let _ = reply.send(Err(NetError::Rejected("You were removed from this server.".into())));
+                    return Next::Stay;
+                }
                 let deadline = Instant::now() + self.ctx.net.timings.publish_timeout;
                 self.ctx.pubs.queued.push_back(Queued { body, reply, deadline });
                 self.pump_publishes();
@@ -697,6 +764,13 @@ impl Session {
                 link::close_conn(&dialed.conn, tincan_core::CLOSE_NORMAL, "redirected");
                 self.on_redirect(d.user, d.purpose, claim, host, addr)
             }
+            Ctl::Events { events, .. } => {
+                // A host refusing my Hello shows me my removal; I believe only an owner-signed
+                // removal of me that nothing I hold has cleared.
+                link::close_conn(&dialed.conn, tincan_core::CLOSE_NORMAL, "refused");
+                self.on_removal_notice(events);
+                Next::Stay
+            }
             Ctl::Reject { code, reason } => {
                 link::close_conn(&dialed.conn, tincan_core::CLOSE_NORMAL, "rejected");
                 tracing::debug!(server = %self.ctx.server.short(), peer = %d.user.short(), ?code, %reason, "dial rejected");
@@ -711,6 +785,21 @@ impl Session {
                 Next::Stay
             }
         }
+    }
+
+    /// A removal notice from a host that refused my Hello: check it, remember it, apply it
+    /// if my history allows, and let `after_step` stop the session.
+    fn on_removal_notice(&mut self, events: Vec<SignedEvent>) {
+        let Some(signed) = events.into_iter().next() else { return };
+        let Ok(ev) = StoredEvent::from_signed(signed.clone()) else { return };
+        let ok = self.ctx.replica.lock().state.removal_of(&ev, &self.ctx.me);
+        if !ok {
+            tracing::debug!(server = %self.ctx.server.short(), "ignoring a removal notice that does not hold");
+            return;
+        }
+        self.ctx.replica.lock().store_notice(self.ctx.net.storage.as_ref(), &ev);
+        self.ctx.ingest_signed(vec![signed]);
+        self.ctx.members_dirty.set(true);
     }
 
     /// A peer answered but is not hosting.
@@ -798,6 +887,15 @@ impl Session {
                 match &mut self.role {
                     Role::Host(h) => {
                         if !member {
+                            // A removed member gets the owner-signed removal, which it can check
+                            // itself (my word alone must not be able to say it was removed).
+                            if let Some(notice) = self.ctx.removal_notice(&peer) {
+                                let ctl = Ctl::Events { events: vec![notice], more: false };
+                                self.ctx.net.tasks.spawn(async move {
+                                    link::reply_and_close(conn, send, &ctl, tincan_core::CLOSE_REJECTED, wait).await
+                                });
+                                return Next::Stay;
+                            }
                             reject(&self.ctx, conn, send, RejectCode::NotMember, "not a member");
                             return Next::Stay;
                         }
@@ -1097,6 +1195,8 @@ impl Session {
         self.ctx.epoch_seen = self.ctx.epoch_seen.max(start.epoch);
         self.ctx.update_record(start.epoch, self.ctx.me);
         self.ctx.redials.clear();
+        // The new host enforces removals from the log at once (members it inherits included).
+        self.ctx.members_dirty.set(true);
         // Short ids survive migrations, but only for current members (a roster from a
         // malicious host could list thousands of strangers and exhaust the id space).
         let mut short_ids: HashMap<UserId, u16> = HashMap::new();
@@ -1254,6 +1354,12 @@ impl Ctx {
 
     /// Is `user` a current member of this server?
     pub fn is_member(&self, user: &UserId) -> bool { self.replica.lock().state.is_member(user) }
+
+    /// The owner-signed removal in effect for `user`, from storage, if they were removed.
+    pub fn removal_notice(&self, user: &UserId) -> Option<SignedEvent> {
+        let id = self.replica.lock().state.active_removal(user)?.id;
+        self.net.storage.event(&id).ok().flatten().map(|e| e.signed)
+    }
 
     /// May `user` be my host? Not if it is known to have left (my history may still lack
     /// the admission of a newer member, so unknown users are not refused here).
@@ -1413,9 +1519,14 @@ impl Ctx {
         {
             return Err(NetError::Invalid("You can't post in this channel.".into()));
         }
+        if r.state.is_removed(&self.me) {
+            return Err(NetError::Rejected("You were removed from this server.".into()));
+        }
         let seq = r.next_own_seq(&self.me);
         let body = match body {
             Body::MemberLeave { .. } => Body::MemberLeave { last_seq: seq },
+            // The cut is my head for them: everything of theirs I hold stays valid.
+            Body::MemberRemove { user, .. } => Body::MemberRemove { user, last_seq: r.state.head(&user) },
             b => b,
         };
         let hlc = self.net.hlc.now();
@@ -1483,6 +1594,9 @@ impl Ctx {
 
     /// Emit app events for applied events; react to my own MemberLeave.
     pub fn after_applied(&self, applied: &[(StoredEvent, Change)]) {
+        if applied.iter().any(|(_, c)| *c == Change::Members) {
+            self.members_dirty.set(true);
+        }
         if !applied.is_empty() {
             self.net.emit_applied(self.server, applied);
             let r = self.replica.lock();

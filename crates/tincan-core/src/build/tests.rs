@@ -194,6 +194,42 @@ fn full_join_flow() {
 }
 
 #[test]
+fn removed_member_rejoins_with_a_fresh_admit() {
+    let mut fx = join_fx(u64::MAX);
+    let joiner = Identity::generate();
+    let now = crate::now_ms();
+    let jhlc = Hlc::new();
+    let req = join_request(&joiner, &fx.invite, &fx.host.user(), "Bob", 1, jhlc.now(), now).unwrap();
+    let ok = verify_join_request(&req, &fx.state, &fx.host.user(), now).unwrap();
+    let adm = admit(&fx.host, &fx.state, fx.host_seq, fx.hlc.now(), &ok).unwrap();
+    apply_ok(&mut fx.state, &adm);
+    fx.state.apply(&ok.profile, now);
+    // the owner (here also the host) removes Bob at his head
+    let rm = remove_member(&fx.host, &fx.state, fx.host_seq + 1, fx.hlc.now(), joiner.user()).unwrap();
+    assert_eq!(stored(&rm).event.body, Body::MemberRemove { user: joiner.user(), last_seq: 1 });
+    apply_ok(&mut fx.state, &rm);
+    assert!(fx.state.is_removed(&joiner.user()));
+    // his old admission is not a membership any more: the invite rules apply again, and the
+    // profile must continue his chain past the cut
+    let stale = join_request(&joiner, &fx.invite, &fx.host.user(), "Bob", 1, jhlc.now(), now).unwrap();
+    assert!(verify_join_request(&stale, &fx.state, &fx.host.user(), now).is_err());
+    let again = join_request(&joiner, &fx.invite, &fx.host.user(), "Bob", 2, jhlc.now(), now).unwrap();
+    let ok = verify_join_request(&again, &fx.state, &fx.host.user(), now).unwrap();
+    assert!(!ok.already_member);
+    let adm = admit(&fx.host, &fx.state, fx.host_seq + 2, fx.hlc.now(), &ok).unwrap();
+    apply_ok(&mut fx.state, &adm);
+    assert_eq!(fx.state.apply(&ok.profile, now).0, Verdict::Accept);
+    assert!(fx.state.is_member(&joiner.user()));
+    // a revoked invite does not let a removed member back in
+    let rm = remove_member(&fx.host, &fx.state, fx.host_seq + 3, fx.hlc.now(), joiner.user()).unwrap();
+    apply_ok(&mut fx.state, &rm);
+    let rv = revoke_invite(&fx.host, fx.ns.server, fx.host_seq + 4, fx.hlc.now(), fx.invite.invite_pk()).unwrap();
+    apply_ok(&mut fx.state, &rv);
+    let third = join_request(&joiner, &fx.invite, &fx.host.user(), "Bob", 3, jhlc.now(), now).unwrap();
+    assert_eq!(verify_join_request(&third, &fx.state, &fx.host.user(), now).unwrap_err().code, RejectCode::BadInvite);
+}
+
+#[test]
 fn join_request_rejections() {
     let fx = join_fx(u64::MAX);
     let joiner = Identity::generate();

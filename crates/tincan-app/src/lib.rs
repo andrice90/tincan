@@ -154,6 +154,13 @@ impl App {
     #[doc(hidden)]
     pub fn test_addrs(&self) -> Vec<SocketAddr> { self.core.loopback_addrs() }
 
+    /// Test hook: would this instance serve the blob `hash_hex` to `user_id` right now?
+    #[doc(hidden)]
+    pub fn test_allows_blob(&self, user_id: &str, hash_hex: &str) -> bool {
+        let (Ok(user), Ok(hash)) = (commands::parse_user(user_id), transfers::parse_hash(hash_hex)) else { return false };
+        self.core.access.read().allow_blob(&user, &hash)
+    }
+
     /// Test hook: tell this instance where `user_id` (z-base-32) can be reached, and retry
     /// anything waiting for that user (DM outbox, cold open).
     #[doc(hidden)]

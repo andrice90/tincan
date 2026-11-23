@@ -27,6 +27,7 @@ pub(crate) const CORE_COMMANDS: &[&str] = &[
     "rotate_friend_code",
     "join_server",
     "leave_server",
+    "kick_member",
     "rename_server",
     "channels",
     "create_channel",
@@ -87,6 +88,13 @@ mod args {
     #[derive(Deserialize)]
     pub struct Join {
         pub invite: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ServerUser {
+        pub server_id: String,
+        pub user_id: String,
     }
 
     #[derive(Deserialize)]
@@ -246,6 +254,11 @@ pub(crate) async fn call(core: &Arc<Core>, cmd: &str, a: Value) -> Result<Value,
         "leave_server" => {
             let a: args::Server = parse_args(cmd, a)?;
             core.cmd_leave_server(parse_conv(&a.server_id)?).await?;
+            Ok(Value::Null)
+        }
+        "kick_member" => {
+            let a: args::ServerUser = parse_args(cmd, a)?;
+            core.cmd_kick_member(parse_conv(&a.server_id)?, parse_user(&a.user_id)?).await?;
             Ok(Value::Null)
         }
         "rename_server" => {

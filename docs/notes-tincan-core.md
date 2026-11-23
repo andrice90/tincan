@@ -17,6 +17,16 @@ What the other crates need to know beyond the doc comments. Rustdoc: `cargo doc 
   - Contract change: builds from before this rule reject such a message, and then that author's later events stay `Gap` on that replica. `PROTOCOL_VERSION` was not bumped (rule 1 would reject every stored event), so every member must run a build with voice room chat before anyone posts there.
 - DMs: `ConvState::new_dm(a, b)`. `Message.channel` must be `state::dm_channel(&conv)` (use `build::dm_message`). Only Message and Delete bodies; you can only delete your own messages.
 
+## Removal (`Body::MemberRemove`, index 11)
+
+- Owner only, never naming the owner. The cut is `last_seq` in the removed user's seq space. `build::remove_member` and `Session::sign_own` fill it with the owner's head for that user.
+- Rule 6 (membership for the seq chain) ignores removals, so validation stays monotonic. What removals change is derived in `refresh_removals`, a least fixpoint over `Member::admit_log` and `Member::removals`. It is recomputed after every admit or removal, and only when some removal exists.
+  - Only trusted admits clear a removal: signed by the owner, or by a member holding a trusted admit, at a valid seq. A member with no trusted admit is `unrooted` (a puppet admitted by a removed user): `removed()` is true and its events are void.
+- Read it through `is_member` (false while a removal is uncleared), `is_removed`, `event_valid(author, seq)` (void events are hidden), `active_removal`, `invite_status` (an invite created at a void seq is Revoked), `Member::name` (latest valid Profile), `Member::avatar` (latest valid ProfileImage) and `state::valid_under` (for code that keeps a copy of the removals).
+- `removal_of(ev, me)` checks a removal heard straight from a host: owner-signed, names me, not cleared by an admit I hold.
+- `verify_join_request` refuses (Busy) a removed joiner whose profile seq is not past the cut, when the host is behind on their events.
+- New `Member` fields: `admit_log`, `removals`, `profiles` (and `avatars`, from the avatars merge). New `InviteState` field: `created_seq` (it voids invites made at a void seq), kept beside `created_hlc` (which orders the owner's short-code invites): neither subsumes the other. A duplicate admit is still a no-op for membership, but it is recorded in `admit_log`.
+
 ## Startup rebuild (store + net)
 
 - `ConvState::rebuild` needs EVERY stored event of the conversation. For each `(author, head)` in `Storage::heads(conv)`, call `events_range(conv, author, 1, head)`.
@@ -76,8 +86,8 @@ None of these changes a signature.
 ## Avatars and server icons
 
 - `Body::ProfileImage { image: Option<ImageRef> }` (index 12) sets the author's own avatar; `Body::ServerIcon { image }` (index 13) is owner only. `None` clears. `ImageRef { hash, size, mime }` is checked by `image::validate_image_ref`: 1 byte to `image::MAX_IMAGE_BYTES` (64 KiB), MIME `image/webp` or `image/png`. Both are rejected in DMs.
-- `ProfileImage` applies like `Profile` (latest hlc wins, `Change::Members`); `ServerIcon` returns `Change::ServerRenamed` (the server summary changed). State: `Member.avatar` / `avatar_hlc`, `ConvState.icon`.
-- Index 11 is `Body::ReservedMemberRemove`, a placeholder every replica rejects. It only keeps the image bodies at 12 and 13 while `MemberRemove` is built on another branch; drop it at that merge. A build without these variants cannot decode events 12 and 13 (postcard), so it treats them as unverifiable: an older host refuses such a publish (the author's chain then waits at that host) and drops a member whose `Events` carry one ("sent an event with a bad signature"); an older member never applies them. Every member of a server needs this build before anyone sets an avatar or icon.
+- `ProfileImage` applies like `Profile`: every one is recorded in `Member.avatars` by (hlc, seq), and `Member.avatar` / `avatar_hlc` is the latest one signed at a valid seq (`refresh_avatar`, rerun by `refresh_removals`). So a removed member's avatar change or clear at a void seq has no effect (`Change::Nothing`), a removal arriving late hides an avatar set past its cut, and a re-admit never revives a void one. `ServerIcon` returns `Change::ServerRenamed` (the server summary changed); it is owner only and the owner is never removed, so it is never void. State: `Member.avatar` / `avatar_hlc` / `avatars`, `ConvState.icon`.
+- Index 11 is `Body::MemberRemove`. The avatars branch held it with a placeholder (`ReservedMemberRemove`, always rejected) until the removal branch merged; the placeholder is gone and no event ever carried it. A build without these variants cannot decode events 12 and 13 (postcard), so it treats them as unverifiable: an older host refuses such a publish (the author's chain then waits at that host) and drops a member whose `Events` carry one ("sent an event with a bad signature"); an older member never applies them. Every member of a server needs this build before anyone sets an avatar or icon.
 - `image::inspect(bytes)` is what an app runs before publishing: magic bytes (PNG or WebP only), size, and width and height from the PNG IHDR or the WebP VP8, VP8L or VP8X header (1 to 256 pixels). Nothing is decoded.
 - `Ctl::DmAvatar { image }` is appended as variant 40 (`within_limits`: MIME at most 32 bytes). Other branches that append `Ctl` variants may collide at 40; the wire test pins it.
 

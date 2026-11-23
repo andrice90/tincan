@@ -732,6 +732,46 @@ impl HostState {
         }
     }
 
+    /// Drop the links of everyone who is no longer a member (removed by the owner, or left),
+    /// after membership changed and on becoming host. A removed member is sent the removal
+    /// first, so it learns why, and its link closes once it hangs up (at most a second).
+    /// Dropping the link also takes it out of voice and the roster.
+    pub(super) fn prune_non_members(&mut self, ctx: &Ctx) {
+        let gone: Vec<UserId> = {
+            let r = ctx.replica.lock();
+            self.links.keys().filter(|u| !r.state.is_member(u)).copied().collect()
+        };
+        for user in gone {
+            let notice = ctx.removal_notice(&user);
+            let Some(m) = self.links.remove(&user) else { continue };
+            tracing::info!(server = %ctx.server.short(), member = %user.short(), removed = notice.is_some(), "no longer a member; dropping");
+            if let Some(ev) = notice {
+                let _ = m.link.send(&Ctl::Events { events: vec![ev], more: false });
+            }
+            ctx.shared.member_conns.lock().remove(&user);
+            ctx.net.media.member_down(ctx.server, user, m.link.conn.stable_id());
+            ctx.net.emit(NetEvent::MemberLinkDown { server: ctx.server, user });
+            let link = m.link;
+            ctx.net.tasks.spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(1), link.conn.closed()).await;
+                link.close(tincan_core::CLOSE_NORMAL, "not a member");
+            });
+            self.mark_roster(ctx);
+            if self.links.is_empty() {
+                self.alone_since = Some(Instant::now());
+            }
+            ctx.publish_info(self.info(ctx.me));
+        }
+        let r = ctx.replica.lock();
+        self.joiners.retain(|_, (l, _)| {
+            let keep = r.state.is_member(&l.peer);
+            if !keep {
+                l.close(tincan_core::CLOSE_NORMAL, "not a member");
+            }
+            keep
+        });
+    }
+
     /// Start a history sync to member `user` unless one runs (then the request is queued) or
     /// its budget is spent (then it waits for the timer). Never dropped: a member's first
     /// sync is what lets it publish.
@@ -1470,6 +1510,10 @@ fn member_publish(ctx: &mut Ctx, gates: &mut Gates, cutoff: u64, from: UserId, s
     }
     if stored.conv() != ctx.server {
         return (ack(false, "event for another server"), Vec::new());
+    }
+    // A removed member's events would only be void: refuse them (its link is being dropped).
+    if ctx.replica.lock().state.is_removed(&from) {
+        return (ack(false, "you were removed from this server"), Vec::new());
     }
     let verdict = ctx.replica.lock().state.check(&id, &stored.event, now_ms());
     match verdict {

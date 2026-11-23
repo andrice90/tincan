@@ -121,6 +121,12 @@ pub enum NetEvent {
         /// The server.
         server: ServerId,
     },
+    /// The owner removed me from a server. Its session has stopped; the local copy stays
+    /// readable until `join` with a current invite (or `leave`).
+    Removed {
+        /// The server.
+        server: ServerId,
+    },
     /// Host side: a member's connection came up (part B: start forwarding media for it).
     MemberLinkUp {
         /// The server.

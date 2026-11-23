@@ -147,8 +147,8 @@ Body:
   InviteRevoke  { invite_pk }
   MemberAdmit   { user, invite_pk, from_seq }
   MemberLeave   { last_seq }
-  (11 reserved for MemberRemove, on another branch)
-  ProfileImage  { image: Option<ImageRef> }                 author's own avatar, latest by hlc
+  MemberRemove  { user, last_seq }                           owner only, never the owner
+  ProfileImage  { image: Option<ImageRef> }                 author's own avatar, latest valid by hlc
   ServerIcon    { image: Option<ImageRef> }                 owner only
 Attachment { hash, size, name, mime }
 ImageRef { hash, size, mime }                                1 B..64 KiB, image/webp or image/png
@@ -157,6 +157,7 @@ ImageRef { hash, size, mime }                                1 B..64 KiB, image/
 - `seq` is per author per server, contiguous from 1. Events are stored only when contiguous; out-of-order events wait in a small pending buffer.
 - `hlc` = (unix ms << 16) | 16-bit logical counter. Display order is `(hlc, event_id)`. Events more than 5 minutes in the future are buffered.
 - Validation (every member runs it locally, deterministic): signature, author's seq/hlc strictly increasing, author admitted (Genesis owner, or a `MemberAdmit` naming them, and not after their `MemberLeave.last_seq`), body-specific authority rules above.
+- Removal (`MemberRemove`, see the security model): the removed user's events with seq > `last_seq` are void until a re-admit. Void means stored and synced (the seq chain stays contiguous), with no effect.
 - Sync: on connect both sides send `SyncHave { per author: highest contiguous seq }` (about 40 B per author). Each side streams what the other lacks per author in ascending seq order (receivers store only contiguous runs), in pages of at most 256 KiB. Pages go on the control stream between live messages; at the target scale (50 members) a full history is a few MB.
 - Live path: member `Publish{event}` -> host validates, stores, `PublishAck`, fans out `Events` to everyone else. The host's own events take the same path internally.
 - `VvDigest` every 60 s catches anything missed.
@@ -249,6 +250,34 @@ Partition merge (two solo hosts is the common case, given the 6 s solo timeout):
 - Stranger identities that keep reconnecting can use up the stranger connection rate (10 a minute), delaying first contact from real strangers. A full stranger pool (8) closes its oldest connection to make room, so idle holders lock nobody out. Unanswered stranger conversations older than 3 days no longer count toward the cap of 32, but nothing deletes them yet (there is no DM delete or block). Contacts and members of shared servers are not affected.
 - Blob transfer throughput under the bounded QUIC windows (16 MiB per connection, 8 bidi streams) has not been measured.
 
+### Removing a member
+
+The owner signs `MemberRemove { user, last_seq }` (`kick_member`). `last_seq` is the owner's head for that user, so everything of theirs the owner holds stays valid.
+
+- **The cut is in the user's seq space, not in time.** An author's hlc only has to grow past their own previous one, so a time cut could not stop a removed member who keeps signing events with old timestamps. Events up to `last_seq` stay valid whenever they arrive. Later events are void until a re-admit.
+- **Validation stays monotonic.** The seq-chain rules ignore removals, so no replica ever retracts an accepted event and the chain stays contiguous for a re-join. What a removal changes is derived from the applied set, the same way on every replica (`state::refresh_removals`):
+  - A re-admit clears a removal only if it is a `MemberAdmit` that comes after the removal by (hlc, id), has `from_seq > last_seq`, and was signed at a valid seq.
+  - The user's old admission does not clear it, nor any admit signed before the removal (a concurrent re-join included).
+  - Only trusted admits count: signed by the owner, or by someone holding a trusted admit, at a valid seq (a least fixpoint). So a removed user cannot re-admit itself, another removed user, or itself through a fresh key it admitted at a void seq. Such a key is unrooted: no member, every event void.
+  - While a removal is uncleared the user is not a member (`is_member`).
+  - Void messages are hidden from every message list and live event, and are not auto-fetched. A void Profile names nobody, a void ProfileImage sets no avatar, and an invite created at a void seq admits nobody.
+  - Still applied from void events: deleting one's own message, revoking an invite, leaving, and admitting someone else (who stays unrooted). Honest hosts refuse a removed user's events, so these reach replicas only through a member that relays them on purpose or that had not seen the removal yet.
+- **Race.** Events the user published just before the removal reached the host are void too (seq past the cut), even on replicas that showed them first. Such a message already on screen stays there until the channel is loaded again. `shuffled_delivery_converges` covers a removal with concurrent events, a void self-admit and a re-admit.
+- **Host enforcement.** After every membership change and on becoming host, a host drops the link of anyone no longer a member. This takes them out of the roster, voice and screen share. Before dropping a removed member, it sends the owner-signed removal.
+  - A host refuses their Hello and their publishes. To a removed member's Hello it answers with that owner-signed removal, so a member who was offline learns of it.
+  - The member believes only an owner-signed removal naming it that nothing it holds has cleared (`ConvState::removal_of`), never a host's word.
+  - A new host after migration does the same, because the removal is in the signed log.
+- **Blobs.** A removed user is no current member, so no member serves them a blob through that server (`Access`). Their avatar is no longer shown there, and members stop sharing it with that server (`HashInfo::drop_naming`) unless someone else there names the same image. The removed side also drops the server from its own access set and announcements.
+- **The removed side.** The session stops, queued publishes fail, and seqs past the applied head (or the cut, whichever is higher) are released, because no honest host stored them.
+  - The server stays readable up to the removal (`ServerSummary.removed`). It stays offline, and no session starts for it after a restart.
+  - Joining again needs an invite the host still accepts. Removal revokes no invite: the owner revokes or rotates invites to keep someone out.
+  - A re-join starts from a fresh local copy, which the sync fills, and continues the user's seqs. The new admit's `from_seq` is the next seq, as after a leave.
+- **Residual.**
+  - Any member can mint an invite and re-admit a removed user, the same trust as any admission.
+  - A malicious host can withhold a removal from its members until they sync with someone else.
+  - If a host stored a removed member's last publish but its ack was lost, the re-join profile reuses that seq. This is detected as equivocation, not resolved.
+  - The unread query reads storage, so a void message can still mark a channel unread, although it is never shown.
+
 ### Files and peer text (tincan-app)
 
 Admitted members and DM contacts are untrusted, hashes are not secret, and peer-supplied names and text are untrusted for the app and the UI.
@@ -312,7 +341,7 @@ Two 6-character codes replace the long strings people share: one invite code per
 
 1. Any member authors `InviteCreate{invite_pk = public(derive_key("tincan v1 invite key", seed)), expires_ms, max_uses}` and shares the code.
 2. Joiner dials bootstrap peers and resolves the rendezvous record, then sends the host `JoinRequest{server, invite_pk, profile, ts_ms, invite_sig}` where `invite_sig = ed25519(invite_sk, "tincan-join1" || server || joiner || host || ts_ms)`.
-3. Host checks the invite (exists, not revoked, not expired, uses below max_uses best-effort), authors `MemberAdmit`, replies `JoinAccepted{server_secret, genesis, admit}`. Normal `Hello` and sync follow. Joins are rate limited per invite and per invite creator (refused with `RejectCode::Busy`).
+3. Host checks the invite (exists, not revoked, not expired, uses below max_uses best-effort), authors `MemberAdmit`, replies `JoinAccepted{server_secret, genesis, admit}`. Normal `Hello` and sync follow. Joins are rate limited per invite and per invite creator (refused with `RejectCode::Busy`). A removed member goes through the same checks: their old admission no longer counts.
 
 People normally share the server's 6-character invite code instead (see "Short codes"); it resolves to an `Invite` and joins the same way. The full `tincan1...` invite (7 days) stays as the fallback.
 

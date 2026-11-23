@@ -680,6 +680,27 @@ impl Media {
         });
     }
 
+    /// Is my voice room one of `server`'s?
+    fn room_in(&self, server: ServerId) -> bool {
+        matches!(self.st.lock().attached.as_ref().map(|a| &a.kind), Some(Kind::Room { server: s, .. }) if *s == server)
+    }
+
+    /// The owner removed me from `server`: leave its voice room if I am in it.
+    pub(crate) fn on_removed(&self, core: &Arc<Core>, server: ServerId) {
+        if self.is_closed() || !self.room_in(server) {
+            return;
+        }
+        let core = core.clone();
+        tokio::spawn(async move {
+            let media = &core.media;
+            let _ops = media.ops.lock().await;
+            if media.is_closed() || !media.room_in(server) {
+                return;
+            }
+            media.leave_now(&core).await;
+        });
+    }
+
     /// `call_start`: returns the ringing call; the engine starts once it is accepted.
     pub(super) async fn call_start(&self, core: &Arc<Core>, user: UserId) -> Result<dto::CallInfo, String> {
         if user == core.me {

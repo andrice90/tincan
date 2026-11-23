@@ -81,15 +81,6 @@ fn only_the_owner_sets_the_server_icon() {
 }
 
 #[test]
-fn the_reserved_body_is_always_rejected() {
-    let mut fx = Fx::new();
-    let o = fx.owner.clone();
-    let m = fx.member("m");
-    assert!(is_reject(&fx.try_apply(&o, Body::ReservedMemberRemove)));
-    assert!(is_reject(&fx.try_apply(&m, Body::ReservedMemberRemove)));
-}
-
-#[test]
 fn dms_carry_no_images() {
     let a = Identity::generate();
     let b = Identity::generate();
@@ -404,7 +395,11 @@ fn duplicate_admit_of_a_member_is_a_noop() {
     let m = fx.member("m");
     let before = fx.state.members[&m.user()].clone();
     fx.ok(&o, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: 1 });
-    assert_eq!(fx.state.members[&m.user()], before);
+    // only recorded in the admission log
+    let mut after = fx.state.members[&m.user()].clone();
+    assert_eq!(after.admit_log.len(), 2);
+    after.admit_log = before.admit_log.clone();
+    assert_eq!(after, before);
     assert!(is_reject(&fx.try_apply(&o, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: 0 })));
 }
 
@@ -416,6 +411,216 @@ fn owner_can_leave_and_loses_authority() {
     fx.ok(&o, Body::MemberLeave { last_seq: seq });
     assert!(!fx.state.is_member(&o.user()));
     assert_eq!(fx.try_apply(&o, Body::ServerUpdate { name: Some("x".into()) }), Verdict::Gap);
+}
+
+// ------------------------------------------------------------------ removal
+
+fn remove(fx: &mut Fx, who: &Identity) -> StoredEvent {
+    let o = fx.owner.clone();
+    let last_seq = fx.state.head(&who.user());
+    fx.ok(&o, Body::MemberRemove { user: who.user(), last_seq })
+}
+
+#[test]
+fn only_the_owner_removes_and_never_itself() {
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let m = fx.member("m");
+    let n = fx.member("n");
+    // a member forging a removal is rejected outright
+    assert!(is_reject(&fx.try_apply(&m, Body::MemberRemove { user: n.user(), last_seq: 1 })));
+    assert!(fx.state.is_member(&n.user()));
+    // the owner cannot remove itself
+    assert!(is_reject(&fx.try_apply(&o, Body::MemberRemove { user: o.user(), last_seq: 1 })));
+    // a stranger's removal is rejected (not buffered) once the genesis is known
+    let s = Identity::generate();
+    let e = raw(&s, fx.conv, 1, hlc_from_ms(fx.clock_ms + 1000), Body::MemberRemove { user: n.user(), last_seq: 0 });
+    assert!(is_reject(&fx.state.check(&e.id, &e.event, NOW)));
+    // DMs have no membership
+    let mut dm = ConvState::new_dm(m.user(), n.user());
+    let e = raw(&m, dm.conv, 1, 1, Body::MemberRemove { user: n.user(), last_seq: 0 });
+    assert!(is_reject(&dm.apply(&e, NOW).0));
+}
+
+#[test]
+fn removal_voids_later_events_until_a_readmit() {
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let m = fx.member("m"); // seq 1
+    let before = fx.ok(&m, text(fx.general, "before")); // seq 2
+    let rm = remove(&mut fx, &m); // cut at 2
+    assert_eq!(rm.event.body, Body::MemberRemove { user: m.user(), last_seq: 2 });
+    assert!(!fx.state.is_member(&m.user()));
+    assert!(fx.state.is_removed(&m.user()));
+    assert_eq!(fx.state.active_removal(&m.user()).map(|r| r.id), Some(rm.id));
+    assert!(!fx.state.can_post(&m.user(), &fx.general));
+    // the removed member keeps publishing: stored for continuity, but void
+    let after = fx.ok(&m, text(fx.general, "after")); // seq 3
+    fx.ok(&m, named("renamed while removed")); // seq 4
+    fx.ok(&m, Body::InviteCreate { invite_pk: [9; 32], expires_ms: NEVER, max_uses: 0 }); // seq 5
+    assert!(fx.state.event_valid(&m.user(), before.event.seq));
+    assert!(!fx.state.event_valid(&m.user(), after.event.seq));
+    assert_eq!(fx.state.display_name(&m.user()), "m", "a void Profile names nobody");
+    assert_eq!(fx.state.invite_status(&[9; 32], NOW).err(), Some(InviteProblem::Revoked));
+    // its old admission never clears the removal, nor a self-admission at a void seq
+    let from = fx.next_seq(&m) + 1;
+    fx.ok(&m, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: from }); // seq 6
+    assert!(fx.state.is_removed(&m.user()));
+    // a re-admit from before the cut does not clear it either
+    fx.ok(&o, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: 2 });
+    assert!(fx.state.is_removed(&m.user()));
+    // a real re-admit from the next seq does
+    let back = fx.next_seq(&m); // 7
+    fx.ok(&o, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: back });
+    assert!(fx.state.is_member(&m.user()));
+    assert_eq!(fx.state.members[&m.user()].removals[0].cleared_from, Some(back));
+    fx.ok(&m, named("m back"));
+    assert_eq!(fx.state.display_name(&m.user()), "m back");
+    // seqs between the cut and the re-admit stay void; the void invite stays dead
+    assert!(!fx.state.event_valid(&m.user(), after.event.seq));
+    assert!(fx.state.event_valid(&m.user(), back));
+    assert_eq!(fx.state.invite_status(&[9; 32], NOW).err(), Some(InviteProblem::Revoked));
+    // a second removal works the same way
+    remove(&mut fx, &m);
+    assert!(fx.state.is_removed(&m.user()));
+    assert!(fx.state.event_valid(&m.user(), back));
+}
+
+#[test]
+fn a_void_profile_image_changes_nothing() {
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let m = fx.member("m");
+    fx.ok(&m, Body::ProfileImage { image: Some(img(1)) });
+    remove(&mut fx, &m);
+    // a removed member's avatar change or clear is void: stored, with no effect
+    let e = fx.peek(&m, Body::ProfileImage { image: Some(img(2)) });
+    assert_eq!(fx.state.apply(&e, NOW), (Verdict::Accept, Change::Nothing));
+    fx.seqs.insert(m.user(), e.event.seq);
+    assert_eq!(fx.state.members[&m.user()].avatar, Some(img(1)));
+    fx.ok(&m, Body::ProfileImage { image: None });
+    assert_eq!(fx.state.members[&m.user()].avatar, Some(img(1)));
+    // a re-admit does not revive the void ones; a new one after it counts
+    let back = fx.next_seq(&m);
+    fx.ok(&o, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: back });
+    assert_eq!(fx.state.members[&m.user()].avatar, Some(img(1)));
+    fx.ok(&m, Body::ProfileImage { image: Some(img(3)) });
+    assert_eq!(fx.state.members[&m.user()].avatar, Some(img(3)));
+    // the owner's icon is never void
+    fx.ok(&o, Body::ServerIcon { image: Some(img(4)) });
+    assert_eq!(fx.state.icon, Some(img(4)));
+}
+
+#[test]
+fn a_late_removal_hides_an_avatar_set_after_its_cut() {
+    // the avatar arrives first, the removal whose cut precedes it later: the avatar goes
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let m = fx.member("m"); // seq 1
+    fx.ok(&m, Body::ProfileImage { image: Some(img(1)) }); // seq 2
+    fx.ok(&m, Body::ProfileImage { image: Some(img(2)) }); // seq 3
+    fx.ok(&o, Body::MemberRemove { user: m.user(), last_seq: 2 });
+    assert_eq!(fx.state.members[&m.user()].avatar, Some(img(1)));
+}
+
+#[test]
+fn removal_ignores_an_earlier_concurrent_readmit() {
+    // m left and was re-admitted; the owner, not having seen that yet, removes m with an
+    // older cut. The re-admit came before the removal, so it does not undo it.
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let host = fx.member("host");
+    let m = fx.member("m"); // seq 1
+    fx.ok(&m, Body::MemberLeave { last_seq: 2 }); // seq 2
+    fx.ok(&host, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: 3 });
+    fx.ok(&m, named("m again")); // seq 3
+    fx.ok(&o, Body::MemberRemove { user: m.user(), last_seq: 1 });
+    assert!(fx.state.is_removed(&m.user()));
+    assert!(!fx.state.is_member(&m.user()));
+    assert!(!fx.state.event_valid(&m.user(), 3));
+    assert_eq!(fx.state.display_name(&m.user()), "m");
+}
+
+#[test]
+fn early_events_of_a_removed_member_stay_valid() {
+    // the removal arrives before the member's admission and events (owner first in sync)
+    let mut src = Fx::new();
+    let m = src.member("m"); // seq 1
+    src.ok(&m, text(src.general, "one")); // seq 2
+    src.ok(&m, text(src.general, "two")); // seq 3
+    remove(&mut src, &m); // cut 3
+    src.ok(&m, text(src.general, "void")); // seq 4
+    let conv = src.conv;
+    let mut order: Vec<StoredEvent> = src.log.iter().filter(|e| e.event.author == src.owner.user()).cloned().collect();
+    order.extend(src.log.iter().filter(|e| e.event.author != src.owner.user()).cloned());
+    let (st, applied, pending) = drain_all(conv, order);
+    assert!(pending.is_empty());
+    assert_eq!(applied.len(), src.log.len());
+    assert_eq!(st, src.state);
+    assert!(st.event_valid(&m.user(), 3));
+    assert!(!st.event_valid(&m.user(), 4));
+}
+
+#[test]
+fn removed_members_cannot_readmit_each_other() {
+    let mut fx = Fx::new();
+    let a = fx.member("a");
+    let b = fx.member("b");
+    remove(&mut fx, &a);
+    remove(&mut fx, &b);
+    let fa = fx.next_seq(&a);
+    let fb = fx.next_seq(&b);
+    fx.ok(&a, Body::MemberAdmit { user: b.user(), invite_pk: fx.invite, from_seq: fb });
+    fx.ok(&b, Body::MemberAdmit { user: a.user(), invite_pk: fx.invite, from_seq: fa });
+    assert!(fx.state.is_removed(&a.user()));
+    assert!(fx.state.is_removed(&b.user()));
+    // a member who was never removed can re-admit them (any member can admit anyone)
+    let c = fx.member("c");
+    fx.ok(&c, Body::MemberAdmit { user: a.user(), invite_pk: fx.invite, from_seq: fa + 1 });
+    assert!(fx.state.is_member(&a.user()));
+    // and then a's admit of b counts too, if it is past b's cut and after b's removal
+    assert!(fx.state.is_removed(&b.user()), "a's admit of b was signed at a void seq");
+}
+
+#[test]
+fn a_removed_member_cannot_come_back_through_a_puppet() {
+    // m, removed, admits a fresh key s at a void seq; s then re-admits m. s's admission does
+    // not chain back to the owner, so s vouches for nobody and is no member itself.
+    let mut fx = Fx::new();
+    let m = fx.member("m");
+    remove(&mut fx, &m);
+    let s = Identity::generate();
+    fx.ok(&m, Body::MemberAdmit { user: s.user(), invite_pk: fx.invite, from_seq: 1 });
+    let posted = fx.ok(&s, text(fx.general, "puppet"));
+    let back = fx.next_seq(&m);
+    fx.ok(&s, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: back });
+    assert!(fx.state.is_removed(&m.user()), "the puppet's admit does not clear the removal");
+    assert!(!fx.state.is_member(&s.user()));
+    assert!(!fx.state.event_valid(&s.user(), posted.event.seq), "the puppet's messages are void");
+    // a member admitted through the owner's chain still vouches
+    let h = fx.member("h");
+    fx.ok(&h, Body::MemberAdmit { user: s.user(), invite_pk: fx.invite, from_seq: fx.next_seq(&s) });
+    assert!(fx.state.is_member(&s.user()), "admitted by a rooted member");
+    assert!(fx.state.is_removed(&m.user()), "s's earlier admit of m was signed before s was rooted");
+}
+
+#[test]
+fn removal_notice_check() {
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let m = fx.member("m");
+    let n = fx.member("n");
+    let rm = fx.peek(&o, Body::MemberRemove { user: m.user(), last_seq: 1 });
+    assert!(fx.state.removal_of(&rm, &m.user()));
+    assert!(!fx.state.removal_of(&rm, &n.user()), "names someone else");
+    let forged = fx.peek(&n, Body::MemberRemove { user: m.user(), last_seq: 1 });
+    assert!(!fx.state.removal_of(&forged, &m.user()), "not the owner");
+    let (v, _) = fx.state.apply(&rm, NOW);
+    assert!(v.is_accept());
+    fx.log.push(rm.clone());
+    fx.seqs.insert(o.user(), rm.event.seq);
+    fx.ok(&o, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: 2 });
+    assert!(!fx.state.removal_of(&rm, &m.user()), "re-admitted since");
 }
 
 // ------------------------------------------------------------------ owner-only rules
@@ -788,9 +993,44 @@ fn scenario() -> (ConvId, Vec<StoredEvent>, ConvState) {
     fx.ok(&b, Body::ProfileImage { image: Some(img(3)) });
     fx.ok(&b, Body::ProfileImage { image: None });
     fx.ok(&o, Body::ServerIcon { image: Some(img(4)) });
+    // r is removed: it posted before, posted once more concurrently with the removal, kept
+    // publishing (void), tried to re-admit itself and was re-admitted by the host
+    let r = Identity::generate();
+    fx.ok(&host, Body::MemberAdmit { user: r.user(), invite_pk: fx.invite, from_seq: 1 });
+    fx.ok(&r, named("r"));
+    fx.ok(&r, text(fx.general, "before the removal"));
+    fx.ok(&r, Body::ProfileImage { image: Some(img(5)) });
+    let cut = fx.next_seq(&r) - 1;
+    fx.ok(&r, text(fx.general, "concurrent with the removal"));
+    fx.ok(&o, Body::MemberRemove { user: r.user(), last_seq: cut });
+    fx.ok(&r, named("void name"));
+    fx.ok(&r, Body::ProfileImage { image: Some(img(6)) });
+    fx.ok(&r, Body::InviteCreate { invite_pk: [4; 32], expires_ms: NEVER, max_uses: 0 });
+    let self_from = fx.next_seq(&r) + 1;
+    fx.ok(&r, Body::MemberAdmit { user: r.user(), invite_pk: fx.invite, from_seq: self_from });
+    let back = fx.next_seq(&r);
+    fx.ok(&host, Body::MemberAdmit { user: r.user(), invite_pk: fx.invite, from_seq: back });
+    fx.ok(&r, named("r back"));
+    fx.ok(&r, text(fx.general, "back again"));
+    // d is removed and stays out; its removal and admission arrive in any order
+    let d = Identity::generate();
+    fx.ok(&host, Body::MemberAdmit { user: d.user(), invite_pk: fx.invite, from_seq: 1 });
+    fx.ok(&d, named("d"));
+    fx.ok(&d, Body::ProfileImage { image: Some(img(7)) });
+    fx.ok(&o, Body::MemberRemove { user: d.user(), last_seq: 2 });
+    fx.ok(&d, text(fx.general, "void"));
+    fx.ok(&d, Body::ProfileImage { image: Some(img(8)) });
 
     // sanity of the reference state
     let st = &fx.state;
+    assert!(st.is_member(&r.user()));
+    assert!(st.event_valid(&r.user(), cut) && !st.event_valid(&r.user(), cut + 1) && st.event_valid(&r.user(), back));
+    assert_eq!(st.display_name(&r.user()), "r back");
+    assert_eq!(st.invite_status(&[4; 32], NOW).err(), Some(InviteProblem::Revoked));
+    assert!(st.is_removed(&d.user()) && !st.is_member(&d.user()));
+    assert_eq!(st.display_name(&d.user()), "d");
+    assert_eq!(st.members[&r.user()].avatar, Some(img(5)), "r's void avatar never shows");
+    assert_eq!(st.members[&d.user()].avatar, Some(img(7)));
     for u in [host.user(), a.user(), b.user(), c.user()] {
         assert!(st.is_member(&u));
     }
@@ -803,7 +1043,7 @@ fn scenario() -> (ConvId, Vec<StoredEvent>, ConvState) {
     assert_eq!(st.icon, Some(img(4)));
     assert!(st.invites[&inv2].revoked);
     assert_eq!(st.invites[&inv2].uses, 3);
-    assert_eq!(st.invites[&fx.invite].uses, 2);
+    assert_eq!(st.invites[&fx.invite].uses, 6);
     assert_eq!(st.name, "Renamed");
     assert!(st.deleted.contains(&m1) && st.deleted.contains(&m2) && st.deleted.contains(&v1));
     assert!(st.channels[&den].deleted);

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tincan_core::event::{Body, ChannelKind as CoreKind, StoredEvent};
 use tincan_core::hlc::hlc_ms;
-use tincan_core::state::ConvState;
+use tincan_core::state::{ConvState, RemovalRecord, valid_under};
 use tincan_core::{ChannelId, ConvId, UserId};
 use tincan_net::{ConnState, PathKind as NetPath};
 
@@ -54,12 +54,15 @@ pub(crate) struct ConvView {
     pub all_channels: BTreeMap<ChannelId, ChannelInfo>,
     /// Current members (servers).
     pub members: Vec<UserId>,
-    /// Current avatars by member (servers).
+    /// Current avatars by member (servers). A removed member's is left out: not shown, not
+    /// fetched.
     pub avatars: HashMap<UserId, tincan_core::event::ImageRef>,
     /// Server icon.
     pub icon: Option<tincan_core::event::ImageRef>,
     /// Display names of everyone who ever had one here.
     pub names: HashMap<UserId, String>,
+    /// Removals of each user the owner ever removed (servers), to hide their void messages.
+    pub removals: HashMap<UserId, Vec<RemovalRecord>>,
 }
 
 impl ConvView {
@@ -85,9 +88,16 @@ impl ConvView {
             all_channels: st.channels.iter().map(|(id, c)| (*id, info(c))).collect(),
             members,
             names: st.members.iter().filter(|(_, m)| !m.name.is_empty()).map(|(u, m)| (*u, m.name.clone())).collect(),
-            avatars: st.members.iter().filter_map(|(u, m)| Some((*u, m.avatar.clone()?))).collect(),
+            avatars: st.members.iter().filter(|(_, m)| !m.removed()).filter_map(|(u, m)| Some((*u, m.avatar.clone()?))).collect(),
             icon: st.icon.clone(),
+            removals: st.members.iter().filter(|(_, m)| !m.removals.is_empty()).map(|(u, m)| (*u, m.removals.clone())).collect(),
         }
+    }
+
+    /// Is `author`'s event at `seq` valid? False for what a removed member signed after
+    /// the removal (void until a re-admit): such messages are not shown.
+    pub fn event_valid(&self, author: &UserId, seq: u64) -> bool {
+        self.is_dm || self.removals.get(author).is_none_or(|r| valid_under(r, seq))
     }
 
     /// The name of `user` here for display (cleaned), if it has a visible one.
@@ -339,6 +349,7 @@ impl Core {
             unread,
             online_count: u32::try_from(online_count).unwrap_or(u32::MAX),
             icon: self.icon_url(&view),
+            removed: self.net.is_removed(conv),
         })
     }
 
@@ -400,6 +411,9 @@ impl Core {
     pub(crate) fn message_dto(&self, view: &ConvView, ev: &StoredEvent, delivered: u64) -> Option<dto::Message> {
         let Body::Message { channel, text, attachments } = &ev.event.body else { return None };
         let author = ev.event.author;
+        if !view.event_valid(&author, ev.event.seq) {
+            return None;
+        }
         if !ev.deleted {
             self.index_attachments(view.conv, view.is_dm, author, attachments);
         }
@@ -554,6 +568,7 @@ mod tests {
             names: HashMap::new(),
             avatars: HashMap::new(),
             icon: None,
+            removals: HashMap::new(),
         })
     }
 

@@ -122,6 +122,12 @@ pub fn leave(identity: &Identity, server: ServerId, seq: u64, hlc: u64) -> Resul
     event(identity, server, seq, hlc, Body::MemberLeave { last_seq: seq })
 }
 
+/// Remove a member (owner only): `MemberRemove{user, last_seq}` with `last_seq` = my head
+/// for `user` in `state`, so everything of theirs I hold stays valid.
+pub fn remove_member(identity: &Identity, state: &ConvState, seq: u64, hlc: u64, user: UserId) -> Result<SignedEvent> {
+    event(identity, state.conv, seq, hlc, Body::MemberRemove { user, last_seq: state.head(&user) })
+}
+
 /// Create an invite valid until `expires_ms` with unlimited uses: the InviteCreate event to
 /// publish and the Invite to share (`invite.encode()`). At most 2 bootstrap peers are kept.
 /// An empty `name_hint` uses the server name from `state`.
@@ -269,6 +275,11 @@ pub fn verify_join_request(ctl: &Ctl, state: &ConvState, host: &UserId, now_ms: 
         }
         if profile.event.seq != state.next_seq(&joiner) {
             return Err(JoinRejection::new(RejectCode::BadInvite, "profile event has the wrong seq"));
+        }
+        // A re-admit clears a removal only from past its cut. A host that is behind on the
+        // removed member's own events would admit them without clearing it.
+        if state.active_removal(&joiner).is_some_and(|r| profile.event.seq <= r.last_seq) {
+            return Err(JoinRejection::new(RejectCode::Busy, "this host is still catching up; try again in a minute"));
         }
     }
     Ok(VerifiedJoin { joiner, invite_pk: *invite_pk, profile, already_member })
