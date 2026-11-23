@@ -4,9 +4,11 @@ import { MessageSquare, Phone } from "lucide-react";
 import { memo, useMemo } from "react";
 import type { Member, ServerId } from "../api/types";
 import { messageUser, startCall } from "../store/actions";
+import { MEMBERS_BOUNDS, MEMBERS_KEY } from "../lib/panelWidth";
 import { useStore } from "../store/store";
 import { ICON_SM, PersonId, PersonName, SpeakingAvatar } from "./common";
 import { Menu, useMenu, type MenuItem } from "./Menu";
+import { ResizeHandle, usePanelWidth } from "./ResizeHandle";
 
 const EMPTY: Member[] = [];
 
@@ -19,11 +21,15 @@ const MemberRow = memo(function MemberRow({ m, isMe, canCall }: { m: Member; isM
   const content = (
     <>
       <SpeakingAvatar userId={m.userId} name={m.name} size={32} />
-      <span className="member-name truncate">
+      <span className="member-name" title={m.name}>
         <PersonName userId={m.userId} name={m.name} you={isMe} />
       </span>
-      {m.isHost && <span className="member-tag">Host</span>}
-      {m.isOwner && <span className="member-tag">Owner</span>}
+      {(m.isHost || m.isOwner) && (
+        <span className="member-tags">
+          {m.isHost && <span className="member-tag">Host</span>}
+          {m.isOwner && <span className="member-tag">Owner</span>}
+        </span>
+      )}
     </>
   );
   return (
@@ -63,37 +69,41 @@ export function MemberList({ serverId }: { serverId: ServerId }) {
   const members = useStore((s) => s.members[serverId] ?? EMPTY);
   const meId = useStore((s) => s.me?.userId);
   const busy = useStore((s) => s.call !== null || s.voice?.kind === "call");
+  const width = usePanelWidth(MEMBERS_KEY, MEMBERS_BOUNDS);
   const [online, offline] = useMemo(() => {
     const byName = (a: Member, b: Member) => a.name.localeCompare(b.name);
     return [members.filter((m) => m.online).sort(byName), members.filter((m) => !m.online).sort(byName)];
   }, [members]);
 
   return (
-    <aside className="members" aria-label="Members">
-      {online.length > 0 && (
-        <section className="member-group">
-          <h3>
-            Online <span className="faint">{online.length}</span>
-          </h3>
-          <ul>
-            {online.map((m) => (
-              <MemberRow key={m.userId} m={m} isMe={m.userId === meId} canCall={!busy} />
-            ))}
-          </ul>
-        </section>
-      )}
-      {offline.length > 0 && (
-        <section className="member-group is-offline">
-          <h3>
-            Offline <span className="faint">{offline.length}</span>
-          </h3>
-          <ul>
-            {offline.map((m) => (
-              <MemberRow key={m.userId} m={m} isMe={m.userId === meId} canCall={!busy} />
-            ))}
-          </ul>
-        </section>
-      )}
+    <aside className="members" aria-label="Members" style={{ width: width.width }}>
+      <ResizeHandle panel={width} bounds={MEMBERS_BOUNDS} edge="left" label="Resize member list" />
+      <div className="members-scroll">
+        {online.length > 0 && (
+          <section className="member-group">
+            <h3>
+              Online <span className="faint">{online.length}</span>
+            </h3>
+            <ul>
+              {online.map((m) => (
+                <MemberRow key={m.userId} m={m} isMe={m.userId === meId} canCall={!busy} />
+              ))}
+            </ul>
+          </section>
+        )}
+        {offline.length > 0 && (
+          <section className="member-group is-offline">
+            <h3>
+              Offline <span className="faint">{offline.length}</span>
+            </h3>
+            <ul>
+              {offline.map((m) => (
+                <MemberRow key={m.userId} m={m} isMe={m.userId === meId} canCall={!busy} />
+              ))}
+            </ul>
+          </section>
+        )}
+      </div>
     </aside>
   );
 }

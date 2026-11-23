@@ -4,6 +4,8 @@
 .app {
   display: grid;
   grid-template-rows: var(--titlebar-h) minmax(0, 1fr);
+  /* The window's width, so the side panels give way in a narrow window. */
+  grid-template-columns: minmax(0, 1fr);
   height: 100%;
 }
 
@@ -200,12 +202,62 @@
 /* ---------------------------------------------------------------- sidebar */
 
 .sidebar {
-  flex: none;
-  width: var(--side-w);
+  position: relative;
+  flex: 0 1 auto;
+  min-width: 200px;
   display: flex;
   flex-direction: column;
   min-height: 0;
   background: var(--bg-side);
+}
+
+/* Grab bar on a panel edge that faces the content. The hit area stays off the panel's
+   scrollbar: past the sidebar's right edge, inside the member list's left padding. */
+.resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 2;
+  width: 6px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.resize-handle.is-right {
+  right: -6px;
+}
+
+.resize-handle.is-left {
+  left: 0;
+}
+
+/* The line sits on the panel edge. */
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  transition: background-color var(--ease);
+}
+
+.resize-handle:hover::after {
+  background: var(--text-3);
+}
+
+.resize-handle.is-dragging::after,
+.resize-handle:focus-visible::after {
+  background: var(--accent);
+}
+
+.resize-handle:focus-visible {
+  outline: none;
+}
+
+html:has(.resize-handle.is-dragging) {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .side-header {
@@ -324,6 +376,31 @@
 .channel-row.is-unread {
   color: var(--text-1);
   font-weight: 600;
+}
+
+/* Unread marker at the end of a sidebar row: a dot like the rail's, or a count. */
+.unread-badge {
+  flex: none;
+  margin-left: auto;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 var(--sp-1);
+  border-radius: 8px;
+  background: var(--text-1);
+  color: var(--bg-side);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+}
+
+.unread-badge.is-dot {
+  min-width: 0;
+  width: 6px;
+  height: 6px;
+  padding: 0;
+  margin-right: var(--sp-1);
+  border-radius: 50%;
 }
 
 .room-people {
@@ -518,7 +595,8 @@
 .main {
   position: relative;
   flex: 1;
-  min-width: 0;
+  /* 800 px window - rail - default sidebar and member list: defaults fit the minimum window. */
+  min-width: 276px;
   display: flex;
   flex-direction: column;
   background: var(--bg-main);
@@ -836,11 +914,23 @@
 
 /* ---------------------------------------------------------------- member list */
 
+/* Width set inline from the saved value (lib/panelWidth.ts); in a narrow window the panel
+   gives way down to its minimum before the content does. */
 .members {
-  flex: none;
-  width: var(--members-w);
-  padding: var(--sp-4) var(--sp-2);
+  position: relative;
+  flex: 0 1 auto;
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   background: var(--bg-side);
+}
+
+.members-scroll {
+  flex: 1;
+  min-height: 0;
+  padding: var(--sp-4) var(--sp-2);
+  overflow-x: hidden;
   overflow-y: auto;
 }
 
@@ -854,10 +944,12 @@
   color: var(--text-3);
 }
 
+/* The name, "(you)", the short id and the tags are flex items of the row itself
+   (display: contents), so only the name gives way: it shrinks first, the short id only
+   once the name is gone, and "(you)" and the tags never shrink or wrap. */
 .member-row {
   display: flex;
   align-items: center;
-  gap: var(--sp-3);
   width: 100%;
   height: 44px;
   padding: 0 var(--sp-2);
@@ -879,14 +971,42 @@ button.member-row:hover {
   opacity: 0.5;
 }
 
-.member-name {
-  flex: 1;
+.member-row > .avatar {
+  margin-right: var(--sp-3);
+}
+
+.member-name,
+.member-name .person {
+  display: contents;
+}
+
+.member-name .person-name {
+  flex: 0 1000 auto;
+}
+
+.member-name .person-you {
+  flex: none;
+}
+
+.member-name .user-id {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.member-tags {
+  flex: none;
+  display: flex;
+  gap: var(--sp-2);
+  margin-left: auto;
+  padding-left: var(--sp-3);
 }
 
 .member-tag {
-  flex: none;
   font-size: var(--fs-12);
   color: var(--text-3);
+  white-space: nowrap;
 }
 
 /* ---------------------------------------------------------------- voice */

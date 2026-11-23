@@ -4,6 +4,7 @@ import { memo, type ReactNode } from "react";
 import type { UserId } from "../api/types";
 import { hashIndex, initials } from "../lib/format";
 import { shortId } from "../lib/names";
+import { unreadLabel, type BadgeContent } from "../lib/unread";
 import { useSharesName, useSpeaking } from "../store/store";
 
 interface AvatarProps {
@@ -54,6 +55,25 @@ export function PersonName({ userId, name, you = false }: { userId: UserId; name
 export function IdSuffix({ userId, name }: { userId: UserId; name: string }) {
   const shared = useSharesName(userId, name);
   return shared ? <bdi className="user-id">{shortId(userId)}</bdi> : null;
+}
+
+/**
+ * The unread marker at the end of a sidebar row: a count when one is known, else a dot.
+ * The text for screen readers is part of it, so the row says "general, unread messages".
+ */
+export function UnreadBadge({ badge }: { badge: BadgeContent }) {
+  return (
+    <>
+      {badge.kind === "dot" ? (
+        <span className="unread-badge is-dot" aria-hidden="true" />
+      ) : (
+        <span className="unread-badge" aria-hidden="true">
+          {badge.text}
+        </span>
+      )}
+      <span className="sr-only">{unreadLabel(badge)}</span>
+    </>
+  );
 }
 
 /** "ID abcd1234": the short id, shown where one person is looked at (menus, popovers). */
