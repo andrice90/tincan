@@ -26,7 +26,7 @@ use tincan_core::state::{ConvState, Verdict, dm_channel, validate_name};
 use tincan_core::storage::ConvRecord;
 use tincan_core::sync::Heads;
 use tincan_core::wire::{AddrHint, Ctl};
-use tincan_core::{ALPN_DM, BlobHash, ConvId, UserId, build, now_ms};
+use tincan_core::{ALPN_DM, ConvId, UserId, build, now_ms};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
@@ -448,18 +448,6 @@ impl DmManager {
         }
     }
 
-    /// Send a Have delta on every DM connection.
-    pub fn broadcast_have(&self, add: &[BlobHash], remove: &[BlobHash]) {
-        for ctl in tincan_core::wire::have_frames(add, remove) {
-            let Some(b) = link::encode(&ctl) else { continue };
-            for p in self.peers.lock().values() {
-                if let Some(l) = &p.link {
-                    let _ = l.live.try_send(b.clone());
-                }
-            }
-        }
-    }
-
     /// My display name changed: announce it on every DM connection.
     pub fn broadcast_profile(&self, net: &Inner) {
         let Some(name) = my_name(net) else { return };
@@ -799,7 +787,9 @@ async fn dial(net: &Arc<Inner>, peer: UserId, hint: Option<AddrHint>) -> std::re
 
 fn dm_hello(net: &Inner, conv: &ConvId) -> Ctl {
     let heads = net.replica(conv).map(|r| r.lock().state.sync_heads()).unwrap_or_default();
-    Ctl::DmHello { conv: *conv, heads, have: net.have_list() }
+    // No Have list: `who_has` in a DM always names the contact, and my held blobs of other
+    // conversations are none of their business.
+    Ctl::DmHello { conv: *conv, heads, have: Vec::new() }
 }
 
 /// Accept an incoming DM connection whose first frame was `first` (a DmHello).

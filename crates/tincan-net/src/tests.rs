@@ -773,3 +773,51 @@ fn net_is_send_sync() {
     fn check<T: Send + Sync + Clone>() {}
     check::<Net>();
 }
+
+/// APP-CORE-03 (net part): with per-server announcements each server's host learns only
+/// what was announced for that server (Hello and later deltas), and lists me as a holder
+/// only there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn announcements_are_per_server() {
+    use std::collections::HashMap;
+
+    use crate::Announced;
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    wire_to(&a, &[&b]);
+    let (x, y, z) = (BlobHash([1; 32]), BlobHash([2; 32]), BlobHash([3; 32]));
+    // Bob announces before joining (it goes in the Hello) and the global list says all.
+    b.net.set_have(vec![x, y, z]);
+    b.net.set_announced(HashMap::new());
+    let s1 = cluster(&a, &[&b]).await;
+    let s2 = cluster(&a, &[&b]).await;
+    let holds = |server: ServerId, hash: BlobHash| {
+        let a = a.net.clone();
+        let bob = b.net.me();
+        async move { a.who_has(&server, hash).await.iter().any(|(u, _)| *u == bob) }
+    };
+    for (s, h) in [(s1, x), (s1, y), (s2, x), (s2, y), (s1, z)] {
+        assert!(!holds(s, h).await, "nothing announced yet ({h:?})");
+    }
+    // Deltas per server.
+    b.net.set_announced(HashMap::from([(s1, Announced { have: vec![x], clips: vec![] }), (s2, Announced { have: vec![y], clips: vec![] })]));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(holds(s1, x).await && holds(s2, y).await) {
+        assert!(Instant::now() < deadline, "the per-server deltas did not arrive");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!holds(s1, y).await, "server 1's host learns nothing of server 2's blob");
+    assert!(!holds(s2, x).await, "server 2's host learns nothing of server 1's blob");
+    assert!(!holds(s1, z).await && !holds(s2, z).await, "the unscoped list is not announced");
+    // Removing one from a server takes it out there only.
+    b.net.set_announced(HashMap::from([(s2, Announced { have: vec![y], clips: vec![] })]));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while holds(s1, x).await {
+        assert!(Instant::now() < deadline, "the removal did not arrive");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(holds(s2, y).await);
+    for n in [a, b] {
+        n.net.shutdown().await;
+    }
+}

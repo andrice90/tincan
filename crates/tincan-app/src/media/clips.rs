@@ -245,15 +245,13 @@ impl Media {
     }
 
     /// Tell the hosts which clips I hold (they count as held blobs in holder lookups):
-    /// only clips shared with a server I am in, that is, played or pulled in one of its
-    /// voice rooms (see `Core::announce`).
-    pub(crate) fn announce_clips(&self, core: &Core) {
-        let lib = self.library(core);
-        let clips: Vec<ClipInfo> = {
-            let access = core.access.read();
-            lib.iter().filter(|r| core.files.is_complete(&r.hash) && access.announces(&r.hash)).map(clip_info).collect()
-        };
-        core.net.set_clips(clips);
+    /// each server's host only the clips shared with it, that is, played or pulled in one of
+    /// its voice rooms (`Core::announce` does both lists).
+    pub(crate) fn announce_clips(&self, core: &Core) { core.announce(); }
+
+    /// The library clips whose blob is complete, as announced.
+    pub(crate) fn complete_clips(&self, core: &Core) -> Vec<ClipInfo> {
+        self.library(core).iter().filter(|r| core.files.is_complete(&r.hash)).map(clip_info).collect()
     }
 
     /// A clip blob was dropped: re-announce the held set and the library.

@@ -54,4 +54,5 @@ pub use media::{
     AUDIO_IN_QUEUE, AUDIO_OUT_QUEUE, CallEnd, CallInfo, CallState, HOST_UPLINK_BUDGET_BPS, MediaSession, RELAYED_SHARER_BPS,
     RELAYED_VIEWER_BPS, SHARE_QUEUE, VIDEO_IN_QUEUE, VIDEO_MAX_BPS, VIDEO_MIN_BPS, VoiceInfo, call_short_id,
 };
+pub use inner::Announced;
 pub use net::Net;

@@ -274,8 +274,11 @@ impl Access {
 
     /// Should `hash` be in my `Have` list? Only when it is shared with a server I am in:
     /// DM `who_has` always names the contact, so a DM-only blob needs no announcement.
-    pub fn announces(&self, hash: &BlobHash) -> bool {
-        self.blobs.get(hash).is_some_and(|convs| convs.iter().any(|c| self.convs.get(c).is_some_and(|m| !m.dm)))
+    pub fn announces(&self, hash: &BlobHash) -> bool { !self.servers_sharing(hash).is_empty() }
+
+    /// The servers I am in that `hash` is shared with: the hosts that may be told I hold it.
+    pub fn servers_sharing(&self, hash: &BlobHash) -> Vec<ConvId> {
+        self.blobs.get(hash).map(|convs| convs.iter().filter(|c| self.convs.get(c).is_some_and(|m| !m.dm)).copied().collect()).unwrap_or_default()
     }
 }
 
@@ -414,6 +417,8 @@ mod tests {
 
         assert!(a.announces(&server_file));
         assert!(!a.announces(&dm_file), "DM-only blobs are not announced");
+        assert_eq!(a.servers_sharing(&server_file), vec![server], "announced to that server's host only");
+        assert!(a.servers_sharing(&dm_file).is_empty());
 
         // Leaving the server takes the access and the announcement away.
         let mut convs = HashMap::new();

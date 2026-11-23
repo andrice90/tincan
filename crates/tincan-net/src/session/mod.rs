@@ -1266,9 +1266,9 @@ impl Ctx {
     fn hello_for(&self, host: &UserId) -> Option<Ctl> {
         let keys = self.keys()?;
         // Bounded like the host keeps them (and so the Hello always fits in one frame).
-        let mut have = self.net.have_list();
+        let mut have = self.net.have_list_for(&self.server);
         have.truncate(tincan_core::wire::MAX_HAVE);
-        let mut clips = self.net.clips();
+        let mut clips = self.net.clips_for(&self.server);
         clips.truncate(tincan_core::wire::MAX_CLIPS);
         let info = HelloInfo { epoch_seen: self.epoch_seen, status: self.net.status_for(&self.server, false), have, clips };
         Some(build::hello(&self.me, &self.server, &keys.hello_key, host, info))

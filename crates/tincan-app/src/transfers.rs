@@ -272,16 +272,11 @@ impl Core {
         true
     }
 
-    /// The shares of `hash` changed: update what I announce. A held attachment that is now
-    /// shared with a server is one `have_add`; anything else (it stopped being announced, or
-    /// it is a clip, whose library entry is announced too) recomputes both lists.
+    /// The shares of `hash` changed: update what each server's host is told.
     fn announce_changed(&self, hash: BlobHash) {
-        if !self.files.is_complete(&hash) {
-            return;
+        if self.files.is_complete(&hash) {
+            self.announce();
         }
-        let announces = self.access.read().announces(&hash);
-        let clip = matches!(self.storage.get_clip(&hash), Ok(Some(_)));
-        if announces && !clip { self.net.have_add(hash) } else { self.announce() }
     }
 
     /// Share `hash` with `conv`: I sent it there, or played the clip there.
@@ -398,7 +393,7 @@ impl Core {
             a.announces(&hash)
         };
         if announces && self.files.is_complete(&hash) {
-            self.net.have_add(hash);
+            self.announce();
         }
     }
 

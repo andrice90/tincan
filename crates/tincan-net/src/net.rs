@@ -29,7 +29,7 @@ use crate::dm::{self, DmHold, DmManager, DmWatch};
 use crate::error::{NetError, Result, capitalize};
 use crate::events::{ConnectionInfo, NetEvent};
 use crate::hooks::ExtraCtlHandler;
-use crate::inner::{EVENT_CAPACITY, Inner, Local};
+use crate::inner::{Announced, EVENT_CAPACITY, Inner, Local};
 use crate::link::{self, Dialed, Tasks};
 use crate::power;
 use crate::proto::{DmProto, ServerProto};
@@ -344,7 +344,7 @@ impl Net {
             &server,
             &acc.keys.hello_key,
             &host,
-            HelloInfo { epoch_seen: 0, status: inner.status_for(&server, false), have: inner.have_list(), clips: inner.clips() },
+            HelloInfo { epoch_seen: 0, status: inner.status_for(&server, false), have: inner.have_list_for(&server), clips: inner.clips_for(&server) },
         );
         let Dialed { conn, send, reader, .. } = dialed;
         let mode = match link::continue_exchange(conn, send, reader, &hello, inner.timings.dial).await {
@@ -449,17 +449,30 @@ impl Net {
     /// Replace my soundboard library (its hashes count as held blobs).
     pub fn set_clips(&self, clips: Vec<ClipInfo>) { self.change_have(|l| l.clips = clips); }
 
+    /// Announce held blobs and clips per server: each server's host learns only that
+    /// server's entry (a server missing from `per_server` gets nothing), and a host lists me
+    /// as a holder in its server only for those. Once called, this replaces what
+    /// `set_have`, `have_add` and `set_clips` announce. DM contacts are never sent `Have`
+    /// lists (`who_has` in a DM always names the contact).
+    pub fn set_announced(&self, per_server: HashMap<ServerId, Announced>) { self.change_have(|l| l.scoped = Some(per_server)); }
+
+    /// Apply `f`, then send each connected server's host the delta of what it is told.
+    /// (Clip names travel only in the next `Hello`.)
     fn change_have(&self, f: impl FnOnce(&mut Local)) {
-        let before: HashSet<BlobHash> = self.inner.have_list().into_iter().collect();
+        let servers: Vec<ServerId> = self.inner.sessions.lock().keys().copied().collect();
+        let before: Vec<HashSet<BlobHash>> = servers.iter().map(|s| self.inner.have_list_for(s).into_iter().collect()).collect();
         f(&mut self.inner.local.lock());
-        let after: HashSet<BlobHash> = self.inner.have_list().into_iter().collect();
-        let add: Vec<BlobHash> = after.difference(&before).copied().collect();
-        let remove: Vec<BlobHash> = before.difference(&after).copied().collect();
-        if add.is_empty() && remove.is_empty() {
-            return;
+        for (server, before) in servers.iter().zip(before) {
+            let after: HashSet<BlobHash> = self.inner.have_list_for(server).into_iter().collect();
+            let add: Vec<BlobHash> = after.difference(&before).copied().collect();
+            let remove: Vec<BlobHash> = before.difference(&after).copied().collect();
+            if add.is_empty() && remove.is_empty() {
+                continue;
+            }
+            if let Some(s) = self.inner.sessions.lock().get(server) {
+                let _ = s.tx.try_send(SessionCmd::HaveChanged { add, remove });
+            }
         }
-        self.inner.dm.broadcast_have(&add, &remove);
-        self.notify_sessions(|| SessionCmd::HaveChanged { add: add.clone(), remove: remove.clone() });
     }
 
     /// Who holds `hash`? Servers: online holders as aggregated by the host (members' `Have`

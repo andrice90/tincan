@@ -77,6 +77,15 @@ pub(crate) struct TestHooks {
 /// Most known addresses kept (LAN sightings of strangers cannot grow it beyond this).
 pub(crate) const MAX_HINTS: usize = 4096;
 
+/// What one server's host is told I hold (`Net::set_announced`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Announced {
+    /// Complete blobs (attachments and clips) that server's members may fetch from me.
+    pub have: Vec<BlobHash>,
+    /// Clips of my library announced there (their hashes count as held).
+    pub clips: Vec<ClipInfo>,
+}
+
 /// User-controlled presence fields and held blobs.
 #[derive(Debug, Default)]
 pub(crate) struct Local {
@@ -87,6 +96,10 @@ pub(crate) struct Local {
     pub have: BTreeSet<BlobHash>,
     /// Soundboard library.
     pub clips: Vec<ClipInfo>,
+    /// Per-server announcements (`Net::set_announced`). Once set, each server's host learns
+    /// only its own entry (none for a server missing from it), and `have` and `clips` above
+    /// are no longer announced.
+    pub scoped: Option<HashMap<ServerId, Announced>>,
 }
 
 /// Everything shared across tasks.
@@ -204,22 +217,41 @@ impl Inner {
         }
     }
 
-    /// Held blobs: attachments plus clip hashes, deduplicated.
-    pub fn have_list(&self) -> Vec<BlobHash> {
+    /// Held blobs announced to `server`'s host: attachments plus clip hashes, deduplicated.
+    pub fn have_list_for(&self, server: &ServerId) -> Vec<BlobHash> {
         let local = self.local.lock();
-        let mut set = local.have.clone();
-        set.extend(local.clips.iter().map(|c| c.hash));
+        let (have, clips): (&[BlobHash], &[ClipInfo]) = match &local.scoped {
+            Some(m) => match m.get(server) {
+                Some(a) => (&a.have, &a.clips),
+                None => (&[], &[]),
+            },
+            None => {
+                let mut set = local.have.clone();
+                set.extend(local.clips.iter().map(|c| c.hash));
+                return set.into_iter().collect();
+            }
+        };
+        let set: BTreeSet<BlobHash> = have.iter().copied().chain(clips.iter().map(|c| c.hash)).collect();
         set.into_iter().collect()
     }
 
-    /// Do I hold `hash` (blob or clip)?
-    pub fn holds(&self, hash: &BlobHash) -> bool {
+    /// Do I hold `hash` (blob or clip) as far as `server`'s members are told?
+    pub fn holds_for(&self, server: &ServerId, hash: &BlobHash) -> bool {
         let local = self.local.lock();
-        local.have.contains(hash) || local.clips.iter().any(|c| c.hash == *hash)
+        match &local.scoped {
+            Some(m) => m.get(server).is_some_and(|a| a.have.contains(hash) || a.clips.iter().any(|c| c.hash == *hash)),
+            None => local.have.contains(hash) || local.clips.iter().any(|c| c.hash == *hash),
+        }
     }
 
-    /// Soundboard library.
-    pub fn clips(&self) -> Vec<ClipInfo> { self.local.lock().clips.clone() }
+    /// Soundboard clips announced to `server`'s host.
+    pub fn clips_for(&self, server: &ServerId) -> Vec<ClipInfo> {
+        let local = self.local.lock();
+        match &local.scoped {
+            Some(m) => m.get(server).map(|a| a.clips.clone()).unwrap_or_default(),
+            None => local.clips.clone(),
+        }
+    }
 
     /// Allow hosting setting.
     pub fn allow_hosting(&self) -> bool { self.cfg.read().allow_hosting }

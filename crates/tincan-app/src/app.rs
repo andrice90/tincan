@@ -299,18 +299,28 @@ impl Core {
         }
     }
 
-    /// Set my `Have` list and clip library announcement to the blobs I hold that are
-    /// shared with a server I am in. tincan-net sends one list to every host and DM peer,
-    /// so a blob shared only in DMs (DM `who_has` always names the contact) or with no
-    /// conversation at all is left out.
+    /// Tell each server's host which of my held blobs and library clips are shared with
+    /// that server, and nothing else (`Net::set_announced`): a host never learns what I hold
+    /// for my other servers. DM contacts get no list (DM `who_has` always names the
+    /// contact), and a blob shared with no server I am in is not announced at all.
     pub(crate) fn announce(&self) {
         let held = self.files.complete_hashes();
-        let have: Vec<BlobHash> = {
+        let clips = self.media.complete_clips(self);
+        let mut per: HashMap<ConvId, tincan_net::Announced> = HashMap::new();
+        {
             let a = self.access.read();
-            held.into_iter().filter(|h| a.announces(h)).collect()
-        };
-        self.net.set_have(have);
-        self.media.announce_clips(self);
+            for h in held {
+                for s in a.servers_sharing(&h) {
+                    per.entry(s).or_default().have.push(h);
+                }
+            }
+            for c in clips {
+                for s in a.servers_sharing(&c.hash) {
+                    per.entry(s).or_default().clips.push(c.clone());
+                }
+            }
+        }
+        self.net.set_announced(per);
     }
 
     /// Ask the pump to treat `conv` as bulk (history sync) until it goes quiet.

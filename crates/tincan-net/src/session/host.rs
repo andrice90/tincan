@@ -444,7 +444,7 @@ impl HostState {
     /// Online holders of `hash`. `requester` = the member asking (None: I am asking).
     pub(super) fn holders(&self, ctx: &Ctx, hash: &BlobHash, requester: Option<UserId>) -> Vec<(UserId, AddrHint)> {
         let mut out = Vec::new();
-        if requester.is_some() && ctx.net.holds(hash) {
+        if requester.is_some() && ctx.net.holds_for(&ctx.server, hash) {
             out.push((ctx.me, ctx.net.my_hint()));
         }
         for (u, m) in &self.links {
