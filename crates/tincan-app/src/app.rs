@@ -129,6 +129,9 @@ fn net_config(cfg: &AppConfig, s: &dto::Settings, name: Option<&str>) -> NetConf
         bind_addr: offline.then(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
         display_name: name.unwrap_or("Anonymous").to_string(),
         rendezvous: !offline,
+        // Offline, short code records live in a folder every profile on the machine shares
+        // (`profiles/.offline-codes`: no profile name contains a dot).
+        code_dir: offline.then(|| cfg.data_dir.parent().unwrap_or(&cfg.data_dir).join(".offline-codes")),
     }
 }
 
@@ -218,6 +221,7 @@ impl Core {
             shutdown_once: tokio::sync::OnceCell::new(),
         });
         core.warm_up();
+        core.start_friend_code();
         core.media.start(&core);
         let pump = tokio::spawn(pump::run(core.clone(), net_rx, file_rx, pump_rx));
         let worker = tokio::spawn(transfers::fetch_worker(core.clone(), fetch_rx));

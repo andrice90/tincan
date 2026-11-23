@@ -1047,3 +1047,67 @@ async fn contract_matches_types_ts() {
     assert_eq!(snap["settings"]["allowHosting"], false);
     again.shutdown().await;
 }
+
+/// (g) short codes: the owner's 6-character invite code (the same for every member, only
+/// the owner rotates it, the old one stops admitting at once) and friend codes in
+/// `add_contact`. The profiles share a parent folder, so they share `.offline-codes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn short_invite_and_friend_codes() {
+    let _g = serial().await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = |n: &str| {
+        let d = root.path().join(n);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    };
+    let a = node(&dir("a"), "Alice").await;
+    let b = node(&dir("b"), "Bob").await;
+    let c = node(&dir("c"), "Carol").await;
+    let is_code = |v: &Value| v.as_str().is_some_and(|s| tincan_core::code::ShortCode::parse(s).is_some_and(|c| c.to_string() == s));
+
+    let server = server_id(&call(&a.app, "create_server", json!({ "name": "Codes" })).await);
+    let code = call(&a.app, "get_invite_code", json!({ "serverId": server })).await;
+    assert!(is_code(&code), "{code}");
+    assert_eq!(call(&a.app, "get_invite_code", json!({ "serverId": server })).await, code);
+    let typed = code.as_str().unwrap().replace('-', " ").to_lowercase();
+    assert_eq!(server_id(&call(&b.app, "join_server", json!({ "invite": typed })).await), server);
+    all_online(&[&a, &b], &server).await;
+    let seen = eventually("bob sees the code", 20, || async {
+        let v = b.app.call("get_invite_code", json!({ "serverId": server })).await.ok()?;
+        (!v.is_null()).then_some(v)
+    })
+    .await;
+    assert_eq!(seen, code);
+    assert!(call_err(&b.app, "rotate_invite_code", json!({ "serverId": server })).await.contains("Only the server owner"));
+
+    let rotated = call(&a.app, "rotate_invite_code", json!({ "serverId": server })).await;
+    assert!(is_code(&rotated) && rotated != code);
+    let err = call_err(&c.app, "join_server", json!({ "invite": code })).await;
+    assert!(!err.is_empty());
+    assert_eq!(server_id(&call(&c.app, "join_server", json!({ "invite": rotated })).await), server);
+
+    // Friend codes: made on first use, stable, rotatable; add_contact resolves them.
+    let bob_code = call(&b.app, "get_friend_code", json!({})).await;
+    assert!(is_code(&bob_code));
+    assert_eq!(call(&b.app, "get_friend_code", json!({})).await, bob_code);
+    let dm = eventually("alice adds bob by friend code", 20, || async {
+        a.app.call("add_contact", json!({ "code": bob_code.as_str().unwrap().to_lowercase() })).await.ok()
+    })
+    .await;
+    assert_eq!(dm["userId"], b.user.as_str());
+    assert!(call_err(&b.app, "add_contact", json!({ "code": bob_code })).await.contains("your own code"));
+    let new_code = call(&b.app, "rotate_friend_code", json!({})).await;
+    assert!(is_code(&new_code) && new_code != bob_code);
+    assert_eq!(call(&b.app, "get_friend_code", json!({})).await, new_code);
+    let dm = eventually("carol adds bob by the new code", 20, || async { c.app.call("add_contact", json!({ "code": new_code })).await.ok() }).await;
+    assert_eq!(dm["userId"], b.user.as_str());
+    eventually("the old friend code stops resolving", 20, || async { c.app.call("add_contact", json!({ "code": bob_code })).await.err() }).await;
+    // The long ID still works.
+    let long = call(&a.app, "app_snapshot", json!({})).await["me"]["userCode"].clone();
+    assert_eq!(call(&c.app, "add_contact", json!({ "code": long })).await["userId"], a.user.as_str());
+    assert!(call_err(&c.app, "add_contact", json!({ "code": "hello" })).await.contains("friend code"));
+
+    for n in [&a, &b, &c] {
+        n.app.shutdown().await;
+    }
+}

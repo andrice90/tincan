@@ -19,6 +19,10 @@ pub(crate) const CORE_COMMANDS: &[&str] = &[
     "set_name",
     "create_server",
     "create_invite",
+    "get_invite_code",
+    "rotate_invite_code",
+    "get_friend_code",
+    "rotate_friend_code",
     "join_server",
     "leave_server",
     "rename_server",
@@ -201,6 +205,16 @@ pub(crate) async fn call(core: &Arc<Core>, cmd: &str, a: Value) -> Result<Value,
             let a: args::Server = parse_args(cmd, a)?;
             ok(core.cmd_create_invite(parse_conv(&a.server_id)?).await?)
         }
+        "get_invite_code" => {
+            let a: args::Server = parse_args(cmd, a)?;
+            ok(core.cmd_get_invite_code(parse_conv(&a.server_id)?).await?)
+        }
+        "rotate_invite_code" => {
+            let a: args::Server = parse_args(cmd, a)?;
+            ok(core.cmd_rotate_invite_code(parse_conv(&a.server_id)?).await?)
+        }
+        "get_friend_code" => ok(core.cmd_get_friend_code()?),
+        "rotate_friend_code" => ok(core.cmd_rotate_friend_code()?),
         "join_server" => {
             let a: args::Join = parse_args(cmd, a)?;
             ok(core.cmd_join_server(&a.invite).await?)
