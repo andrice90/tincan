@@ -857,6 +857,7 @@ fn pending_limits_keep_junk_from_evicting_honest_early_events() {
         small.ingest(&mut fx.state, raw(&m, fx.conv, seq + i, hlc_from_ms(fx.clock_ms + 7000 + i), named("run")), NOW);
     }
     assert_eq!(small.len(), 3);
+    assert_eq!(small.dropped(), 7, "every event refused under the limits is counted");
     // Draining still works and the counters follow.
     let next = raw(&m, fx.conv, seq, hlc_from_ms(fx.clock_ms + 4000), named("next"));
     let (v, applied) = pending.ingest(&mut fx.state, next, NOW);
@@ -924,6 +925,7 @@ fn pending_is_bounded_by_count() {
         pending.insert(fake(u, seq, 1));
     }
     assert_eq!(pending.len(), MAX_PENDING_EVENTS);
+    assert_eq!(pending.dropped(), 5, "evictions are counted");
     for seq in 1..=5 {
         assert!(!pending.contains(&u, seq), "oldest {seq} dropped");
     }

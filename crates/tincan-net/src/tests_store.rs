@@ -57,3 +57,54 @@ async fn history_sync_into_sqlite() {
     eprintln!("sync of {HISTORY} events into sqlite: {took:?}");
     a.net.shutdown().await;
 }
+
+/// NET-SECURITY-9: the owner's chain blocks on a later member's invite with more events after
+/// it than the joiner's pending buffer holds per author. The joiner reports SyncComplete only
+/// once every event is applied (what it dropped meanwhile is asked for again first).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_complete_waits_for_events_dropped_while_blocked() {
+    use crate::tests::wire;
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    wire(&[&a, &b]);
+    let server = crate::tests::cluster(&a, &[&b]).await;
+    let bid = b.net.me();
+    within("bob's invite", Duration::from_secs(10), b.net.create_invite(server)).await.expect("invite");
+    let mut bob_invite = None;
+    until("alice knows bob's invite", Duration::from_secs(5), || {
+        bob_invite = a.net.conv_state(&server).and_then(|s| s.invites.values().find(|i| i.creator == bid).map(|i| i.invite_pk));
+        bob_invite.is_some()
+    })
+    .await;
+    // Alice (the owner) admits someone through Bob's invite: her chain now waits on Bob's.
+    let body = Body::MemberAdmit { user: Identity::generate().user(), invite_pk: bob_invite.unwrap(), from_seq: 1 };
+    within("admit", Duration::from_secs(10), a.net.publish(server, body)).await.expect("admit");
+    let ch = text_channel(&a, &server);
+    for i in 0..2200 {
+        let body = Body::Message { channel: ch, text: format!("after the admission {i}"), attachments: vec![] };
+        within("publish", Duration::from_secs(10), a.net.publish(server, body)).await.expect("publish");
+    }
+    let invite = a.net.create_invite(server).await.expect("invite");
+    let want = a.net.conv_state(&server).unwrap().sync_heads();
+    let j = node("joy", fast()).await;
+    wire(&[&a, &b, &j]);
+    let mut j_ev = j.net.subscribe();
+    within("join", Duration::from_secs(20), j.net.join(&invite)).await.expect("join");
+    within("SyncComplete", Duration::from_secs(60), async {
+        loop {
+            match j_ev.recv().await {
+                Ok(crate::NetEvent::SyncComplete { conv }) if conv == server => return,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await;
+    let got = j.net.conv_state(&server).unwrap();
+    for (u, s) in want.0 {
+        assert!(got.head(&u) >= s, "at SyncComplete {} has {} of {s}", u.short(), got.head(&u));
+    }
+    for n in [a, b, j] {
+        n.net.shutdown().await;
+    }
+}

@@ -333,6 +333,20 @@ impl Inner {
         self.replica(&ConvId::dm(&self.me, user)).is_some() || self.shares_server(user)
     }
 
+    /// Does `user` get a pre-auth slot from the known pool (`proto::PreAuth`)? A member of
+    /// one of my servers, or a DM contact I wrote to. A stranger whose message opened a
+    /// conversation I never answered is still unknown here: one valid message must not buy
+    /// slots in the pool that members and contacts rely on.
+    pub fn is_trusted_dialer(&self, user: &UserId) -> bool {
+        if *user == self.me {
+            return false;
+        }
+        if self.shares_server(user) {
+            return true;
+        }
+        self.replica(&ConvId::dm(&self.me, user)).is_some_and(|r| r.lock().state.head(&self.me) > 0)
+    }
+
     /// Is `user` online in any server roster I know of, or connected over a DM?
     pub fn peer_online(&self, user: &UserId) -> bool {
         if self.dm.is_connected(user) {

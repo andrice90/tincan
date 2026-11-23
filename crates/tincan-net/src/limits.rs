@@ -61,8 +61,8 @@ impl Bucket {
 #[derive(Debug)]
 pub(crate) struct Buckets<K> {
     map: HashMap<K, Bucket>,
-    every: Duration,
-    burst: u32,
+    per_sec: f64,
+    burst: f64,
 }
 
 /// Most keys a `Buckets` keeps.
@@ -70,12 +70,21 @@ const MAX_KEYS: usize = 4096;
 
 impl<K: Eq + Hash + Clone> Buckets<K> {
     /// One token per `every` and key, `burst` at most.
-    pub fn new(every: Duration, burst: u32) -> Self { Self { map: HashMap::new(), every, burst } }
+    pub fn new(every: Duration, burst: u32) -> Self {
+        let per_sec = if every.is_zero() { f64::INFINITY } else { 1.0 / every.as_secs_f64() };
+        Self::rate(per_sec, f64::from(burst))
+    }
+
+    /// `per_sec` tokens per second and key, `burst` at most (for byte budgets).
+    pub fn rate(per_sec: f64, burst: f64) -> Self { Self { map: HashMap::new(), per_sec, burst } }
 
     /// Take a token for `key`.
-    pub fn take(&mut self, key: &K, now: Instant) -> bool {
+    pub fn take(&mut self, key: &K, now: Instant) -> bool { self.take_n(key, 1.0, now) }
+
+    /// Take `n` tokens for `key` if it has that many.
+    pub fn take_n(&mut self, key: &K, n: f64, now: Instant) -> bool {
         if !self.map.contains_key(key) && self.map.len() >= MAX_KEYS {
-            let burst = f64::from(self.burst);
+            let burst = self.burst;
             self.map.retain(|_, b| {
                 b.refill(now);
                 b.tokens < burst
@@ -84,8 +93,8 @@ impl<K: Eq + Hash + Clone> Buckets<K> {
                 return false;
             }
         }
-        let (every, burst) = (self.every, self.burst);
-        self.map.entry(key.clone()).or_insert_with(|| Bucket::every(every, burst, now)).take(now)
+        let (per_sec, burst) = (self.per_sec, self.burst);
+        self.map.entry(key.clone()).or_insert_with(|| Bucket::new(per_sec, burst, now)).take_n(n, now)
     }
 
     /// Would `take(key)` succeed now (without taking a token)? A key not seen yet has a full

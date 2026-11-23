@@ -84,6 +84,23 @@ const STRANGER_BURST: u32 = 10;
 /// Conversations opened by strangers that I never answered, kept at once. Beyond this, a
 /// stranger's first message is not accepted (no row, no `DmOpened`).
 pub(crate) const MAX_UNANSWERED_STRANGER_CONVS: usize = 32;
+/// An unanswered stranger conversation older than this no longer counts toward
+/// `MAX_UNANSWERED_STRANGER_CONVS` (it stays stored).
+const STALE_STRANGER_CONV_MS: u64 = 3 * 24 * 60 * 60 * 1000;
+/// New events applied per contact: 2000 in a row (a backlog after a long absence), then 5
+/// per second. Over it the rest of the page is not applied and is asked for again later.
+const DM_EVENTS_EVERY: Duration = Duration::from_millis(200);
+const DM_EVENTS_BURST: u32 = 2000;
+/// The same while I never wrote in the conversation and we share no server (a stranger's
+/// conversation): 50 in a row, then one per minute.
+const DM_UNANSWERED_EVERY: Duration = Duration::from_secs(60);
+const DM_UNANSWERED_BURST: u32 = 50;
+/// Bytes of new events applied per contact: 8 MiB in a row, then 16 KiB/s.
+const DM_BYTES_PER_S: f64 = 16.0 * 1024.0;
+const DM_BYTES_BURST: f64 = 8.0 * 1024.0 * 1024.0;
+/// After events were cut, what is missing is asked for again at most this often, once the
+/// budget has room.
+const DM_REFETCH_EVERY: Duration = Duration::from_secs(1);
 /// Typing notices per contact: one per this.
 const DM_TYPING_EVERY: Duration = Duration::from_secs(2);
 /// Rings per contact: a burst of 5, then one per 10 s.
@@ -104,6 +121,12 @@ struct DmGates {
     call_invite: Buckets<UserId>,
     call_state: Buckets<UserId>,
     profile: Buckets<UserId>,
+    /// New events applied per contact (`DM_EVENTS_BURST`).
+    events: Buckets<UserId>,
+    /// New events applied in a stranger's conversation (`DM_UNANSWERED_BURST`).
+    unanswered: Buckets<UserId>,
+    /// Bytes of new events applied per contact.
+    event_bytes: Buckets<UserId>,
 }
 
 impl Default for DmGates {
@@ -114,6 +137,9 @@ impl Default for DmGates {
             call_invite: Buckets::new(CALL_INVITE_EVERY, CALL_INVITE_BURST),
             call_state: Buckets::new(CALL_STATE_EVERY, CALL_STATE_BURST),
             profile: Buckets::new(DM_PROFILE_EVERY, DM_PROFILE_BURST),
+            events: Buckets::new(DM_EVENTS_EVERY, DM_EVENTS_BURST),
+            unanswered: Buckets::new(DM_UNANSWERED_EVERY, DM_UNANSWERED_BURST),
+            event_bytes: Buckets::rate(DM_BYTES_PER_S, DM_BYTES_BURST),
         }
     }
 }
@@ -124,8 +150,10 @@ pub(crate) struct DmManager {
     peers: Mutex<HashMap<UserId, DmPeer>>,
     next_id: Mutex<u64>,
     changed: watch::Sender<u64>,
-    /// Peers whose connection was accepted while they were strangers (no conversation yet).
-    strangers: Mutex<std::collections::HashSet<UserId>>,
+    /// Peers whose connection was accepted while they were strangers (no conversation yet),
+    /// with the ticket of the slot and when it was taken.
+    strangers: Mutex<HashMap<UserId, (u64, Instant)>>,
+    next_ticket: std::sync::atomic::AtomicU64,
     gates: Mutex<DmGates>,
 }
 
@@ -135,8 +163,38 @@ impl Default for DmManager {
             peers: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
             changed: watch::channel(0).0,
-            strangers: Mutex::new(std::collections::HashSet::new()),
+            strangers: Mutex::new(HashMap::new()),
+            next_ticket: std::sync::atomic::AtomicU64::new(1),
             gates: Mutex::new(DmGates::default()),
+        }
+    }
+}
+
+/// A stranger slot taken for an incoming connection. Dropped before the connection was
+/// kept (a failed hello, a dropped duplicate), it frees the slot it took.
+struct StrangerSlot<'a> {
+    dm: &'a DmManager,
+    peer: UserId,
+    /// The ticket of a slot this connection took (None: the peer already had one).
+    ticket: Option<u64>,
+}
+
+impl StrangerSlot<'_> {
+    /// The connection was kept: the slot now lives with it (released by `unregister`, or
+    /// when its first message opens a conversation). False if it was evicted meanwhile.
+    fn keep(mut self) -> bool {
+        let ticket = self.ticket.take();
+        ticket.is_none_or(|t| self.dm.strangers.lock().get(&self.peer).is_some_and(|(k, _)| *k == t))
+    }
+}
+
+impl Drop for StrangerSlot<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.ticket {
+            let mut s = self.dm.strangers.lock();
+            if s.get(&self.peer).is_some_and(|(k, _)| *k == t) {
+                s.remove(&self.peer);
+            }
         }
     }
 }
@@ -307,7 +365,9 @@ impl DmManager {
         net.tasks.spawn(async move {
             let res = dial(&net2, peer, hint).await;
             match res {
-                Ok(d) => net2.dm.register(&net2, peer, d, net2.me),
+                Ok(d) => {
+                    net2.dm.register(&net2, peer, d, net2.me);
+                }
                 Err(e) => {
                     tracing::debug!(peer = %peer.short(), error = %e, "DM dial failed");
                     net2.dm.dial_failed(&net2, peer);
@@ -535,21 +595,21 @@ impl DmManager {
         }
     }
 
-    /// Install a connection whose DmHello exchange is done.
-    fn register(&self, net: &Arc<Inner>, peer: UserId, d: Dialed, dialer: UserId) {
+    /// Install a connection whose DmHello exchange is done. False if it was not kept.
+    fn register(&self, net: &Arc<Inner>, peer: UserId, d: Dialed, dialer: UserId) -> bool {
         let Ctl::DmHello { conv, heads, .. } = d.reply.clone() else {
             link::close_conn(&d.conn, tincan_core::CLOSE_REJECTED, "expected DmHello");
             if dialer == net.me {
                 self.dial_failed(net, peer);
             }
-            return;
+            return false;
         };
         if conv != ConvId::dm(&net.me, &peer) {
             link::close_conn(&d.conn, tincan_core::CLOSE_REJECTED, "wrong conversation");
             if dialer == net.me {
                 self.dial_failed(net, peer);
             }
-            return;
+            return false;
         }
         let id = {
             let mut n = self.next_id.lock();
@@ -589,7 +649,7 @@ impl DmManager {
             new_link.close(tincan_core::CLOSE_NORMAL, "duplicate");
             // Waiters re-check: the dial is over and the kept connection is up.
             self.bump();
-            return;
+            return false;
         }
         if let Some(name) = my_name(net) {
             let _ = new_link.send(&Ctl::DmProfile { name });
@@ -600,6 +660,7 @@ impl DmManager {
         tracing::debug!(peer = %peer.short(), "DM connection up");
         let net2 = net.clone();
         net.tasks.spawn(run_conn(net2, peer, conv, new_link, rx, sync_tx, heads));
+        true
     }
 
     fn unregister(&self, net: &Arc<Inner>, peer: UserId, id: u64) {
@@ -641,18 +702,60 @@ impl DmManager {
         }
     }
 
-    /// May a stranger's DM connection be accepted now? (A global rate and a cap on stranger
-    /// connections held at once; one per peer.)
-    fn admit_stranger(&self, peer: UserId) -> bool {
-        let mut s = self.strangers.lock();
-        if s.contains(&peer) {
-            return true;
+    /// May a stranger's DM connection be accepted now? A global rate, and at most
+    /// `MAX_STRANGER_LINKS` stranger connections at once: when full, the oldest one is closed
+    /// to make room (identities cost nothing, so refusing newcomers would let idle holders
+    /// lock everyone else out). The slot is freed when the returned guard is dropped unless
+    /// the connection was kept (`StrangerSlot::keep`).
+    fn admit_stranger(&self, peer: UserId) -> Option<StrangerSlot<'_>> {
+        let (evicted, ticket) = {
+            let mut s = self.strangers.lock();
+            if s.contains_key(&peer) {
+                return Some(StrangerSlot { dm: self, peer, ticket: None });
+            }
+            if !self.gates.lock().strangers.take(Instant::now()) {
+                return None;
+            }
+            let evicted = if s.len() >= MAX_STRANGER_LINKS {
+                let oldest = s.iter().min_by_key(|(_, (_, at))| *at).map(|(u, _)| *u);
+                oldest.inspect(|u| {
+                    s.remove(u);
+                })
+            } else {
+                None
+            };
+            let ticket = self.next_ticket.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            s.insert(peer, (ticket, Instant::now()));
+            (evicted, ticket)
+        };
+        if let Some(old) = evicted {
+            tracing::debug!(stranger = %old.short(), "stranger DM connections full; closing the oldest");
+            let conn = self.peers.lock().get(&old).and_then(|p| p.link.as_ref().map(|l| l.conn.clone()));
+            if let Some(c) = conn {
+                link::close_conn(&c, tincan_core::CLOSE_NORMAL, "busy");
+            }
         }
-        if s.len() >= MAX_STRANGER_LINKS || !self.gates.lock().strangers.take(Instant::now()) {
-            return false;
-        }
-        s.insert(peer);
-        true
+        Some(StrangerSlot { dm: self, peer, ticket: Some(ticket) })
+    }
+
+    /// Stranger slots taken now.
+    #[cfg(test)]
+    pub(crate) fn stranger_slots(&self) -> usize { self.strangers.lock().len() }
+
+    /// Room for a new event of `bytes` from `peer` in the DM budget (`strict`: a stranger's
+    /// conversation I never wrote in). Taken if there is.
+    fn allow_event(&self, peer: &UserId, strict: bool, bytes: usize) -> bool {
+        let now = Instant::now();
+        let mut g = self.gates.lock();
+        let count = if strict { g.unanswered.take(peer, now) } else { g.events.take(peer, now) };
+        count && g.event_bytes.take_n(peer, bytes as f64, now)
+    }
+
+    /// Has the DM budget of `peer` room again (after events were cut)?
+    fn events_ready(&self, peer: &UserId, strict: bool) -> bool {
+        let now = Instant::now();
+        let mut g = self.gates.lock();
+        if strict { g.unanswered.ready(peer, now) } else { g.events.ready(peer, now) }
     }
 
     /// Budget check for something a DM peer makes this device show (typing, rings, state).
@@ -668,6 +771,14 @@ impl DmManager {
     }
 }
 
+/// Does a DM conversation count toward `MAX_UNANSWERED_STRANGER_CONVS`? One the stranger
+/// opened (they wrote, I never did, we share no server) within `STALE_STRANGER_CONV_MS`. A
+/// conversation I opened myself, or an old one, does not: old spam never locks out new
+/// people.
+fn counts_as_unanswered(my_head: u64, their_head: u64, shares_server: bool, opened_ms: u64, now_ms: u64) -> bool {
+    my_head == 0 && their_head > 0 && !shares_server && now_ms.saturating_sub(opened_ms) < STALE_STRANGER_CONV_MS
+}
+
 /// Conversations opened by strangers I never wrote in (each one a DM list entry and a row).
 fn unanswered_stranger_convs(net: &Inner) -> usize {
     let dms: Vec<(UserId, ReplicaRef)> = net
@@ -679,7 +790,16 @@ fn unanswered_stranger_convs(net: &Inner) -> usize {
             (g.state.is_dm).then(|| g.record.peer.map(|p| (p, r.clone()))).flatten()
         })
         .collect();
-    dms.iter().filter(|(p, r)| r.lock().state.head(&net.me) == 0 && !net.shares_server(p)).count()
+    let now = now_ms();
+    dms.iter()
+        .filter(|(p, r)| {
+            let (mine, theirs, opened) = {
+                let g = r.lock();
+                (g.state.head(&net.me), g.state.head(p), g.record.joined_ms)
+            };
+            counts_as_unanswered(mine, theirs, net.shares_server(p), opened, now)
+        })
+        .count()
 }
 
 /// A stranger's batch: does its first event apply in order to an empty DM log (a real,
@@ -803,24 +923,44 @@ pub(crate) async fn accept_incoming(net: Arc<Inner>, conn: Connection, mut send:
         link::close_conn(&conn, tincan_core::CLOSE_REJECTED, "wrong conversation");
         return;
     }
-    if net.is_known_peer(&peer) {
+    let slot = if net.is_known_peer(&peer) {
         if let Err(e) = open_conv(&net, peer) {
             tracing::warn!(error = %e, "cannot open DM conversation");
             link::close_conn(&conn, tincan_core::CLOSE_REJECTED, "internal");
             return;
         }
-    } else if !net.dm.admit_stranger(peer) {
+        None
+    } else {
         // A stranger (no conversation, no shared server): accepted only within the limits,
         // and nothing is stored until they send a valid first message.
-        link::close_conn(&conn, tincan_core::CLOSE_REJECTED, "busy");
-        return;
-    }
+        match net.dm.admit_stranger(peer) {
+            Some(s) => Some(s),
+            None => {
+                link::close_conn(&conn, tincan_core::CLOSE_REJECTED, "busy");
+                return;
+            }
+        }
+    };
+    // A peer that stops the stream or grants it no credit cannot park this task (or keep
+    // its stranger slot: the guard frees it on every early return).
     let hello = dm_hello(&net, conv);
-    if link::write_ctl(&mut send, &hello).await.is_err() {
-        return;
+    match tokio::time::timeout(net.timings.dial, link::write_ctl(&mut send, &hello)).await {
+        Ok(Ok(())) => {}
+        _ => {
+            link::close_conn(&conn, tincan_core::CLOSE_NORMAL, "no hello");
+            return;
+        }
     }
-    let d = Dialed { conn, send, reader, reply: first };
-    net.dm.register(&net, peer, d, peer);
+    let d = Dialed { conn: conn.clone(), send, reader, reply: first };
+    let kept = net.dm.register(&net, peer, d, peer);
+    // Not kept (a duplicate): the slot is freed as it drops here.
+    if let Some(slot) = slot
+        && kept
+        && !slot.keep()
+    {
+        // Evicted while the hello went out: this connection is the one to go.
+        link::close_conn(&conn, tincan_core::CLOSE_NORMAL, "busy");
+    }
 }
 
 /// History sync on one DM connection: at most one `send_missing` in flight, the latest
@@ -896,7 +1036,10 @@ async fn run_conn(
     let keepalive_every = net.timings.dm_keepalive;
     let mut idle_at = Instant::now() + idle;
     let mut ping_at = Instant::now() + keepalive_every;
+    // Events were cut by the DM budget: ask for the rest at this time (once it has room).
+    let mut refetch_at: Option<Instant> = None;
     loop {
+        let wake = refetch_at.map_or(idle_at.min(ping_at), |r| r.min(idle_at).min(ping_at));
         tokio::select! {
             ev = rx.recv() => match ev {
                 Some(LinkEvent::Frame { ctl, .. }) => {
@@ -920,7 +1063,9 @@ async fn run_conn(
                     }
                     if let Some(r) = &replica {
                         let end = sync_pending && is_sync_end(&ctl);
-                        on_frame(&net, &peer, &conv, r, &link, &mut sync, ctl);
+                        if on_frame(&net, &peer, &conv, r, &link, &mut sync, ctl) && refetch_at.is_none() {
+                            refetch_at = Some(Instant::now() + DM_REFETCH_EVERY);
+                        }
                         if end || opened_live {
                             sync_pending = false;
                             net.emit(NetEvent::SyncComplete { conv });
@@ -934,8 +1079,21 @@ async fn run_conn(
                 }
                 Some(LinkEvent::Closed { .. }) | None => break,
             },
-            _ = tokio::time::sleep_until(idle_at.min(ping_at)) => {
+            _ = tokio::time::sleep_until(wake) => {
                 let now = Instant::now();
+                if let Some(r) = &replica
+                    && refetch_at.is_some_and(|t| now >= t)
+                {
+                    if net.dm.events_ready(&peer, strict_budget(&net, &peer, r)) {
+                        // The sender streamed its missing events once; what was cut comes
+                        // when it hears my heads again.
+                        refetch_at = None;
+                        let heads = r.lock().state.sync_heads();
+                        let _ = link.send(&Ctl::SyncHave { heads });
+                    } else {
+                        refetch_at = Some(now + DM_REFETCH_EVERY);
+                    }
+                }
                 let (held, watched) = net.dm.peers.lock().get(&peer).map(|p| (p.holds > 0, p.watches > 0)).unwrap_or_default();
                 if now >= ping_at {
                     ping_at = now + keepalive_every;
@@ -988,17 +1146,37 @@ fn stranger_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, ctl: &Ctl) -> 
     }
 }
 
-fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef, link: &Link, sync: &mut DmSync, ctl: Ctl) {
+/// Is the DM with `peer` held to the stranger budget (`DM_UNANSWERED_BURST`)? While I never
+/// wrote in it and we share no server.
+fn strict_budget(net: &Inner, peer: &UserId, replica: &ReplicaRef) -> bool { replica.lock().state.head(&net.me) == 0 && !net.shares_server(peer) }
+
+/// Handle one frame of an open conversation. True if events in it were cut by the DM
+/// budget (ask for the rest again once it has room).
+fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef, link: &Link, sync: &mut DmSync, ctl: Ctl) -> bool {
     match ctl {
         Ctl::Events { events, .. } => {
             if events.is_empty() {
-                return;
+                return false;
             }
+            let strict = strict_budget(net, peer, replica);
             let mut applied = Vec::new();
+            let mut cut = false;
             {
                 let mut r = replica.lock();
-                let verified: Vec<StoredEvent> =
-                    events.into_iter().filter_map(|signed| StoredEvent::from_signed(signed).ok()).filter(|s| s.conv() == *conv).collect();
+                let mut verified = Vec::with_capacity(events.len());
+                for signed in events {
+                    let Ok(s) = StoredEvent::from_signed(signed) else { continue };
+                    if s.conv() != *conv {
+                        continue;
+                    }
+                    // New events are budgeted per contact; over it the rest of the page is
+                    // not applied (and not acknowledged).
+                    if s.event.seq > r.state.head(&s.event.author) && !net.dm.allow_event(peer, strict, s.signed.bytes.len()) {
+                        cut = true;
+                        break;
+                    }
+                    verified.push(s);
+                }
                 for res in r.ingest_many(net.storage.as_ref(), &net.hlc, verified) {
                     applied.extend(res.applied);
                 }
@@ -1008,6 +1186,7 @@ fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef
                 let heads = replica.lock().state.sync_heads();
                 let _ = link.send(&Ctl::SyncHave { heads });
             }
+            return cut;
         }
         Ctl::SyncHave { heads } => on_heads(net, peer, conv, replica, link, sync, heads),
         Ctl::Have { .. } => {}
@@ -1026,5 +1205,23 @@ fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef
             }
         }
         other => tracing::trace!(?other, "DM: ignoring frame"),
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NET-SECURITY-6: only fresh conversations a stranger opened count toward the cap, so
+    /// old spam (or a DM I opened myself and never wrote in) never locks out new people.
+    #[test]
+    fn only_fresh_stranger_opened_conversations_count() {
+        let now = 10 * STALE_STRANGER_CONV_MS;
+        assert!(counts_as_unanswered(0, 3, false, now - 1000, now), "a stranger wrote, I did not");
+        assert!(!counts_as_unanswered(1, 3, false, now - 1000, now), "answered");
+        assert!(!counts_as_unanswered(0, 0, false, now - 1000, now), "I opened it and nobody wrote");
+        assert!(!counts_as_unanswered(0, 3, true, now - 1000, now), "we share a server");
+        assert!(!counts_as_unanswered(0, 3, false, now - STALE_STRANGER_CONV_MS, now), "older than the window");
     }
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tincan_core::event::StoredEvent;
+use tincan_core::event::{Body, StoredEvent};
 use tincan_core::hlc::Hlc;
 use tincan_core::keys::ServerKeys;
 use tincan_core::state::{Change, ConvState, PendingBuffer, PendingLimits, Verdict};
@@ -40,6 +40,44 @@ pub(crate) struct Replica {
     /// Highest own seq ever signed for this conversation (persisted), so a seq is never
     /// signed twice even if the signed event was not stored locally.
     own_floor: u64,
+    /// Servers: when this replica first stored each member's admission and who admitted
+    /// them (persisted). Local knowledge, kept out of `ConvState` (which must come out the
+    /// same for any delivery order): admission budgets and merge attestations use it.
+    seen: HashMap<UserId, Seen>,
+}
+
+/// When a replica first stored a member's admission, by its own clock, and who admitted
+/// them: the `MemberAdmit`'s author, or for a join I admitted as host, the creator of the
+/// invite used. None for the owner and for members stored before this was recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Seen {
+    /// Unix ms (local clock); 0 = before records were kept (counts as long ago).
+    pub at_ms: u64,
+    /// Who admitted them.
+    pub by: Option<UserId>,
+}
+
+/// Longest admitter chain walked (a deeper chain stops at this many steps).
+const MAX_CHAIN: usize = 64;
+
+fn seen_key(conv: &ConvId) -> String { format!("net/members_seen/{}", conv.to_hex()) }
+
+fn load_seen(storage: &dyn Storage, conv: &ConvId) -> Option<HashMap<UserId, Seen>> {
+    let raw = match storage.get_kv(&seen_key(conv)) {
+        Ok(Some(v)) => v,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, "reading member records failed");
+            return None;
+        }
+    };
+    match postcard::from_bytes::<Vec<(UserId, u64, Option<UserId>)>>(&raw) {
+        Ok(v) => Some(v.into_iter().map(|(u, at_ms, by)| (u, Seen { at_ms, by })).collect()),
+        Err(e) => {
+            tracing::warn!(error = %e, "member records unreadable; starting over");
+            None
+        }
+    }
 }
 
 /// Result of [`Replica::ingest`].
@@ -84,7 +122,96 @@ impl Replica {
         let keys = record.server_secret.map(|s| ServerKeys::derive(&s, &record.id));
         let own_floor = load_floor(storage, &record.id);
         let limits = if record.is_dm { PendingLimits::dm() } else { PendingLimits::network() };
-        Self { record, keys, state, pending: PendingBuffer::with_limits(limits), own_floor }
+        let mut seen = HashMap::new();
+        let mut save = false;
+        if !record.is_dm {
+            match load_seen(storage, &record.id) {
+                Some(m) => seen = m,
+                None => {
+                    // First load since records are kept: everyone known now counts as stored
+                    // long ago. A new conversation starts with an empty record.
+                    for u in state.members.keys() {
+                        seen.insert(*u, Seen { at_ms: 0, by: None });
+                    }
+                    save = true;
+                }
+            }
+        }
+        let r = Self { record, keys, state, pending: PendingBuffer::with_limits(limits), own_floor, seen };
+        if save {
+            r.save_seen(storage);
+        }
+        r
+    }
+
+    fn save_seen(&self, storage: &dyn Storage) {
+        let v: Vec<(UserId, u64, Option<UserId>)> = self.seen.iter().map(|(u, s)| (*u, s.at_ms, s.by)).collect();
+        match postcard::to_stdvec(&v) {
+            Ok(bytes) => {
+                if let Err(e) = storage.set_kv(&seen_key(&self.record.id), &bytes) {
+                    tracing::error!(error = %e, "persisting member records failed");
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "encoding member records failed"),
+        }
+    }
+
+    /// Record first sightings of members admitted by `applied` (servers only).
+    fn note_admissions<'a>(&mut self, storage: &dyn Storage, applied: impl Iterator<Item = &'a StoredEvent>) {
+        if self.record.is_dm {
+            return;
+        }
+        let now = now_ms();
+        let mut changed = false;
+        for e in applied {
+            let (user, by) = match &e.event.body {
+                Body::Genesis { .. } => (e.event.author, None),
+                Body::MemberAdmit { user, .. } => (*user, Some(e.event.author)),
+                _ => continue,
+            };
+            if let std::collections::hash_map::Entry::Vacant(v) = self.seen.entry(user) {
+                v.insert(Seen { at_ms: now, by: by.filter(|b| *b != user) });
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_seen(storage);
+        }
+    }
+
+    /// I admitted `joiner` as host for a join through an invite of `creator`: that creator is
+    /// who admitted them, not me. Only for a record made by my admission (a rejoin keeps its
+    /// own).
+    pub fn note_join(&mut self, storage: &dyn Storage, me: &UserId, joiner: &UserId, creator: &UserId) {
+        if let Some(s) = self.seen.get_mut(joiner)
+            && s.by == Some(*me)
+            && creator != joiner
+        {
+            s.by = Some(*creator);
+            self.save_seen(storage);
+        }
+    }
+
+    /// Is `user` a member first stored at or before `cutoff_ms` (local clock)? Members with
+    /// no record count as stored long ago.
+    pub fn seen_by(&self, user: &UserId, cutoff_ms: u64) -> bool { self.seen.get(user).is_none_or(|s| s.at_ms <= cutoff_ms) }
+
+    /// Who answers for admissions authored by `user`: the nearest admitter up the chain
+    /// (`user` first) that this replica stored at or before `cutoff_ms`. A member admitted
+    /// since then spends its admitter's budget, never a fresh one of its own. A chain with
+    /// nobody that old ends at its top.
+    pub fn answerable(&self, user: &UserId, cutoff_ms: u64) -> UserId {
+        let mut cur = *user;
+        for _ in 0..MAX_CHAIN {
+            match self.seen.get(&cur) {
+                Some(s) if s.at_ms > cutoff_ms => match s.by {
+                    Some(by) if by != cur => cur = by,
+                    _ => return cur,
+                },
+                _ => return cur,
+            }
+        }
+        cur
     }
 
     /// Rebuild a replica from every stored event of `record`'s conversation.
@@ -161,11 +288,12 @@ impl Replica {
 
     /// Store applied events (one `insert_events` call), then flag deleted targets. Storage
     /// failures are logged; the state has already advanced.
-    fn persist<'a>(&self, storage: &dyn Storage, applied: impl Iterator<Item = &'a (StoredEvent, Change)>) {
+    fn persist<'a>(&mut self, storage: &dyn Storage, applied: impl Iterator<Item = &'a (StoredEvent, Change)>) {
         let applied: Vec<&(StoredEvent, Change)> = applied.collect();
         if applied.is_empty() {
             return;
         }
+        self.note_admissions(storage, applied.iter().map(|(e, _)| e));
         let evs: Vec<&StoredEvent> = applied.iter().map(|(e, _)| e).collect();
         for (res, e) in storage.insert_events(&evs).into_iter().zip(&evs) {
             if let Err(err) = res {

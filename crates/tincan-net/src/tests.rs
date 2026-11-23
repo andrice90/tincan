@@ -36,6 +36,8 @@ pub(super) fn fast() -> Timings {
         compare_cooldown: Duration::from_secs(1),
         roster_min_interval: Duration::from_millis(200),
         publish_park_retry: Duration::from_millis(500),
+        // Test members are minutes old: count them all (tests of the age rule set it).
+        established_after: Duration::ZERO,
         ..Timings::default()
     }
 }

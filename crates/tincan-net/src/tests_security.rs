@@ -526,23 +526,23 @@ async fn n3_strangers_store_nothing_until_a_valid_first_message() {
     // A valid first message opens it.
     crate::link::write_ctl(&mut d.send, &Ctl::Events { events: vec![msg(1, "hello")], more: false }).await.unwrap();
     until("conversation opened", Duration::from_secs(5), || a.net.conv_state(&conv).is_some_and(|s| s.head(&x.user()) == 1)).await;
-    // At most MAX_STRANGER_LINKS stranger connections at once.
+    // At most MAX_STRANGER_LINKS stranger connections at once: past that, the oldest is
+    // closed to make room (it used to refuse newcomers, which let idle holders lock first
+    // contact out; NET-SECURITY-6).
     let mut held = Vec::new();
-    let mut refused = 0;
-    for i in 0..(crate::dm::MAX_STRANGER_LINKS + 2) {
+    for i in 0..(crate::dm::MAX_STRANGER_LINKS + 1) {
         let id = Identity::generate();
         let ep = crate::build_endpoint(&id, &crate::tests::cfg(&format!("s{i}"))).await.unwrap();
         let conv = ConvId::dm(&a.net.me(), &id.user());
-        let Ok(conn) = crate::link::connect(&ep, &a.net.me(), Some(&hint(&a)), tincan_core::ALPN_DM, Duration::from_secs(3)).await else {
-            refused += 1;
-            continue;
-        };
-        match crate::link::exchange(conn, &Ctl::DmHello { conv, heads: Heads::default(), have: vec![] }, Duration::from_secs(3)).await {
-            Ok(d) => held.push((ep, d)),
-            Err(_) => refused += 1,
-        }
+        let conn = crate::link::connect(&ep, &a.net.me(), Some(&hint(&a)), tincan_core::ALPN_DM, Duration::from_secs(3)).await.expect("connect");
+        let d = crate::link::exchange(conn, &Ctl::DmHello { conv, heads: Heads::default(), have: vec![] }, Duration::from_secs(3)).await.expect("hello");
+        held.push((ep, d));
     }
-    assert!(refused >= 2, "only {refused} of {} stranger connections refused", crate::dm::MAX_STRANGER_LINKS + 2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let open = held.iter().filter(|(_, d)| d.conn.close_reason().is_none()).count();
+    assert_eq!(open, crate::dm::MAX_STRANGER_LINKS, "the oldest stranger connection made room");
+    assert!(held[0].1.conn.close_reason().is_some(), "the oldest went first");
+    assert!(a.net.inner().dm.stranger_slots() <= crate::dm::MAX_STRANGER_LINKS);
     drop(held);
     a.net.shutdown().await;
 }
@@ -784,6 +784,130 @@ async fn typing_and_attest_inputs_are_checked() {
         }
     })
     .await;
+    for n in [a, b, m] {
+        n.net.shutdown().await;
+    }
+}
+
+/// NET-SECURITY-1: admissions signed by members admitted during this host role spend the
+/// budget of whoever admitted them, on every path (relayed `Events` included). A member
+/// relaying 200 admissions signed by a key it just admitted, and four more such keys
+/// admitting 40 each, grow the server by at most one admission budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sybil_admissions_spend_their_admitters_budget() {
+    // Everyone joins during Alice's host role, so for her nobody but herself is established.
+    let a = node("alice", Timings { established_after: Duration::from_secs(3600), ..fast() }).await;
+    let m = node("mallory", fast()).await;
+    wire(&[&a, &m]);
+    let server = cluster(&a, &[&m]).await;
+    let invite_pk = *a.net.conv_state(&server).unwrap().invites.keys().next().unwrap();
+    let before = a.net.conv_state(&server).unwrap().members.len();
+    let sybils: Vec<Identity> = (0..5).map(|_| Identity::generate()).collect();
+    for s in &sybils {
+        let body = Body::MemberAdmit { user: s.user(), invite_pk, from_seq: 1 };
+        within("mallory admits a key of hers", Duration::from_secs(10), m.net.publish(server, body)).await.expect("admitted");
+    }
+    let chain = |id: &Identity, n: u64| -> Vec<SignedEvent> {
+        (1..=n)
+            .map(|seq| {
+                let body = Body::MemberAdmit { user: Identity::generate().user(), invite_pk, from_seq: 1 };
+                build::event(id, server, seq, (now_ms() << 16) + seq, body).unwrap()
+            })
+            .collect()
+    };
+    let mut batch = chain(&sybils[0], 200);
+    for s in &sybils[1..] {
+        batch.extend(chain(s, 40));
+    }
+    assert!(m.net.send_ctl_to_host(&server, Ctl::Events { events: batch, more: false }).await);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let state = a.net.conv_state(&server).unwrap();
+    let grown = state.members.len() - before;
+    eprintln!("the server grew by {grown} members");
+    assert!(grown <= 21, "{grown} new members from one member's budget");
+    assert!(grown > sybils.len(), "within the budget some relayed admissions still apply");
+    assert_eq!(host_of(&m, &server), Some(a.net.me()), "valid signatures get nobody dropped");
+    for n in [a, m] {
+        n.net.shutdown().await;
+    }
+}
+
+/// NET-SECURITY-2: a member that admits a few keys of its own and has them attest for it
+/// cannot take over a live host: only attesters the host stored long enough ago count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s1_sybil_attestations_do_not_move_a_live_host() {
+    let a = node("alice", Timings { established_after: Duration::from_secs(2), ..fast() }).await;
+    let b = node("bob", fast()).await;
+    let c = node("carol", fast()).await;
+    let m = node("mallory", fast()).await;
+    wire(&[&a, &b, &c, &m]);
+    let server = cluster(&a, &[&b, &c, &m]).await;
+    // Bob, Carol and Mallory become established for Alice, and their attestations arrive.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let epoch = a.net.connection(&server).epoch;
+    let mid = m.net.me();
+    let invite_pk = *a.net.conv_state(&server).unwrap().invites.keys().next().unwrap();
+    // More fresh keys than Alice has other members.
+    let sybils: Vec<Identity> = (0..4).map(|_| Identity::generate()).collect();
+    for s in &sybils {
+        let body = Body::MemberAdmit { user: s.user(), invite_pk, from_seq: 1 };
+        within("mallory admits a key of hers", Duration::from_secs(10), m.net.publish(server, body)).await.expect("admitted");
+    }
+    until("alice knows them", Duration::from_secs(5), || a.net.conv_state(&server).is_some_and(|st| sybils.iter().all(|s| st.is_member(&s.user())))).await;
+    let attests: Vec<SignedAttestation> = sybils.iter().map(|s| att(s, server, mid, epoch + 1, now_ms())).collect();
+    let claim = build::host_claim(&m.identity, &server, epoch + 1, None, now_ms()).unwrap();
+    assert!(m.net.send_ctl_to_host(&server, Ctl::HostCompare2 { claim, attests }).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let moved = build::host_claim(&m.identity, &server, epoch + 2, None, now_ms()).unwrap();
+    assert!(m.net.send_ctl_to_host(&server, Ctl::HostMoved { claim: moved, addr: hint(&m) }).await);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(a.net.connection(&server).state, ConnState::Hosting, "the live host kept hosting");
+    for n in [&b, &c] {
+        assert_eq!(host_of(n, &server), Some(a.net.me()), "members stayed with the live host");
+    }
+    for n in [a, b, c, m] {
+        n.net.shutdown().await;
+    }
+}
+
+/// NET-SECURITY-3: a member pushing thousands of its own events in `Events` frames (outside
+/// the publish budget) gets at most its own-events burst applied at once and more only as
+/// the budget refills; honest members are not closed as too slow and still publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_frames_do_not_bypass_the_publish_budget() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    let m = node("mallory", fast()).await;
+    wire(&[&a, &b, &m]);
+    let server = cluster(&a, &[&b, &m]).await;
+    let (mid, bid) = (m.net.me(), b.net.me());
+    let head = a.net.conv_state(&server).unwrap().head(&mid);
+    let ch = text_channel(&a, &server);
+    let flood: Vec<SignedEvent> = (head + 1..=head + 10_000)
+        .map(|seq| {
+            let body = Body::Message { channel: ch, text: format!("flood {seq}"), attachments: vec![] };
+            build::event(&m.identity, server, seq, (now_ms() << 16) + seq, body).unwrap()
+        })
+        .collect();
+    let mut a_ev = a.net.subscribe();
+    for chunk in flood.chunks(2500) {
+        assert!(m.net.send_ctl_to_host(&server, Ctl::Events { events: chunk.to_vec(), more: false }).await);
+    }
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let applied = a.net.conv_state(&server).unwrap().head(&mid) - head;
+    eprintln!("{applied} of 10000 applied at once");
+    assert!((1000..=2020).contains(&applied), "{applied} own events applied at once");
+    // Sent again later: a few more, at the publish rate.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    for chunk in flood.chunks(2500) {
+        assert!(m.net.send_ctl_to_host(&server, Ctl::Events { events: chunk.to_vec(), more: false }).await);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let later = a.net.conv_state(&server).unwrap().head(&mid) - head;
+    assert!(later > applied && later <= applied + 40, "{later} after the refill");
+    assert_eq!(drain_count(&mut a_ev, |e| matches!(e, NetEvent::MemberLinkDown { user, .. } if *user == bid)), 0, "bob was not dropped");
+    assert_eq!(host_of(&b, &server), Some(a.net.me()));
+    say(&b, server, "still here").await.expect("bob still publishes");
     for n in [a, b, m] {
         n.net.shutdown().await;
     }

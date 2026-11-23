@@ -76,6 +76,12 @@ pub(crate) struct Timings {
     pub publish_park_retry: Duration,
     /// A joiner must send its Hello within this after JoinAccepted.
     pub joiner_hello: Duration,
+    /// A member is established once this replica stored its admission at least this long ago
+    /// (local clock). Only established members' attestations count against a live host in a
+    /// partition-merge comparison (members admitted just now, sybils, cannot outvote it),
+    /// and a member that is neither established nor older than the host role spends its
+    /// admitter's admission budget.
+    pub established_after: Duration,
 }
 
 impl Default for Timings {
@@ -120,6 +126,7 @@ impl Default for Timings {
             roster_min_interval: Duration::from_secs(1),
             publish_park_retry: Duration::from_secs(30),
             joiner_hello: Duration::from_secs(10),
+            established_after: Duration::from_secs(24 * 60 * 60),
         }
     }
 }

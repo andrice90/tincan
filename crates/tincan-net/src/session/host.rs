@@ -15,7 +15,7 @@ use tincan_core::event::{Body, SignedEvent, StoredEvent};
 use tincan_core::media::{KIND_SCREEN, track_id};
 use tincan_core::state::{Change, Verdict};
 use tincan_core::sync::{Heads, SYNC_PAGE_BYTES};
-use tincan_core::wire::{self, AddrHint, ClipInfo, Ctl, HeadsAssembler, RejectCode, Roster, RosterEntry};
+use tincan_core::wire::{self, AddrHint, ClipInfo, Ctl, HeadsAssembler, HeadsPart, RejectCode, Roster, RosterEntry};
 use tincan_core::{BlobHash, ChannelId, EventId, UserId, now_ms};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -55,6 +55,21 @@ const ADMIT_INVITE_BURST: u32 = 10;
 /// member cannot use up anyone else's.
 const ADMIT_BY_EVERY: Duration = Duration::from_secs(60);
 const ADMIT_BY_BURST: u32 = 20;
+/// New members over all paths and members together: one per 10 s, 60 in a row. A backstop
+/// for the per-member budgets (each admission grows every replica for good).
+const ADMIT_ALL_EVERY: Duration = Duration::from_secs(10);
+const ADMIT_ALL_BURST: u32 = 60;
+/// A sender's own new events in `Events` frames (honest members publish one at a time
+/// through `Publish`; their own events come in `Events` only after they hosted a partition
+/// of their own): 2000 in a row, then the publish rate.
+const OWN_EVENTS_BURST: u32 = 2000;
+/// Bytes of new events per sender in `Events` frames, own and relayed: 16 MiB in a row,
+/// then 64 KiB/s.
+const EVENT_BYTES_PER_S: f64 = 64.0 * 1024.0;
+const EVENT_BYTES_BURST: f64 = 16.0 * 1024.0 * 1024.0;
+/// A member whose events were held back over the volume budget is asked to resend after
+/// this (after `ADMIT_BY_EVERY` when an admission was held back).
+const RESEND_HELD: Duration = Duration::from_secs(15);
 /// Merge comparisons over all peers: burst 4, then one per 15 s.
 const COMPARE_EVERY: Duration = Duration::from_secs(15);
 const COMPARE_BURST: u32 = 4;
@@ -147,7 +162,8 @@ pub(super) enum Merge {
         synced: bool,
     },
     /// I lost as the prober; waiting for the winner's HostMoved on the probe link.
-    /// `theirs_verified` is re-checked against my members when it arrives.
+    /// `theirs_verified` (its established attesters) is re-checked against my members when
+    /// it arrives.
     AwaitProbe { link: Link, peer: UserId, deadline: Instant, synced: bool, theirs_verified: u32 },
     /// I lost to a host that probed me; waiting for its HostMoved on its member link.
     AwaitMember { peer: UserId, deadline: Instant, theirs_verified: u32 },
@@ -230,8 +246,14 @@ struct Gates {
     whohas: Buckets<UserId>,
     /// Joins per invite (JoinRequest only: the joiner proved it holds the invite).
     admit_invite: Buckets<[u8; 32]>,
-    /// Admissions per responsible member (see `ADMIT_BY_EVERY`).
+    /// Admissions per answerable member (see `ADMIT_BY_EVERY` and `Replica::answerable`).
     admit_by: Buckets<UserId>,
+    /// New members over everyone (see `ADMIT_ALL_EVERY`).
+    admit_all: Bucket,
+    /// A sender's own new events in `Events` frames.
+    own_events: Buckets<UserId>,
+    /// Bytes of new events per sender in `Events` frames.
+    event_bytes: Buckets<UserId>,
     compare: Bucket,
     /// Last comparison handled per peer.
     compare_last: HashMap<UserId, Instant>,
@@ -248,16 +270,29 @@ impl Gates {
             whohas: Buckets::new(WHOHAS_EVERY, WHOHAS_BURST),
             admit_invite: Buckets::new(ADMIT_INVITE_EVERY, ADMIT_INVITE_BURST),
             admit_by: Buckets::new(ADMIT_BY_EVERY, ADMIT_BY_BURST),
+            admit_all: Bucket::every(ADMIT_ALL_EVERY, ADMIT_ALL_BURST, now),
+            own_events: Buckets::new(PUBLISH_EVERY, OWN_EVENTS_BURST),
+            event_bytes: Buckets::rate(EVENT_BYTES_PER_S, EVENT_BYTES_BURST),
             compare: Bucket::every(COMPARE_EVERY, COMPARE_BURST, now),
             compare_last: HashMap::new(),
             reprobes: HashMap::new(),
         }
     }
 
-    /// Budget for one join through `invite_pk`, an invite created by `creator`.
-    fn admit_join(&mut self, creator: &UserId, invite_pk: &[u8; 32], now: Instant) -> bool {
-        // Both or neither: a refused join spends nothing.
-        self.admit_by.ready(creator, now) && self.admit_invite.take(invite_pk, now) && self.admit_by.take(creator, now)
+    /// Budget for one join through `invite_pk`; `answerable` answers for the invite's
+    /// creator (`Replica::answerable`).
+    fn admit_join(&mut self, answerable: &UserId, invite_pk: &[u8; 32], now: Instant) -> bool {
+        // All or nothing: a refused join spends nothing.
+        self.admit_by.ready(answerable, now)
+            && self.admit_all.ready(now)
+            && self.admit_invite.take(invite_pk, now)
+            && self.admit_by.take(answerable, now)
+            && self.admit_all.take(now)
+    }
+
+    /// Budget for one new member admitted by a `MemberAdmit` that `answerable` answers for.
+    fn admit_new(&mut self, answerable: &UserId, now: Instant) -> bool {
+        self.admit_by.ready(answerable, now) && self.admit_all.ready(now) && self.admit_by.take(answerable, now) && self.admit_all.take(now)
     }
 }
 
@@ -390,6 +425,14 @@ impl HostState {
             rtt_ms: None,
             epoch: self.claim.claim.epoch,
         }
+    }
+
+    /// Members this replica stored at or before this time answer for their own admissions
+    /// (`Replica::answerable`): those stored before this host role started, or at least
+    /// `established_after` ago. Anyone newer spends the budget of whoever admitted them.
+    fn answer_cutoff(&self, ctx: &Ctx) -> u64 {
+        let age = u64::try_from(ctx.net.timings.established_after.as_millis()).unwrap_or(u64::MAX);
+        self.since_ms.max(now_ms().saturating_sub(age))
     }
 
     fn user_of(&self, link: u64) -> Option<UserId> { self.links.iter().find(|(_, m)| m.link.id == link).map(|(u, _)| *u) }
@@ -528,11 +571,27 @@ impl HostState {
 
     /// How many members `peer` proved for its `claim`: attestations for exactly that claim,
     /// from current members that are neither me, the peer, nor connected to me.
-    fn verified_for(&self, ctx: &Ctx, peer: UserId, claim: &SignedHostClaim, attests: &[SignedAttestation]) -> u32 {
+    ///
+    /// Returns (the count for the comparison, the count of established attesters). An
+    /// established attester is one whose admission this replica stored at least
+    /// `established_after` ago: members admitted just now (any member can admit, so sybils
+    /// are cheap) never outvote a live host. That also covers attesters the peer admitted
+    /// itself, or through members it admitted, within that time. A host with members to hand
+    /// over compares with the established count; a host with nobody to hand over has
+    /// nothing to protect and uses every valid attestation (so a solo host still rejoins a
+    /// young server). The established count is what `may_follow` re-checks.
+    fn verified_for(&self, ctx: &Ctx, peer: UserId, claim: &SignedHostClaim, attests: &[SignedAttestation]) -> (u32, u32) {
         let r = ctx.replica.lock();
-        election::count_attests(attests, &ctx.server, &peer, claim.claim.epoch, now_ms(), election::ATTEST_ACCEPT_MS, |m| {
-            *m != ctx.me && *m != peer && !self.links.contains_key(m) && r.state.is_member(m)
-        })
+        let cutoff = now_ms().saturating_sub(u64::try_from(ctx.net.timings.established_after.as_millis()).unwrap_or(u64::MAX));
+        let valid = |m: &UserId| *m != ctx.me && *m != peer && !self.links.contains_key(m) && r.state.is_member(m);
+        let count = |established: bool| {
+            election::count_attests(attests, &ctx.server, &peer, claim.claim.epoch, now_ms(), election::ATTEST_ACCEPT_MS, |m| {
+                valid(m) && (!established || r.seen_by(m, cutoff))
+            })
+        };
+        let established = count(true);
+        let all = if self.links_except(Some(peer)) > 0 { established } else { count(false) };
+        (all, established)
     }
 
     /// The roster as of now. `bump` increments the revision (broadcasts do, Welcome does not).
@@ -753,7 +812,10 @@ impl HostState {
         } else {
             let creator = ctx.replica.lock().state.invites.get(&invite_pk).map(|i| i.creator);
             let creator = creator.ok_or_else(|| JoinRejection { code: RejectCode::BadInvite, reason: "unknown invite".into() })?;
-            if !self.gates.admit_join(&creator, &invite_pk, Instant::now()) {
+            // An invite of a member admitted during this host role spends its admitter's
+            // budget (`Replica::answerable`).
+            let answerable = ctx.replica.lock().answerable(&creator, self.answer_cutoff(ctx));
+            if !self.gates.admit_join(&answerable, &invite_pk, Instant::now()) {
                 return Err(busy());
             }
         }
@@ -781,6 +843,12 @@ impl HostState {
                 stored
             };
             self.publish_local(ctx, ev.clone()).map_err(|e| internal(&e.to_string()))?;
+            {
+                let mut r = ctx.replica.lock();
+                if let Some(creator) = r.state.invites.get(&invite_pk).map(|i| i.creator) {
+                    r.note_join(ctx.net.storage.as_ref(), &ctx.me, &verified.joiner, &creator);
+                }
+            }
             let res = {
                 let mut r = ctx.replica.lock();
                 r.ingest(ctx.net.storage.as_ref(), &ctx.net.hlc, verified.profile.clone())
@@ -820,49 +888,72 @@ impl HostState {
         }
     }
 
-    /// Events from `sender`, with the sender's own admissions of new members cut to its
-    /// admission budget (an admission is permanent for every replica). Only events the sender
-    /// authored are looked at: relayed history is never budgeted or held back, so one member
-    /// cannot hold up anyone else's history. A budgeted admission must carry a valid
-    /// signature and be the sender's next seq (one that would wait in the pending buffer
-    /// would later apply unbudgeted). Over budget, it and the sender's later events in the
-    /// batch are held back; the second value says so (ask the sender to resend later).
-    fn budget_admits(&mut self, ctx: &Ctx, sender: UserId, events: Vec<SignedEvent>) -> (Vec<SignedEvent>, bool) {
+    /// Events from `sender` (a member, or the other host on a probe link), cut to the budgets.
+    /// Every new event (above its author's head), own or relayed, is charged:
+    /// - its bytes to the sender, and the sender's own events also to its own-events budget
+    ///   (`Events` is not a way around the publish budget);
+    /// - an admission of someone who is not a member yet to the member that answers for its
+    ///   author (`Replica::answerable`: a member admitted during this host role spends its
+    ///   admitter's budget, so freshly admitted keys never bring budgets of their own) and to
+    ///   the budget over everyone. Such an admission must also be its author's next event
+    ///   (one that waits in the pending buffer would later apply unbudgeted).
+    ///
+    /// Over a budget, that event and its author's later events in the batch are held back,
+    /// never dropped (the author's chain stays contiguous). The second value is when to ask
+    /// the sender to resend them, if anything was held back.
+    fn budget_events(&mut self, ctx: &Ctx, sender: UserId, events: Vec<SignedEvent>) -> (Vec<SignedEvent>, Option<Duration>) {
         let now = Instant::now();
+        let cutoff = self.answer_cutoff(ctx);
         let r = ctx.replica.lock();
-        let mut next = r.state.head(&sender).saturating_add(1);
-        let mut held = false;
+        let mut next: HashMap<UserId, u64> = HashMap::new();
+        let mut cut: HashSet<UserId> = HashSet::new();
+        let mut resend: Option<Duration> = None;
+        let mut hold = |cut: &mut HashSet<UserId>, author: UserId, after: Duration| {
+            cut.insert(author);
+            resend = Some(resend.map_or(after, |d| d.max(after)));
+        };
         let mut out = Vec::with_capacity(events.len());
         for s in events {
             let Ok(ev) = s.decode() else {
+                // Undecodable: ingesting it flags the sender.
                 out.push(s);
                 continue;
             };
-            if ev.author != sender {
+            if cut.contains(&ev.author) {
+                continue;
+            }
+            let head = r.state.head(&ev.author);
+            if ev.seq <= head {
+                // Stored already (or stale): skipped by a lookup when ingested.
                 out.push(s);
                 continue;
             }
-            if held {
-                continue;
+            let expected = next.entry(ev.author).or_insert(head.saturating_add(1));
+            let in_order = ev.seq == *expected;
+            if in_order {
+                *expected = expected.saturating_add(1);
             }
             let new_admit = matches!(&ev.body, Body::MemberAdmit { user, .. } if !r.state.is_member(user));
-            if ev.seq != next {
-                if new_admit && ev.seq > next {
-                    held = true;
-                    continue;
-                }
-                out.push(s);
+            if new_admit && !in_order {
+                hold(&mut cut, ev.author, ADMIT_BY_EVERY);
                 continue;
             }
-            next = next.saturating_add(1);
-            // A bad signature is not charged; ingesting it drops the sender.
-            if new_admit && s.verify().is_ok() && !self.gates.admit_by.take(&sender, now) {
-                held = true;
+            let own_ok = ev.author != sender || self.gates.own_events.take(&sender, now);
+            if !own_ok || !self.gates.event_bytes.take_n(&sender, s.bytes.len() as f64, now) {
+                hold(&mut cut, ev.author, RESEND_HELD);
                 continue;
+            }
+            // A bad signature is not charged; ingesting it drops the sender.
+            if new_admit && s.verify().is_ok() {
+                let answerable = r.answerable(&ev.author, cutoff);
+                if !self.gates.admit_new(&answerable, now) {
+                    hold(&mut cut, ev.author, ADMIT_BY_EVERY);
+                    continue;
+                }
             }
             out.push(s);
         }
-        (out, held)
+        (out, resend)
     }
 
     /// May a comparison with `peer` be looked at now? At most once per `compare_cooldown`
@@ -1183,14 +1274,15 @@ fn member_frame(s: &mut Session, user: UserId, ctl: Ctl) -> Next {
     match ctl {
         Ctl::Publish { event } => {
             let id = event.id();
+            let cutoff = h.answer_cutoff(&s.ctx);
             let (ack, applied) = if !h.gates.publish.take(&user, now) {
                 // Retryable: the member re-sends the same signed event (its seq is kept).
                 (Ctl::PublishAck { id, ok: false, reason: "busy".into() }, Vec::new())
             } else if publish_refusal(&s.ctx).is_some() {
-                let (_, applied) = member_publish(&mut s.ctx, &mut h.gates, user, event);
+                let (_, applied) = member_publish(&mut s.ctx, &mut h.gates, cutoff, user, event);
                 (Ctl::PublishAck { id, ok: false, reason: publish_refusal(&s.ctx).unwrap_or_default() }, applied)
             } else {
-                member_publish(&mut s.ctx, &mut h.gates, user, event)
+                member_publish(&mut s.ctx, &mut h.gates, cutoff, user, event)
             };
             if let Some(m) = h.links.get(&user) {
                 let _ = m.link.send(&ack);
@@ -1204,13 +1296,13 @@ fn member_frame(s: &mut Session, user: UserId, ctl: Ctl) -> Next {
             Next::Stay
         }
         Ctl::Events { events, .. } => {
-            let (events, held) = h.budget_admits(&s.ctx, user, events);
-            if held
+            let (events, resend) = h.budget_events(&s.ctx, user, events);
+            if let Some(after) = resend
                 && let Some(m) = h.links.get_mut(&user)
                 && m.resync_at.is_none()
             {
-                // Its own admissions wait for its budget: ask it to resend then.
-                m.resync_at = Some(now + ADMIT_BY_EVERY);
+                // What was held back waits for the budgets: ask it to resend then.
+                m.resync_at = Some(now + after);
             }
             let (applied, bad) = s.ctx.ingest_checked(events);
             let Role::Host(h) = &mut s.role else { return Next::Stay };
@@ -1226,8 +1318,15 @@ fn member_frame(s: &mut Session, user: UserId, ctl: Ctl) -> Next {
             Next::Stay
         }
         Ctl::SyncHavePart { heads, more } => {
-            if let Some(full) = m.sync.parts.push(heads, more) {
-                member_sync_have(s, user, full, now);
+            match m.sync.parts.push_part(heads, more) {
+                HeadsPart::Done(full) => member_sync_have(s, user, full, now),
+                // Its heads are unknown: answer as if it had all of mine, so its sync still
+                // ends (an empty last page) and it is not left waiting to publish.
+                HeadsPart::Overflowed => {
+                    let mine = s.ctx.heads();
+                    member_sync_have(s, user, mine, now);
+                }
+                HeadsPart::Pending => {}
             }
             Next::Stay
         }
@@ -1357,8 +1456,9 @@ fn publish_refusal(ctx: &Ctx) -> Option<String> {
     None
 }
 
-/// Validate a member's Publish; returns the ack and the applied events.
-fn member_publish(ctx: &mut Ctx, gates: &mut Gates, from: UserId, signed: SignedEvent) -> (Ctl, Vec<(StoredEvent, Change)>) {
+/// Validate a member's Publish; returns the ack and the applied events. `cutoff`:
+/// `HostState::answer_cutoff`.
+fn member_publish(ctx: &mut Ctx, gates: &mut Gates, cutoff: u64, from: UserId, signed: SignedEvent) -> (Ctl, Vec<(StoredEvent, Change)>) {
     let id = signed.id();
     let ack = |ok: bool, reason: &str| Ctl::PublishAck { id, ok, reason: reason.to_string() };
     let stored = match StoredEvent::from_signed(signed) {
@@ -1374,10 +1474,19 @@ fn member_publish(ctx: &mut Ctx, gates: &mut Gates, from: UserId, signed: Signed
     let verdict = ctx.replica.lock().state.check(&id, &stored.event, now_ms());
     match verdict {
         Verdict::Accept => {
-            // A member's own admission of someone takes its own admission budget (any member
-            // may admit with any invite, so the invite's budget is for joins only).
-            if matches!(&stored.event.body, Body::MemberAdmit { .. }) && !gates.admit_by.take(&from, Instant::now()) {
-                return (ack(false, "busy"), Vec::new());
+            // A member's own admission of someone takes its admission budget (any member may
+            // admit with any invite, so the invite's budget is for joins only). A new member
+            // is charged to whoever answers for the author, and to the budget over everyone.
+            if let Body::MemberAdmit { user, .. } = &stored.event.body {
+                let now = Instant::now();
+                let (new, answerable) = {
+                    let r = ctx.replica.lock();
+                    (!r.state.is_member(user), r.answerable(&from, cutoff))
+                };
+                let ok = if new { gates.admit_new(&answerable, now) } else { gates.admit_by.take(&from, now) };
+                if !ok {
+                    return (ack(false, "busy"), Vec::new());
+                }
             }
             let res = {
                 let mut r = ctx.replica.lock();
@@ -1424,7 +1533,7 @@ fn compare_from_member(s: &mut Session, user: UserId, claim: SignedHostClaim, at
     if claim.verify_for(&s.ctx.server).is_err() || !s.ctx.epoch_ok(claim.claim.epoch) || !h.compare_budget(now) {
         return Next::Stay;
     }
-    let theirs_verified = h.verified_for(&s.ctx, user, &claim, &attests);
+    let (theirs_verified, theirs_established) = h.verified_for(&s.ctx, user, &claim, &attests);
     let theirs = HostSide { host: user, epoch: claim.claim.epoch, connected: theirs_verified, score: 0 };
     let (mine, my_attests) = h.my_side(&s.ctx, Some(user));
     let wins = election::merge_winner_attested(&mine, &theirs);
@@ -1452,7 +1561,7 @@ fn compare_from_member(s: &mut Session, user: UserId, claim: SignedHostClaim, at
             let _ = m.link.send(&Ctl::HostMoved { claim, addr });
         }
     } else if election::may_yield(h.links_except(Some(user)), theirs_verified) {
-        h.merge = Some(Merge::AwaitMember { peer: user, deadline: now + s.ctx.net.timings.merge_timeout, theirs_verified });
+        h.merge = Some(Merge::AwaitMember { peer: user, deadline: now + s.ctx.net.timings.merge_timeout, theirs_verified: theirs_established });
     } else {
         tracing::info!(
             server = %s.ctx.server.short(), other = %user.short(), theirs_verified,
@@ -1499,7 +1608,9 @@ fn probe_frame(s: &mut Session, ctl: Ctl) -> Next {
         }
         Ctl::Events { events, .. } => {
             let Some(peer) = h.merge.as_ref().and_then(Merge::probe_peer) else { return Next::Stay };
-            let (events, _) = h.budget_admits(&s.ctx, peer, events);
+            // What is held back comes again with a later sync: the next comparison, or the
+            // other side's members once they reach me.
+            let (events, _) = h.budget_events(&s.ctx, peer, events);
             let (applied, bad) = s.ctx.ingest_checked(events);
             let Role::Host(h) = &mut s.role else { return Next::Stay };
             h.fanout(&s.ctx, &applied, None);
@@ -1547,7 +1658,7 @@ fn retired_probe_frame(s: &mut Session, link: u64, ctl: Ctl) -> Next {
             }
         }
         Ctl::Events { events, .. } => {
-            let (events, _) = h.budget_admits(&s.ctx, peer, events);
+            let (events, _) = h.budget_events(&s.ctx, peer, events);
             let (applied, bad) = s.ctx.ingest_checked(events);
             let Role::Host(h) = &mut s.role else { return Next::Stay };
             h.fanout(&s.ctx, &applied, None);
@@ -1575,7 +1686,7 @@ fn probe_compare(s: &mut Session, claim: SignedHostClaim, attests: Vec<SignedAtt
         }
         return Next::Stay;
     }
-    let theirs_verified = h.verified_for(&s.ctx, peer, &claim, &attests);
+    let (theirs_verified, theirs_established) = h.verified_for(&s.ctx, peer, &claim, &attests);
     let theirs = HostSide { host: peer, epoch: claim.claim.epoch, connected: theirs_verified, score: 0 };
     if election::merge_winner_attested(&sent, &theirs) {
         let Ok(bump) = win_epoch(h.claim.claim.epoch, theirs.epoch, theirs_verified) else {
@@ -1597,7 +1708,13 @@ fn probe_compare(s: &mut Session, claim: SignedHostClaim, attests: Vec<SignedAtt
         reprobe(s, peer);
     } else if election::may_yield(h.links_except(Some(peer)), theirs_verified) {
         let Some(Merge::Probing { link, peer, synced, .. }) = h.merge.take() else { return Next::Stay };
-        h.merge = Some(Merge::AwaitProbe { link, peer, deadline: Instant::now() + s.ctx.net.timings.merge_timeout, synced, theirs_verified });
+        h.merge = Some(Merge::AwaitProbe {
+            link,
+            peer,
+            deadline: Instant::now() + s.ctx.net.timings.merge_timeout,
+            synced,
+            theirs_verified: theirs_established,
+        });
     } else {
         tracing::info!(server = %s.ctx.server.short(), other = %peer.short(), theirs_verified, "merge: not moving my members");
         end_probe(s, peer);

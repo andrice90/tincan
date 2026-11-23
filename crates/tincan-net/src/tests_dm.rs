@@ -281,3 +281,108 @@ async fn dm_reachable_probes_with_a_backoff() {
     assert!(t0.elapsed() < Duration::from_millis(100), "a probe right after a failed one answers at once");
     a.net.shutdown().await;
 }
+
+/// A stranger: a fresh key with its own endpoint, and its DM conversation with `a`.
+async fn stranger(a: &Node, name: &str) -> (Identity, iroh::Endpoint, ConvId) {
+    let x = Identity::generate();
+    let ep = crate::build_endpoint(&x, &crate::tests::cfg(name)).await.expect("endpoint");
+    let conv = ConvId::dm(&a.net.me(), &x.user());
+    (x, ep, conv)
+}
+
+fn dm_msg(x: &Identity, conv: ConvId, seq: u64, text: &str) -> tincan_core::event::SignedEvent {
+    build::event(x, conv, seq, (tincan_core::now_ms() << 16) + seq, Body::Message { channel: dm_channel(&conv), text: text.into(), attachments: vec![] })
+        .expect("event")
+}
+
+/// A stranger's DmHello exchange with `a`.
+async fn stranger_hello(a: &Node, ep: &iroh::Endpoint, conv: ConvId) -> crate::link::Dialed {
+    let conn = crate::link::connect(ep, &a.net.me(), Some(&hint(a)), tincan_core::ALPN_DM, Duration::from_secs(3)).await.expect("connect");
+    crate::link::exchange(conn, &Ctl::DmHello { conv, heads: Heads::default(), have: vec![] }, Duration::from_secs(3)).await.expect("hello")
+}
+
+/// NET-SECURITY-5: strangers that send a hello and refuse my reply (their stream stopped
+/// before it) leave no stranger slot behind; a real newcomer still gets in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stranger_slots_are_freed_when_the_hello_reply_fails() {
+    let a = node("alice", fast()).await;
+    let mut kept = Vec::new();
+    for i in 0..crate::dm::MAX_STRANGER_LINKS {
+        let (_, ep, conv) = stranger(&a, &format!("s{i}")).await;
+        let conn = crate::link::connect(&ep, &a.net.me(), Some(&hint(&a)), tincan_core::ALPN_DM, Duration::from_secs(3)).await.expect("connect");
+        let (mut send, mut recv) = conn.open_bi().await.expect("stream");
+        // Refuse the reply before it is written, then say hello; the connection stays open.
+        let _ = recv.stop(iroh::endpoint::VarInt::from_u32(0));
+        crate::link::write_ctl(&mut send, &Ctl::DmHello { conv, heads: Heads::default(), have: vec![] }).await.expect("hello");
+        kept.push((ep, conn, send, recv));
+    }
+    until("no stranger slot left behind", Duration::from_secs(5), || a.net.inner().dm.stranger_slots() == 0).await;
+    let (x, ep, conv) = stranger(&a, "newcomer").await;
+    let mut d = stranger_hello(&a, &ep, conv).await;
+    crate::link::write_ctl(&mut d.send, &Ctl::Events { events: vec![dm_msg(&x, conv, 1, "hello")], more: false }).await.expect("events");
+    until("the newcomer's conversation opened", Duration::from_secs(5), || a.net.conv_state(&conv).is_some_and(|s| s.head(&x.user()) == 1)).await;
+    drop(kept);
+    a.net.shutdown().await;
+}
+
+/// NET-SECURITY-6: idle strangers holding every stranger slot do not keep a newcomer out: the
+/// oldest makes room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_strangers_do_not_keep_a_newcomer_out() {
+    let a = node("alice", fast()).await;
+    let mut idle = Vec::new();
+    for i in 0..crate::dm::MAX_STRANGER_LINKS {
+        let (_, ep, conv) = stranger(&a, &format!("idle{i}")).await;
+        let mut d = stranger_hello(&a, &ep, conv).await;
+        crate::link::write_ctl(&mut d.send, &Ctl::Tick { epoch: 0, t_ms: 0 }).await.expect("tick");
+        idle.push((ep, d));
+    }
+    let (x, ep, conv) = stranger(&a, "newcomer").await;
+    let mut d = stranger_hello(&a, &ep, conv).await;
+    crate::link::write_ctl(&mut d.send, &Ctl::Events { events: vec![dm_msg(&x, conv, 1, "hello")], more: false }).await.expect("events");
+    until("the newcomer's conversation opened", Duration::from_secs(5), || a.net.conv_state(&conv).is_some_and(|s| s.head(&x.user()) == 1)).await;
+    drop(idle);
+    a.net.shutdown().await;
+}
+
+/// NET-SECURITY-8: events on a DM link are budgeted per contact. A stranger's 5000 messages
+/// store at most the stranger burst; a contact's backlog over the burst still arrives in
+/// full as the budget refills.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dm_events_are_budgeted_per_contact() {
+    let (a_id, a_store) = (Identity::generate(), Arc::new(MemStorage::new()));
+    let a = start(a_id.clone(), a_store.clone(), "alice", fast()).await;
+    let (x, ep, conv) = stranger(&a, "spammer").await;
+    let mut d = stranger_hello(&a, &ep, conv).await;
+    let spam: Vec<_> = (1..=5000).map(|seq| dm_msg(&x, conv, seq, &format!("spam {seq}"))).collect();
+    for chunk in spam.chunks(2500) {
+        crate::link::write_ctl(&mut d.send, &Ctl::Events { events: chunk.to_vec(), more: false }).await.expect("events");
+    }
+    until("conversation opened", Duration::from_secs(5), || a.net.conv_state(&conv).is_some()).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let stored = a.net.conv_state(&conv).map(|s| s.head(&x.user())).unwrap_or(0);
+    eprintln!("{stored} of 5000 stranger messages stored");
+    assert!((1..=51).contains(&stored), "{stored} stranger messages stored");
+    drop(d);
+
+    // A contact Alice wrote to sends a backlog over the burst while she is away.
+    let b = node("bob", fast()).await;
+    wire(&[&a, &b]);
+    let bconv = a.net.dm_open(b.net.me()).await.expect("dm_open");
+    let hi = dm_say(&a, bconv, "hi").await;
+    until("delivered", Duration::from_secs(5), || delivered(&b, &bconv, &hi.id)).await;
+    a.net.shutdown().await;
+    drop(a);
+    let backlog = 2020;
+    for i in 0..backlog {
+        let body = Body::Message { channel: EventId::default(), text: format!("while you were away {i}"), attachments: vec![] };
+        b.net.publish(bconv, body).await.expect("dm publish");
+    }
+    let a = start(a_id, a_store, "alice", fast()).await;
+    b.net.add_addr_hint(a.net.me(), hint(&a));
+    let bid = b.net.me();
+    until("the whole backlog arrived", Duration::from_secs(30), || a.net.conv_state(&bconv).is_some_and(|s| s.head(&bid) == backlog)).await;
+    for n in [a, b] {
+        n.net.shutdown().await;
+    }
+}

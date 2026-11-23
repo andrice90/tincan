@@ -316,6 +316,9 @@ pub(super) struct Ctx {
     pub last_ac: bool,
     persisted: HashMap<UserId, (AddrHint, u64)>,
     roster_sig: Option<(Vec<UserId>, Vec<UserId>)>,
+    /// New members a host may make me admit, over every host of this session (a malicious
+    /// host gets no fresh budget by reconnecting me).
+    pub host_admits: crate::limits::Bucket,
 }
 
 /// Reply channel of a `who_has` request.
@@ -386,6 +389,7 @@ pub(crate) fn spawn(net: &Arc<Inner>, server: ServerId, replica: ReplicaRef, mod
         last_ac: crate::power::ac_power(),
         persisted: HashMap::new(),
         roster_sig: None,
+        host_admits: member::host_admit_budget(),
     };
     let session = Session { ctx, role: Role::Offline { retry_at: Instant::now() } };
     net.tasks.spawn(session.run(mode, cmd_rx, link_rx, dial_rx));
@@ -1065,7 +1069,8 @@ impl Session {
         let media = self.ctx.net.media.member_started(&self.ctx.net, self.ctx.server, host, &link.conn, link.live(), epoch, start.short_id);
         let raw = if start.roster.online.len() <= tincan_core::wire::MAX_ROSTER { start.roster } else { Roster { epoch, host, ..Roster::default() } };
         let roster = self.ctx.sanitize_roster(raw.clone()).unwrap_or_else(|| Roster { epoch, host, ..Roster::default() });
-        let state = MemberState::new(link, start.claim, roster.clone(), raw, path, media);
+        let dropped = self.ctx.replica.lock().pending.dropped();
+        let state = MemberState::new(link, start.claim, roster.clone(), raw, path, media, dropped);
         self.role = Role::Member(Box::new(state));
         self.ctx.note_roster(&roster);
         self.ctx.tick_at = Some(Instant::now() + self.ctx.net.timings.tick);
@@ -1192,9 +1197,13 @@ impl Session {
                 }
             }
             Role::Member(m) => {
-                // Only after both syncs: the host's history (my own events it holds advance my
-                // seq legitimately) and mine to the host (so it never sees my gaps).
-                if !m.sync_out_done || !m.synced {
+                // Only after my sync to the host (so it never sees my gaps) and once I hold
+                // every event of mine it holds (they advance my seq legitimately): when its
+                // whole history sync is in, or earlier when the head it advertised for me
+                // after Welcome is no further than mine (a long sync does not hold my
+                // messages back until they time out).
+                let my_head = self.ctx.replica.lock().state.head(&self.ctx.me);
+                if !member::may_publish(m.sync_out_done, m.synced, m.host_my_head, my_head) {
                     return;
                 }
                 if self.ctx.pubs.inflight.is_none()

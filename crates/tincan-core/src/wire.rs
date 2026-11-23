@@ -506,20 +506,53 @@ pub fn sync_have_frames(heads: Heads) -> Vec<Ctl> {
 #[derive(Debug, Default)]
 pub struct HeadsAssembler {
     parts: Vec<(UserId, u64)>,
+    /// The sequence in progress went past `MAX_ENTRIES`: its remaining parts are discarded
+    /// up to and including the next `more == false`.
+    overflowed: bool,
+}
+
+/// What one `SyncHavePart` completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadsPart {
+    /// More parts follow.
+    Pending,
+    /// The last part of a sequence: the complete heads.
+    Done(Heads),
+    /// The last part of a sequence that went past `HeadsAssembler::MAX_ENTRIES`: nothing of
+    /// it is used (never a truncated `Heads`). The sender's heads are unknown; answer as if
+    /// it had everything I have, so its sync still ends.
+    Overflowed,
 }
 
 impl HeadsAssembler {
     /// Most entries collected; beyond that the assembly is dropped.
     pub const MAX_ENTRIES: usize = 65_536;
 
-    /// Add a part. Returns the complete heads once `more == false`.
+    /// Add a part. Returns the complete heads once `more == false`; None while parts are
+    /// pending and for a sequence that overflowed (see [`HeadsAssembler::push_part`]).
     pub fn push(&mut self, heads: Heads, more: bool) -> Option<Heads> {
-        if self.parts.len() + heads.0.len() > Self::MAX_ENTRIES {
-            self.parts.clear();
-            return None;
+        match self.push_part(heads, more) {
+            HeadsPart::Done(h) => Some(h),
+            HeadsPart::Pending | HeadsPart::Overflowed => None,
+        }
+    }
+
+    /// Add a part and say what it completed. A sequence that goes past `MAX_ENTRIES` is
+    /// discarded whole, up to and including its last part, which reports `Overflowed`.
+    pub fn push_part(&mut self, heads: Heads, more: bool) -> HeadsPart {
+        if !self.overflowed && self.parts.len() + heads.0.len() > Self::MAX_ENTRIES {
+            self.parts = Vec::new();
+            self.overflowed = true;
+        }
+        if self.overflowed {
+            if more {
+                return HeadsPart::Pending;
+            }
+            self.overflowed = false;
+            return HeadsPart::Overflowed;
         }
         self.parts.extend(heads.0);
-        if more { None } else { Some(Heads(std::mem::take(&mut self.parts))) }
+        if more { HeadsPart::Pending } else { HeadsPart::Done(Heads(std::mem::take(&mut self.parts))) }
     }
 }
 
@@ -793,6 +826,26 @@ mod tests {
         assert_eq!(out, Some(big));
         let small = Heads(vec![(UserId([1; 32]), 3)]);
         assert_eq!(sync_have_frames(small.clone()), vec![Ctl::SyncHave { heads: small }]);
+    }
+
+    #[test]
+    fn an_overflowed_heads_sequence_yields_nothing_of_it() {
+        let part = |n: usize, base: u8| Heads((0..n).map(|i| (UserId([base; 32]), i as u64)).collect());
+        let mut asm = HeadsAssembler::default();
+        let half = HeadsAssembler::MAX_ENTRIES / 2 + 1;
+        assert_eq!(asm.push_part(part(half, 1), true), HeadsPart::Pending);
+        // Past the bound: the whole sequence is dropped, its later parts too.
+        assert_eq!(asm.push_part(part(half, 2), true), HeadsPart::Pending);
+        assert_eq!(asm.push_part(part(10, 3), true), HeadsPart::Pending);
+        assert_eq!(asm.push(part(10, 4), false), None, "never a truncated Heads");
+        // The next sequence starts clean.
+        let small = part(3, 5);
+        assert_eq!(asm.push_part(small.clone(), true), HeadsPart::Pending);
+        assert_eq!(asm.push_part(Heads::default(), false), HeadsPart::Done(small));
+        // An overflow on the last part reports it.
+        assert_eq!(asm.push_part(part(half, 6), true), HeadsPart::Pending);
+        assert_eq!(asm.push_part(part(half, 7), false), HeadsPart::Overflowed);
+        assert_eq!(asm.push(part(2, 8), false), Some(part(2, 8)));
     }
 
     #[test]

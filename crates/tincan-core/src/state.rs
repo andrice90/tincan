@@ -855,6 +855,8 @@ pub struct PendingBuffer {
     limits: PendingLimits,
     per_author: HashMap<UserId, (usize, usize)>,
     non_members: HashSet<(UserId, u64)>,
+    /// Events dropped under the limits so far (refused on arrival or evicted).
+    dropped: u64,
 }
 
 /// Bounds of a [`PendingBuffer`]. The default keeps only the global caps; buffers fed from
@@ -953,6 +955,7 @@ impl PendingBuffer {
             let Some((_, oldest)) = self.order.pop_first() else { break };
             self.stamps.remove(&oldest);
             if self.remove_item(&oldest).is_some() {
+                self.dropped += 1;
                 tracing::debug!(author = %oldest.0.short(), seq = oldest.1, "pending buffer full: dropped oldest event");
             }
         }
@@ -1050,7 +1053,10 @@ impl PendingBuffer {
             Verdict::Gap | Verdict::Future => {
                 match self.admits(state, &ev, &verdict, now_ms) {
                     Some(non_member) => self.insert_as(ev, non_member),
-                    None => tracing::debug!(author = %ev.event.author.short(), seq = ev.event.seq, "pending limits: early event dropped"),
+                    None => {
+                        self.dropped += 1;
+                        tracing::debug!(author = %ev.event.author.short(), seq = ev.event.seq, "pending limits: early event dropped");
+                    }
                 }
                 (verdict, Vec::new())
             }
@@ -1067,6 +1073,9 @@ impl PendingBuffer {
     pub fn is_empty(&self) -> bool { self.items.is_empty() }
     /// Approximate bytes held.
     pub fn bytes(&self) -> usize { self.bytes }
+    /// Early events dropped under the limits so far (refused on arrival or evicted). A sync
+    /// receiver compares it before and after a sync: anything dropped must be asked for again.
+    pub fn dropped(&self) -> u64 { self.dropped }
     /// Drop everything.
     pub fn clear(&mut self) {
         self.items.clear();

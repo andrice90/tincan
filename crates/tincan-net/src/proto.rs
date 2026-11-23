@@ -15,8 +15,10 @@ use crate::session::SessionCmd;
 
 /// Time a dialer gets to open the control stream and send its first frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
-/// Connections from known peers (members of one of my servers, DM contacts) that may wait
-/// for their first frame at once (both ALPNs together). Unknown ids cannot take these.
+/// Connections from known peers (members of one of my servers, DM contacts I wrote to) that
+/// may wait for their first frame at once (both ALPNs together). Unknown ids cannot take
+/// these. When full, a waiter of the peer holding the most slots is dropped to make room
+/// (honest first frames arrive within a round trip, so only idle holders lose theirs).
 pub(crate) const MAX_PREAUTH: usize = 64;
 /// Connections from unknown ids (joiners, strangers) that may wait for their first frame at
 /// once. When full, the oldest unknown waiter is dropped to make room (identities cost
@@ -28,8 +30,8 @@ pub(crate) const MAX_PREAUTH_UNKNOWN: usize = 32;
 pub(crate) const MAX_PREAUTH_PER_PEER: usize = 8;
 
 /// Bounds connections that have not proven anything yet: known peers have their own
-/// `MAX_PREAUTH` slots, unknown ids share `MAX_PREAUTH_UNKNOWN` (oldest evicted first), and
-/// any one id holds at most `MAX_PREAUTH_PER_PEER`.
+/// `MAX_PREAUTH` slots, unknown ids share `MAX_PREAUTH_UNKNOWN`, any one id holds at most
+/// `MAX_PREAUTH_PER_PEER`, and a full pool makes room instead of refusing.
 #[derive(Debug, Default)]
 pub(crate) struct PreAuth {
     st: parking_lot::Mutex<GateState>,
@@ -37,11 +39,29 @@ pub(crate) struct PreAuth {
 
 #[derive(Debug, Default)]
 struct GateState {
-    known: usize,
+    /// Known waiters, oldest first: (slot id, peer, its eviction signal).
+    known: VecDeque<(u64, iroh::EndpointId, Arc<Notify>)>,
     /// Unknown waiters, oldest first: (slot id, its eviction signal).
     unknown: VecDeque<(u64, Arc<Notify>)>,
     peers: HashMap<iroh::EndpointId, usize>,
     next_id: u64,
+}
+
+impl GateState {
+    /// Make room in the full known pool: the oldest waiter of the peer holding the most
+    /// known slots (the oldest overall when nobody holds more than one) is told to give up.
+    fn evict_known(&mut self) {
+        let mut counts: HashMap<iroh::EndpointId, usize> = HashMap::new();
+        for (_, p, _) in &self.known {
+            *counts.entry(*p).or_default() += 1;
+        }
+        let most = counts.values().copied().max().unwrap_or(0);
+        if let Some(pos) = self.known.iter().position(|(_, p, _)| counts.get(p).copied() == Some(most))
+            && let Some((_, _, n)) = self.known.remove(pos)
+        {
+            n.notify_one();
+        }
+    }
 }
 
 /// A held pre-auth slot (released on drop).
@@ -49,8 +69,9 @@ pub(crate) struct PreAuthSlot<'a> {
     gate: &'a PreAuth,
     peer: iroh::EndpointId,
     id: u64,
-    /// Fires when an unknown waiter is evicted (None for known peers).
-    evicted: Option<Arc<Notify>>,
+    known: bool,
+    /// Fires when this waiter is evicted to make room.
+    evicted: Arc<Notify>,
 }
 
 impl Drop for PreAuthSlot<'_> {
@@ -62,18 +83,18 @@ impl Drop for PreAuthSlot<'_> {
                 st.peers.remove(&self.peer);
             }
         }
-        if self.evicted.is_some() {
-            st.unknown.retain(|(id, _)| *id != self.id);
+        if self.known {
+            st.known.retain(|(id, _, _)| *id != self.id);
         } else {
-            st.known = st.known.saturating_sub(1);
+            st.unknown.retain(|(id, _)| *id != self.id);
         }
     }
 }
 
 impl PreAuth {
     /// A slot for a connection from `peer` (`known`: a member of one of my servers or a DM
-    /// contact), or None when that pool is full (known) or this peer already has
-    /// `MAX_PREAUTH_PER_PEER` waiting.
+    /// contact), or None when this peer already has `MAX_PREAUTH_PER_PEER` waiting. A full
+    /// pool makes room by evicting a waiter.
     pub fn enter_peer(&self, peer: iroh::EndpointId, known: bool) -> Option<PreAuthSlot<'_>> {
         let mut st = self.st.lock();
         if st.peers.get(&peer).is_some_and(|n| *n >= MAX_PREAUTH_PER_PEER) {
@@ -81,24 +102,22 @@ impl PreAuth {
         }
         st.next_id += 1;
         let id = st.next_id;
-        let evicted = if known {
-            if st.known >= MAX_PREAUTH {
-                return None;
+        let n = Arc::new(Notify::new());
+        if known {
+            if st.known.len() >= MAX_PREAUTH {
+                st.evict_known();
             }
-            st.known += 1;
-            None
+            st.known.push_back((id, peer, n.clone()));
         } else {
             if st.unknown.len() >= MAX_PREAUTH_UNKNOWN
                 && let Some((_, oldest)) = st.unknown.pop_front()
             {
                 oldest.notify_one();
             }
-            let n = Arc::new(Notify::new());
             st.unknown.push_back((id, n.clone()));
-            Some(n)
-        };
+        }
         *st.peers.entry(peer).or_default() += 1;
-        Some(PreAuthSlot { gate: self, peer, id, evicted })
+        Some(PreAuthSlot { gate: self, peer, id, known, evicted: n })
     }
 }
 
@@ -108,8 +127,10 @@ mod tests {
 
     fn id() -> iroh::EndpointId { iroh::SecretKey::generate().public() }
 
-    #[test]
-    fn preauth_bounds_per_peer_and_overall() {
+    async fn told_to_give_up(s: &PreAuthSlot<'_>) -> bool { tokio::time::timeout(Duration::from_millis(1), s.evicted.notified()).await.is_ok() }
+
+    #[tokio::test]
+    async fn preauth_bounds_per_peer_and_overall() {
         let gate = PreAuth::default();
         let a = id();
         let held: Vec<_> = (0..MAX_PREAUTH_PER_PEER).map(|_| gate.enter_peer(a, true).expect("a slot")).collect();
@@ -117,13 +138,49 @@ mod tests {
         assert!(gate.enter_peer(a, false).is_none(), "in either pool");
         drop(held);
         assert!(gate.enter_peer(a, true).is_some(), "slots come back");
+        // A full known pool makes room instead of refusing (it used to refuse, which let a
+        // few known ids lock every member and contact out): at most MAX_PREAUTH wait.
         let mut many = Vec::new();
         for _ in 0..(MAX_PREAUTH * 2) {
-            if let Some(s) = gate.enter_peer(id(), true) {
-                many.push(s);
+            many.push(gate.enter_peer(id(), true).expect("a known peer always gets a slot"));
+        }
+        let mut evicted = 0;
+        for s in &many {
+            if told_to_give_up(s).await {
+                evicted += 1;
             }
         }
-        assert_eq!(many.len(), MAX_PREAUTH);
+        assert_eq!(evicted, MAX_PREAUTH, "the oldest waiters were told to give up");
+        assert_eq!(gate.st.lock().known.len(), MAX_PREAUTH);
+    }
+
+    /// NET-SECURITY-4: eight known ids holding eight slots each (the whole known pool) do not
+    /// lock out another member or contact: one of the flooders' slots is given up.
+    #[tokio::test]
+    async fn known_flooders_cannot_lock_out_known_peers() {
+        let gate = PreAuth::default();
+        let flooders: Vec<_> = (0..MAX_PREAUTH / MAX_PREAUTH_PER_PEER).map(|_| id()).collect();
+        let held: Vec<_> = flooders.iter().flat_map(|f| (0..MAX_PREAUTH_PER_PEER).map(|_| gate.enter_peer(*f, true).expect("a slot"))).collect();
+        assert_eq!(gate.st.lock().known.len(), MAX_PREAUTH);
+        let member = id();
+        let slot = gate.enter_peer(member, true).expect("a member still gets a slot");
+        assert!(!told_to_give_up(&slot).await);
+        let mut evicted = 0;
+        for s in &held {
+            if told_to_give_up(s).await {
+                assert!(flooders.contains(&s.peer));
+                evicted += 1;
+            }
+        }
+        assert_eq!(evicted, 1, "exactly one flooder slot made room");
+        // A second newcomer takes from a flooder that still holds the most, not the member.
+        let second = gate.enter_peer(id(), true).expect("another slot");
+        assert!(!told_to_give_up(&slot).await && !told_to_give_up(&second).await);
+        drop(held);
+        drop(slot);
+        drop(second);
+        let st = gate.st.lock();
+        assert!(st.known.is_empty() && st.peers.is_empty(), "everything released");
     }
 
     #[tokio::test]
@@ -134,8 +191,7 @@ mod tests {
         assert_eq!(flood.len(), MAX_PREAUTH_UNKNOWN * 3, "newcomers always get in (the oldest is evicted)");
         let mut evicted = 0;
         for s in &flood {
-            let n = s.evicted.clone().expect("unknown slot");
-            if tokio::time::timeout(Duration::from_millis(1), n.notified()).await.is_ok() {
+            if told_to_give_up(s).await {
                 evicted += 1;
             }
         }
@@ -147,7 +203,7 @@ mod tests {
         drop(flood);
         drop(known);
         let st = gate.st.lock();
-        assert!(st.unknown.is_empty() && st.known == 0 && st.peers.is_empty(), "everything released");
+        assert!(st.unknown.is_empty() && st.known.is_empty() && st.peers.is_empty(), "everything released");
     }
 }
 
@@ -164,14 +220,12 @@ async fn first_frame(conn: &Connection) -> Option<(iroh::endpoint::SendStream, F
 /// `first_frame` inside a pre-auth slot (None: refused, evicted, or nothing valid in time).
 async fn gated_first_frame(gate: &PreAuth, net: &Weak<Inner>, conn: &Connection) -> Option<(iroh::endpoint::SendStream, FrameReader, Ctl)> {
     let peer = crate::addr::remote_user(conn);
-    let known = net.upgrade().is_some_and(|n| n.is_known_peer(&peer));
+    let known = net.upgrade().is_some_and(|n| n.is_trusted_dialer(&peer));
     let slot = gate.enter_peer(conn.remote_id(), known)?;
-    match slot.evicted.clone() {
-        Some(evicted) => tokio::select! {
-            r = first_frame(conn) => r,
-            _ = evicted.notified() => None,
-        },
-        None => first_frame(conn).await,
+    let evicted = slot.evicted.clone();
+    tokio::select! {
+        r = first_frame(conn) => r,
+        _ = evicted.notified() => None,
     }
 }
 

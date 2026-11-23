@@ -27,6 +27,54 @@ use crate::media::MemberMedia;
 const ROSTER_MIN_GAP: Duration = Duration::from_millis(250);
 /// Longest refusal text from a host shown to the user.
 const MAX_REFUSAL_CHARS: usize = 200;
+/// New members a host may make me admit: 4096 in a row (a whole server's members in the
+/// first sync), then one per second. Over it, the admitting author's later events in the
+/// frame are held back and asked for again later (`HELD_RESYNC`).
+const HOST_ADMIT_BURST: u32 = 4096;
+const HOST_ADMIT_EVERY: Duration = Duration::from_secs(1);
+/// What was held back is asked for again after this.
+const HELD_RESYNC: Duration = Duration::from_secs(60);
+/// Extra history sync rounds when early events were dropped under the pending limits: the
+/// sync counts as complete only after a round that dropped nothing, or after this many.
+const MAX_SYNC_ROUNDS: u32 = 3;
+
+/// The member-side budget of new members (`HOST_ADMIT_BURST`).
+pub(super) fn host_admit_budget() -> crate::limits::Bucket { crate::limits::Bucket::every(HOST_ADMIT_EVERY, HOST_ADMIT_BURST, Instant::now()) }
+
+/// May a member publish now? After its sync to the host, and once it holds every event of
+/// its own the host holds: the host's history sync to it is complete, or the host's head
+/// for it (advertised right after Welcome) is no further than its own.
+pub(super) fn may_publish(sync_out_done: bool, synced: bool, host_my_head: Option<u64>, my_head: u64) -> bool {
+    sync_out_done && (synced || host_my_head.is_some_and(|h| h <= my_head))
+}
+
+/// Events from the host, cut to the member-side admission budget: an admission of a new
+/// member past the budget holds back its author's later events in the frame (the chain
+/// stays contiguous). True if anything was held back.
+fn budget_from_host(ctx: &mut super::Ctx, events: Vec<tincan_core::event::SignedEvent>) -> (Vec<tincan_core::event::SignedEvent>, bool) {
+    use std::collections::HashSet;
+    let now = Instant::now();
+    let r = ctx.replica.lock();
+    let mut cut: HashSet<UserId> = HashSet::new();
+    let mut out = Vec::with_capacity(events.len());
+    for s in events {
+        let Ok(ev) = s.decode() else {
+            out.push(s);
+            continue;
+        };
+        if cut.contains(&ev.author) {
+            continue;
+        }
+        let new_admit = ev.seq > r.state.head(&ev.author)
+            && matches!(&ev.body, tincan_core::event::Body::MemberAdmit { user, .. } if !r.state.is_member(user));
+        if new_admit && !ctx.host_admits.take(now) {
+            cut.insert(ev.author);
+            continue;
+        }
+        out.push(s);
+    }
+    (out, !cut.is_empty())
+}
 
 /// State while connected to a host.
 pub(crate) struct MemberState {
@@ -62,13 +110,22 @@ pub(crate) struct MemberState {
     last_attest: Instant,
     /// Path to the host.
     pub path: PathSnapshot,
+    /// The host's head for my own events, from the first heads it sent after Welcome.
+    pub host_my_head: Option<u64>,
+    /// `PendingBuffer::dropped` when the current history sync round started.
+    dropped_mark: u64,
+    /// Extra sync rounds asked for (see `MAX_SYNC_ROUNDS`).
+    sync_rounds: u32,
+    /// Events held back over the admission budget: ask the host for them again then.
+    resync_at: Option<Instant>,
     /// Media rides this link while the state lives (dropped with it).
     _media: MemberMedia,
 }
 
 impl MemberState {
     /// Fresh state after Welcome (`roster` already cut to members, `raw` as received).
-    pub fn new(link: Link, claim: SignedHostClaim, roster: Roster, raw: Roster, path: PathSnapshot, media: MemberMedia) -> Self {
+    /// `dropped`: the replica's `PendingBuffer::dropped` now.
+    pub fn new(link: Link, claim: SignedHostClaim, roster: Roster, raw: Roster, path: PathSnapshot, media: MemberMedia, dropped: u64) -> Self {
         Self {
             host: claim.claim.host,
             link,
@@ -87,6 +144,10 @@ impl MemberState {
             last_resync: None,
             last_attest: Instant::now(),
             path,
+            host_my_head: None,
+            dropped_mark: dropped,
+            sync_rounds: 0,
+            resync_at: None,
             _media: media,
         }
     }
@@ -170,9 +231,27 @@ fn on_frame(s: &mut Session, ctl: Ctl) -> Next {
         }
         Ctl::Events { events, more } => {
             let terminal = events.is_empty() && !more;
+            let (events, cut) = budget_from_host(&mut s.ctx, events);
             s.ctx.ingest_signed(events);
             let Role::Member(m) = &mut s.role else { return Next::Stay };
+            if cut && m.resync_at.is_none() {
+                m.resync_at = Some(Instant::now() + HELD_RESYNC);
+            }
             if terminal && !m.synced {
+                // Early events dropped under the pending limits during this round (an
+                // author's run waiting on a later author's event): they are missing from my
+                // heads, so ask again before calling the history complete.
+                let dropped = s.ctx.replica.lock().pending.dropped();
+                if dropped != m.dropped_mark && m.sync_rounds < MAX_SYNC_ROUNDS {
+                    m.sync_rounds += 1;
+                    m.dropped_mark = dropped;
+                    tracing::debug!(server = %s.ctx.server.short(), round = m.sync_rounds, "events dropped during the sync; asking again");
+                    let heads = s.ctx.heads();
+                    let Role::Member(m) = &s.role else { return Next::Stay };
+                    s.ctx.send_heads(&m.link, heads);
+                    s.pump_publishes();
+                    return Next::Stay;
+                }
                 m.synced = true;
                 let status = s.ctx.net.status_for(&s.ctx.server, true);
                 let _ = m.link.send(&Ctl::Status(status));
@@ -186,6 +265,9 @@ fn on_frame(s: &mut Session, ctl: Ctl) -> Next {
                     m.roster = clean.clone();
                     s.ctx.note_roster(&clean);
                 }
+                s.pump_publishes();
+            } else if !m.synced && m.host_my_head.is_some() {
+                // My own events from the host may have caught up with its head for me.
                 s.pump_publishes();
             }
             Next::Stay
@@ -255,6 +337,11 @@ fn on_frame(s: &mut Session, ctl: Ctl) -> Next {
 /// The host asked for what it lacks: one sync at a time, the latest request queued.
 fn host_sync_have(s: &mut Session, heads: Heads) {
     let Role::Member(m) = &mut s.role else { return };
+    if m.host_my_head.is_none() {
+        // The first heads after Welcome: how far the host holds my own events.
+        let me = s.ctx.me;
+        m.host_my_head = Some(heads.0.iter().find(|(u, _)| *u == me).map_or(0, |(_, seq)| *seq));
+    }
     if m.sync_running {
         m.sync_queued = Some(heads);
         return;
@@ -415,6 +502,14 @@ pub(super) fn on_timer(s: &mut Session, now: Instant) -> Next {
         take_roster(s, r);
     }
     let Role::Member(m) = &mut s.role else { return Next::Stay };
+    if m.resync_at.is_some_and(|at| at <= now) {
+        // Events held back over the admission budget: ask for them again.
+        m.resync_at = None;
+        let heads = s.ctx.heads();
+        let Role::Member(m) = &s.role else { return Next::Stay };
+        s.ctx.send_heads(&m.link, heads);
+    }
+    let Role::Member(m) = &mut s.role else { return Next::Stay };
     let Some(tick_at) = s.ctx.tick_at else { return Next::Stay };
     if tick_at > now {
         return Next::Stay;
@@ -465,5 +560,17 @@ mod tests {
         assert_eq!(refusal_text("\u{7}\u{8}"), "The host refused this.");
         assert!(matches!(refusal("\u{7}"), NetError::Rejected(_)), "no words of the host: my own sentence");
         assert!(matches!(refusal("busy"), NetError::RejectedByPeer(t) if t == "Busy."));
+    }
+
+    /// NET-SECURITY-7: a member publishes once its own sync to the host is done and it holds
+    /// every event of its own the host holds, without waiting for the host's whole history.
+    #[test]
+    fn publishing_waits_only_for_my_own_events() {
+        assert!(!may_publish(false, true, Some(0), 5), "my sync to the host comes first");
+        assert!(may_publish(true, true, None, 0), "the host's history is complete");
+        assert!(may_publish(true, false, Some(4), 4), "the host holds nothing of mine I lack");
+        assert!(may_publish(true, false, Some(0), 0), "a joiner with no events of its own");
+        assert!(!may_publish(true, false, Some(5), 4), "the host still has one of mine to send");
+        assert!(!may_publish(true, false, None, 4), "the host's heads did not arrive");
     }
 }
