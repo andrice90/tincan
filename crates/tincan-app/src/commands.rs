@@ -228,7 +228,7 @@ impl Core {
         if text.chars().count() > MAX_TEXT_CHARS {
             return Err(format!("Messages can be up to {MAX_TEXT_CHARS} characters."));
         }
-        let attachments = self.import_attachments(conv, paths).await?;
+        let attachments = self.import_attachments(conv, view.is_dm, paths).await?;
         if let Err(e) = tincan_core::state::validate_message(text, &attachments) {
             tracing::warn!(error = %e, "message failed validation");
             return Err("Couldn't send this message.".into());
@@ -290,7 +290,8 @@ impl Core {
         self.invalidate_view(&conv);
         let delivered = self.net.dm_delivered(&conv);
         self.dm_acked.lock().entry(conv).or_insert(delivered);
-        self.allowed.write().insert(peer);
+        // The peer may now connect for blobs, but only fetches what is shared with this DM.
+        self.access.write().add_dm(conv, peer);
         if matches!(self.storage.get_contact(&peer), Ok(None)) {
             let name = self.user_name(&peer);
             let rec = ContactRecord { user: peer, name, added_ms: now_ms() };

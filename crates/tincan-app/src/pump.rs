@@ -118,7 +118,11 @@ pub(crate) async fn run(
             }
             ev = file_rx.recv(), if files_open => match ev {
                 Ok(e) => p.on_file(e),
-                Err(broadcast::error::RecvError::Lagged(n)) => tracing::debug!(missed = n, "file events lagged"),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // Completions and final states may be among the lost events: re-read them.
+                    tracing::warn!(missed = n, "file events lagged; re-reading transfers");
+                    p.core.on_files_lagged();
+                }
                 Err(broadcast::error::RecvError::Closed) => files_open = false,
             },
             _ = sleep_until(deadline), if deadline.is_some() => p.on_timer(),
@@ -312,8 +316,10 @@ impl Pump {
             NetEvent::Error { message, .. } => core.toast(ToastKind::Error, message),
             NetEvent::DmLinkUp { peer } => {
                 self.mark(ConvId::dm(&core.me, &peer), Refresh { dm: true, ..Refresh::default() });
-                // A DM-only profile has no server that connects: resume downloads here too.
+                // A DM-only profile has no server that connects: resume downloads here too,
+                // and retry parked DM attachments now that the contact is reachable.
                 core.resume_downloads();
+                self.rosters_changed = true;
             }
             NetEvent::DmLinkDown { peer } => {
                 self.mark(ConvId::dm(&core.me, &peer), Refresh { dm: true, ..Refresh::default() });
@@ -325,13 +331,13 @@ impl Pump {
 
     fn on_file(&mut self, ev: FileEvent) {
         let core = self.core.clone();
+        if core.test_files_paused.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         match &ev {
             FileEvent::Transfer(info) => core.on_transfer(info),
-            FileEvent::Completed { hash, kind } => {
-                if *kind == tincan_files::BlobKind::Attachment {
-                    core.net.have_add(*hash);
-                }
-            }
+            // Share by nomination and re-announce (only what is shared with a server).
+            FileEvent::Completed { hash, from, .. } => core.on_completed(*hash, *from),
         }
         core.media.on_file_event(&core, &ev);
     }

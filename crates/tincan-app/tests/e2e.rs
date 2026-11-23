@@ -470,12 +470,209 @@ async fn attachment_outlives_its_uploader() {
     s["downloadDir"] = json!(downloads.to_string_lossy());
     call(&c.app, "settings_set", json!({ "settings": s })).await;
     call(&c.app, "open_file", json!({ "hash": hash, "name": "data.bin" })).await;
+    let zone = PathBuf::from(format!("{}:Zone.Identifier", downloads.join("data.bin").display()));
+    assert!(std::fs::read_to_string(&zone).unwrap().contains("ZoneId=3"), "the export carries the Mark of the Web");
+    std::fs::remove_file(&zone).unwrap();
     call(&c.app, "open_file", json!({ "hash": hash, "name": "data.bin" })).await;
     assert_eq!(std::fs::read(downloads.join("data.bin")).unwrap(), bytes);
     assert!(!downloads.join("data (1).bin").exists(), "a second open reuses the export");
+    assert!(std::fs::read_to_string(&zone).unwrap().contains("ZoneId=3"), "reusing an export marks it again");
 
     b.app.shutdown().await;
     c.app.shutdown().await;
+}
+
+/// Wait until `app` holds `hash`.
+async fn until_complete(app: &App, hash: &str, what: &str) {
+    eventually(what, 30, || async { (call(app, "transfer", json!({ "hash": hash })).await["state"] == "complete").then_some(()) }).await;
+}
+
+/// Send one file into `conv` from `app`; returns its hash.
+async fn send_file(app: &App, conv: &str, channel: Option<&str>, path: &Path) -> String {
+    let sent = call(app, "send_message", json!({ "convId": conv, "channelId": channel, "text": "", "attachments": [path.to_string_lossy()] })).await;
+    sent["attachments"][0]["hash"].as_str().unwrap().to_string()
+}
+
+/// (c2) Blobs are served per conversation. A member of a server cannot fetch a file that
+/// two other people exchanged in a DM, and a stranger who DMs me cannot fetch my server
+/// files, even after posting a message that references the hash (hashes are not secret).
+/// Each refusal has a positive control on the same connection. Also: an attachment that
+/// declares more than 25 MB is never fetched, and peer file names are cleaned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blobs_are_served_only_where_they_are_shared() {
+    let _g = serial().await;
+    let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let files = tempfile::tempdir().unwrap();
+    let mut a = node(dirs[0].path(), "Alice").await;
+    let b = node(dirs[1].path(), "Bob").await;
+    let c = node(dirs[2].path(), "Carol").await;
+    let x = node(dirs[3].path(), "Xavier").await;
+    // Carol fetches only on purpose, so the positive control below is a real download.
+    let mut s = call(&c.app, "app_snapshot", json!({})).await["settings"].clone();
+    s["autoFetchLimit"] = json!(0);
+    call(&c.app, "settings_set", json!({ "settings": s })).await;
+
+    let server = server_id(&call(&a.app, "create_server", json!({ "name": "Shared" })).await);
+    let invite = call(&a.app, "create_invite", json!({ "serverId": server })).await;
+    call(&b.app, "join_server", json!({ "invite": invite })).await;
+    call(&c.app, "join_server", json!({ "invite": invite })).await;
+    all_online(&[&a, &b, &c], &server).await;
+    let general = text_channel(&a.app, &server).await;
+
+    let server_file = files.path().join("server.bin");
+    std::fs::write(&server_file, data(200_000, 21)).unwrap();
+    let server_hash = send_file(&a.app, &server, Some(&general), &server_file).await;
+    until_complete(&b.app, &server_hash, "Bob fetches the server file").await;
+
+    // Alice and Bob exchange a file in a DM.
+    a.app.test_add_addr(&b.user, &b.app.test_addrs()).unwrap();
+    b.app.test_add_addr(&a.user, &a.app.test_addrs()).unwrap();
+    let ab = call(&a.app, "open_dm", json!({ "userId": b.user })).await["convId"].as_str().unwrap().to_string();
+    let dm_file = files.path().join("private.bin");
+    std::fs::write(&dm_file, data(150_000, 22)).unwrap();
+    let dm_hash = send_file(&a.app, &ab, None, &dm_file).await;
+    until_complete(&b.app, &dm_hash, "Bob fetches the DM file").await;
+
+    // Carol, a member of the server, asks Bob for the DM file directly: refused.
+    let bob_addrs = b.app.test_addrs();
+    assert!(!c.app.test_fetch_from(&dm_hash, &b.user, &bob_addrs, 15).await, "a server member fetched a DM-only file");
+    // Referencing the hash in the server first does not open it up.
+    c.app.test_post_attachment_ref(&server, Some(&general), &dm_hash, "private.bin", 150_000).await.unwrap();
+    eventually("Bob indexed Carol's reference", 20, || async {
+        let page = call(&b.app, "messages", json!({ "convId": server, "channelId": general, "before": null, "limit": 20 })).await;
+        page["messages"].as_array().unwrap().iter().any(|m| m["attachments"][0]["hash"] == dm_hash.as_str()).then_some(())
+    })
+    .await;
+    assert!(!c.app.test_fetch_from(&dm_hash, &b.user, &bob_addrs, 15).await, "a reference in the server shared a DM-only file");
+    // Control: the server file, which Bob got from its author in the server, is served.
+    assert!(c.app.test_fetch_from(&server_hash, &b.user, &bob_addrs, 20).await, "Carol could not fetch the server file from Bob");
+
+    // A stranger DMs Alice, then asks her for the server file: refused.
+    x.app.test_add_addr(&a.user, &a.app.test_addrs()).unwrap();
+    a.app.test_add_addr(&x.user, &x.app.test_addrs()).unwrap();
+    let a_code = call(&a.app, "app_snapshot", json!({})).await["me"]["userCode"].as_str().unwrap().to_string();
+    let xa = call(&x.app, "add_contact", json!({ "code": a_code })).await["convId"].as_str().unwrap().to_string();
+    call(&x.app, "send_message", json!({ "convId": xa, "channelId": null, "text": "hello", "attachments": [] })).await;
+    wait_for(&mut a.rx, "message-added", 20, |m| m["text"] == "hello" && m["convId"] == xa.as_str()).await;
+    let alice_addrs = a.app.test_addrs();
+    assert!(!x.app.test_fetch_from(&server_hash, &a.user, &alice_addrs, 15).await, "a stranger fetched a server file");
+    x.app.test_post_attachment_ref(&xa, None, &server_hash, "server.bin", 200_000).await.unwrap();
+    eventually("Alice indexed the stranger's reference", 20, || async {
+        let page = call(&a.app, "messages", json!({ "convId": xa, "channelId": null, "before": null, "limit": 20 })).await;
+        page["messages"].as_array().unwrap().iter().any(|m| m["attachments"][0]["hash"] == server_hash.as_str()).then_some(())
+    })
+    .await;
+    assert!(!x.app.test_fetch_from(&server_hash, &a.user, &alice_addrs, 15).await, "a DM reference shared a server file");
+    // Control: a file Alice sends the stranger in their DM arrives.
+    let for_x = files.path().join("for-x.bin");
+    std::fs::write(&for_x, data(50_000, 23)).unwrap();
+    let x_hash = send_file(&a.app, &xa, None, &for_x).await;
+    until_complete(&x.app, &x_hash, "the stranger fetches what Alice sent him").await;
+
+    // An attachment that declares more than 25 MB is not fetched, automatically or on demand.
+    let big = "ab".repeat(32);
+    b.app.test_post_attachment_ref(&server, Some(&general), &big, "photo\u{202E}gnp.exe", 30 * 1024 * 1024).await.unwrap();
+    let shown = wait_for(&mut a.rx, "message-added", 20, |m| m["attachments"][0]["hash"] == big.as_str()).await;
+    assert_eq!(shown["attachments"][0]["name"], "photognp.exe", "hidden format characters are removed from file names");
+    assert_eq!(shown["attachments"][0]["mime"], "application/octet-stream", "the type follows the cleaned name");
+    assert_eq!(call(&a.app, "transfer", json!({ "hash": big })).await["state"], "idle", "not auto-fetched");
+    assert_eq!(call_err(&a.app, "download", json!({ "hash": big })).await, "This file is larger than 25 MB, so Tincan won't download it.");
+
+    for n in [&a, &b, &c, &x] {
+        n.app.shutdown().await;
+    }
+}
+
+/// (c3) The hash index keeps every conversation that references a hash, not only the first
+/// one seen. A stranger names a hash in a DM first and never serves it, so the download
+/// parks; when the real sender posts the file in a server, the parked download asks there
+/// and completes without a click.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_reference_wakes_a_parked_download() {
+    let _g = serial().await;
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let files = tempfile::tempdir().unwrap();
+    let a = node(dirs[0].path(), "Alice").await;
+    let mut b = node(dirs[1].path(), "Bob").await;
+    let x = node(dirs[2].path(), "Xavier").await;
+
+    let server = server_id(&call(&a.app, "create_server", json!({ "name": "Shared" })).await);
+    let invite = call(&a.app, "create_invite", json!({ "serverId": server })).await;
+    call(&b.app, "join_server", json!({ "invite": invite })).await;
+    all_online(&[&a, &b], &server).await;
+    let general = text_channel(&a.app, &server).await;
+    // Alice first posts the file in a server of her own (Bob is not in it), which gives the
+    // test its hash.
+    let notes = server_id(&call(&a.app, "create_server", json!({ "name": "Notes" })).await);
+    let notes_channel = text_channel(&a.app, &notes).await;
+    let path = files.path().join("report.bin");
+    std::fs::write(&path, data(120_000, 31)).unwrap();
+    let hash = send_file(&a.app, &notes, Some(&notes_channel), &path).await;
+
+    // Xavier DMs Bob and names the hash first, without holding it.
+    x.app.test_add_addr(&b.user, &b.app.test_addrs()).unwrap();
+    b.app.test_add_addr(&x.user, &x.app.test_addrs()).unwrap();
+    let b_code = call(&b.app, "app_snapshot", json!({})).await["me"]["userCode"].as_str().unwrap().to_string();
+    let xb = call(&x.app, "add_contact", json!({ "code": b_code })).await["convId"].as_str().unwrap().to_string();
+    call(&x.app, "send_message", json!({ "convId": xb, "channelId": null, "text": "hi", "attachments": [] })).await;
+    wait_for(&mut b.rx, "message-added", 20, |m| m["text"] == "hi" && m["convId"] == xb.as_str()).await;
+    x.app.test_post_attachment_ref(&xb, None, &hash, "report.bin", 120_000).await.unwrap();
+    eventually("Bob's auto-fetch parks", 30, || async {
+        (call(&b.app, "transfer", json!({ "hash": hash })).await["state"] == "unavailable").then_some(())
+    })
+    .await;
+
+    // Alice posts the real file where Bob can see it. Nothing else changes (no roster
+    // update), and nobody clicks Download.
+    assert_eq!(send_file(&a.app, &server, Some(&general), &path).await, hash);
+    eventually("Bob's parked download completes", 15, || async {
+        (call(&b.app, "transfer", json!({ "hash": hash })).await["state"] == "complete").then_some(())
+    })
+    .await;
+
+    for n in [&a, &b, &x] {
+        n.app.shutdown().await;
+    }
+}
+
+/// (c4) File events lost to a lagging receiver are recovered: a download that completed
+/// unseen is still shared with its server (another member can fetch it from me), and the
+/// UI hears that it is complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_file_events_are_recovered() {
+    let _g = serial().await;
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let files = tempfile::tempdir().unwrap();
+    let a = node(dirs[0].path(), "Alice").await;
+    let mut b = node(dirs[1].path(), "Bob").await;
+    let c = node(dirs[2].path(), "Carol").await;
+    let mut s = call(&c.app, "app_snapshot", json!({})).await["settings"].clone();
+    s["autoFetchLimit"] = json!(0);
+    call(&c.app, "settings_set", json!({ "settings": s })).await;
+
+    let server = server_id(&call(&a.app, "create_server", json!({ "name": "Shared" })).await);
+    let invite = call(&a.app, "create_invite", json!({ "serverId": server })).await;
+    call(&b.app, "join_server", json!({ "invite": invite })).await;
+    call(&c.app, "join_server", json!({ "invite": invite })).await;
+    all_online(&[&a, &b, &c], &server).await;
+    let general = text_channel(&a.app, &server).await;
+
+    b.app.test_pause_file_events(true);
+    let path = files.path().join("lag.bin");
+    std::fs::write(&path, data(180_000, 41)).unwrap();
+    let hash = send_file(&a.app, &server, Some(&general), &path).await;
+    // Bob's store completes the auto-fetch; his app sees none of its events.
+    until_complete(&b.app, &hash, "Bob's store holds the file").await;
+    let bob_addrs = b.app.test_addrs();
+    assert!(!c.app.test_fetch_from(&hash, &b.user, &bob_addrs, 10).await, "shared although the completion was never seen");
+
+    b.app.test_pause_file_events(false);
+    wait_for(&mut b.rx, "transfer-updated", 10, |t| t["hash"] == hash.as_str() && t["state"] == "complete").await;
+    assert!(c.app.test_fetch_from(&hash, &b.user, &bob_addrs, 20).await, "the recovered share lets Carol fetch it from Bob");
+
+    for n in [&a, &b, &c] {
+        n.app.shutdown().await;
+    }
 }
 
 /// (d) DMs: add by user code, delivery both ways, and an offline recipient gets the

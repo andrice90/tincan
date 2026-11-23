@@ -62,8 +62,9 @@ pub(crate) const COMMANDS: &[&str] = &[
     "mic_test",
 ];
 
-/// Largest soundboard clip file (architecture.md: 5 MB; the UI's MB is 1024²).
-pub(crate) const MAX_CLIP_BYTES: u64 = 5 * 1024 * 1024;
+/// Largest soundboard clip file (architecture.md: 5 MB; the UI's MB is 1024²). tincan-files
+/// enforces the same cap on clip downloads.
+pub(crate) const MAX_CLIP_BYTES: u64 = tincan_files::MAX_CLIP_BYTES;
 /// Longest soundboard clip (decoded length).
 pub(crate) const MAX_CLIP_MS: u32 = 20_000;
 /// Longest clip name (the UI's `CLIP_NAME_MAX`).
@@ -402,9 +403,23 @@ impl Media {
         }
         match ev {
             FileEvent::Transfer(info) if info.kind == tincan_files::BlobKind::Clip => self.on_clip_transfer(core, info),
-            FileEvent::Completed { hash, kind: tincan_files::BlobKind::Clip } => self.on_clip_completed(core, *hash),
+            FileEvent::Completed { hash, kind: tincan_files::BlobKind::Clip, .. } => self.on_clip_completed(core, *hash),
             _ => {}
         }
+    }
+
+    /// The file event stream lagged: a pull may have completed unseen. Finish every pending
+    /// pull whose blob is complete now, and refresh the clip list.
+    pub(crate) fn on_files_lagged(&self, core: &Arc<Core>) {
+        if self.is_closed() {
+            return;
+        }
+        let done: Vec<BlobHash> = self.st.lock().fetching.keys().copied().filter(|h| core.files.is_complete(h)).collect();
+        for hash in done {
+            self.on_clip_completed(core, hash);
+        }
+        let st = self.st.lock();
+        self.emit_clips_locked(core, &st);
     }
 
     /// Settings changed: apply devices, volumes and audio processing to the engine live.

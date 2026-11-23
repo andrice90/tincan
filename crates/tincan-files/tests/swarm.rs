@@ -381,7 +381,10 @@ async fn export_round_trip_is_byte_equal() -> Result<()> {
     b.files.download(imported.hash, BlobKind::Clip, vec![]);
     let completed_as_clip = loop {
         match tokio::time::timeout(Duration::from_secs(10), rb.recv()).await? {
-            Ok(FileEvent::Completed { hash, kind: BlobKind::Clip }) if hash == imported.hash => break true,
+            Ok(FileEvent::Completed { hash, kind: BlobKind::Clip, from }) if hash == imported.hash => {
+                assert_eq!(from, None, "already complete locally: no provider delivered it");
+                break true;
+            }
             Ok(_) | Err(RecvError::Lagged(_)) => continue,
             Err(RecvError::Closed) => break false,
         }
@@ -422,8 +425,10 @@ async fn events_report_progress_then_complete() -> Result<()> {
         let left = deadline.checked_duration_since(Instant::now()).context("timed out")?;
         match tokio::time::timeout(left, rx.recv()).await? {
             Ok(FileEvent::Transfer(info)) if info.hash == hash => transfers.push(info),
-            Ok(FileEvent::Completed { hash: h, kind }) if h == hash => {
+            Ok(FileEvent::Completed { hash: h, kind, from }) if h == hash => {
                 assert_eq!(kind, BlobKind::Attachment);
+                assert_eq!(from, Some(a.user), "the provider that served it is reported");
+                assert_eq!(b.files.provided_by(&hash), Some(a.user));
                 completed = true;
             }
             Ok(_) | Err(RecvError::Lagged(_)) => {}
@@ -487,5 +492,179 @@ async fn upload_limit_slows_transfer() -> Result<()> {
     for n in [&a, &b, &c] {
         n.shutdown().await?;
     }
+    Ok(())
+}
+
+/// Allows one peer to connect, and to fetch only the listed hashes.
+struct PerBlob {
+    peer: UserId,
+    hashes: parking_lot::Mutex<Vec<BlobHash>>,
+}
+
+impl AccessPolicy for PerBlob {
+    fn allow(&self, peer: &UserId) -> bool {
+        *peer == self.peer
+    }
+    fn allow_blob(&self, peer: &UserId, hash: &BlobHash) -> bool {
+        *peer == self.peer && self.hashes.lock().contains(hash)
+    }
+}
+
+/// Dials `target` with the blobs ALPN from `from`'s endpoint.
+async fn dial(from: &Node, target: &Node) -> Result<iroh::endpoint::Connection> {
+    let ip = *target.hint.direct.first().context("no direct addr")?;
+    let id = iroh::EndpointId::from_bytes(target.user.as_bytes())?;
+    let addr = iroh::EndpointAddr::from_parts(id, [iroh::TransportAddr::Ip(ip)]);
+    Ok(from.endpoint.connect(addr, tincan_files::ALPN).await?)
+}
+
+/// (8) A peer allowed to connect gets only the blobs the policy allows it per hash, and
+/// cannot even observe the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_blob_policy_serves_only_allowed_hashes() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let b_key = SecretKey::generate();
+    let b_user = UserId::from_bytes(*b_key.public().as_bytes());
+    let policy = Arc::new(PerBlob { peer: b_user, hashes: parking_lot::Mutex::new(Vec::new()) });
+    let a = Node::spawn(&tmp.path().join("a"), SecretKey::generate(), policy.clone()).await?;
+    let b = Node::spawn(&tmp.path().join("b"), b_key, allow_all()).await?;
+
+    let shared = a.files.import_bytes(Bytes::from(content(300 * KIB, 9)), BlobKind::Attachment).await?.hash;
+    let private = a.files.import_bytes(Bytes::from(content(200 * KIB, 10)), BlobKind::Attachment).await?.hash;
+    policy.hashes.lock().push(shared);
+
+    let mut rb = b.files.subscribe();
+    b.files.download(private, BlobKind::Attachment, vec![a.provider()]);
+    wait_state(&mut rb, private, TransferState::Unavailable, 20).await?;
+    assert_eq!(b.files.status(private).await?.have, 0, "nothing of the private blob leaked");
+    assert_eq!(a.files.uploaded_bytes(), 0);
+    assert!(observe(&b, &a, private).await.is_err(), "possession of a denied hash cannot be probed");
+
+    b.files.download(shared, BlobKind::Attachment, vec![a.provider()]);
+    wait_complete(&mut rb, shared, 20).await?;
+    assert_eq!(a.files.uploaded_bytes(), 300 * KIB, "only the allowed blob was served");
+    let (complete, have, _) = observe(&b, &a, shared).await?;
+    assert!(complete && have == 300 * KIB);
+
+    // Allowing the second hash later lets the parked request finish.
+    policy.hashes.lock().push(private);
+    b.files.add_providers(private, vec![a.provider()]);
+    wait_complete(&mut rb, private, 20).await?;
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// (9) A get with child ranges would make the provider read an allowed blob as a hash
+/// sequence and send the blobs it lists. Such requests are refused outright; a plain get of
+/// the same root still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hash_sequence_requests_are_refused() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let b_key = SecretKey::generate();
+    let b_user = UserId::from_bytes(*b_key.public().as_bytes());
+    let policy = Arc::new(PerBlob { peer: b_user, hashes: parking_lot::Mutex::new(Vec::new()) });
+    let a = Node::spawn(&tmp.path().join("a"), SecretKey::generate(), policy.clone()).await?;
+    let b = Node::spawn(&tmp.path().join("b"), b_key, allow_all()).await?;
+
+    let secret = a.files.import_bytes(Bytes::from(content(64 * KIB, 11)), BlobKind::Attachment).await?.hash;
+    // A blob whose bytes are the secret's hash: a valid one-entry hash sequence.
+    let list = a.files.import_bytes(Bytes::copy_from_slice(secret.as_bytes()), BlobKind::Attachment).await?.hash;
+    policy.hashes.lock().push(list);
+
+    let client = iroh_blobs::store::mem::MemStore::new();
+    let root = iroh_blobs::Hash::from_bytes(*list.as_bytes());
+    let res = client.remote().execute_get(dial(&b, &a).await?, iroh_blobs::protocol::GetRequest::all(root)).complete().await;
+    assert!(res.is_err(), "a hash sequence request is refused: {res:?}");
+    assert!(!client.blobs().has(iroh_blobs::Hash::from_bytes(*secret.as_bytes())).await?, "the listed blob was not sent");
+    let res = client.remote().execute_get(dial(&b, &a).await?, iroh_blobs::protocol::GetRequest::blob(root)).complete().await;
+    assert!(res.is_ok(), "the root alone is allowed: {res:?}");
+    assert!(client.blobs().has(root).await?);
+    assert!(!client.blobs().has(iroh_blobs::Hash::from_bytes(*secret.as_bytes())).await?);
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// (10) Size caps per kind: a clip over 5 MiB and an attachment over 25 MiB are refused as
+/// soon as the size is known, their tags are dropped (no resume), and asking again does
+/// not refetch. The same bytes are fine as a kind whose cap allows them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_downloads_are_refused() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let a = Node::fresh(tmp.path(), "a").await?;
+    let b = Node::fresh(tmp.path(), "b").await?;
+    let mut rb = b.files.subscribe();
+
+    // Over the clip cap, under the attachment cap.
+    let size = tincan_files::MAX_CLIP_BYTES + 1;
+    let hash = a.files.import_bytes(Bytes::from(content(size, 12)), BlobKind::Attachment).await?.hash;
+    b.files.download(hash, BlobKind::Clip, vec![a.provider()]);
+    let refused = wait_state(&mut rb, hash, TransferState::TooLarge, 20).await?;
+    assert_eq!(refused.total, Some(size));
+    assert!(!b.files.status(hash).await?.complete);
+    assert!(!b.files.partial_downloads().await?.iter().any(|(h, _)| *h == hash), "a refused download is never resumed");
+    assert_eq!(b.files.transfer(hash).map(|t| t.state), Some(TransferState::TooLarge));
+    let sent = a.files.uploaded_bytes();
+    b.files.download(hash, BlobKind::Clip, vec![a.provider()]);
+    let again = next_transfer(&mut rb, hash, Instant::now() + Duration::from_secs(5)).await?;
+    assert_eq!(again.state, TransferState::TooLarge, "asking again repeats the refusal");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a.files.uploaded_bytes(), sent, "and fetches nothing");
+
+    // The same bytes as an attachment are within its cap.
+    b.files.download(hash, BlobKind::Attachment, vec![a.provider()]);
+    wait_complete(&mut rb, hash, 30).await?;
+    // Held as an attachment, still too large to become a clip.
+    b.files.download(hash, BlobKind::Clip, vec![]);
+    let held = next_transfer(&mut rb, hash, Instant::now() + Duration::from_secs(5)).await?;
+    assert_eq!(held.state, TransferState::TooLarge);
+    assert!(b.files.complete_hashes().contains(&hash), "the attachment stays held");
+
+    // Over the attachment cap.
+    let big = tincan_files::MAX_ATTACHMENT_BYTES + 1;
+    let big_hash = a.files.import_bytes(Bytes::from(vec![7u8; big as usize]), BlobKind::Attachment).await?.hash;
+    b.files.download(big_hash, BlobKind::Attachment, vec![a.provider()]);
+    let refused = wait_state(&mut rb, big_hash, TransferState::TooLarge, 30).await?;
+    assert_eq!(refused.total, Some(big));
+    let st = b.files.status(big_hash).await?;
+    assert!(!st.complete && st.have < big, "stopped before the end: {st:?}");
+    assert!(!b.files.partial_downloads().await?.iter().any(|(h, _)| *h == big_hash));
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// (11) A request that started as a clip and merged an attachment request keeps going as
+/// an attachment when the blob turns out too large for a clip, and its partial data stays
+/// tagged as an attachment (the clip tag is gone), so garbage collection keeps it and a
+/// restart resumes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_kind_leaves_the_partial_data_tagged() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let a = Node::fresh(tmp.path(), "a").await?;
+    let b = Node::fresh(tmp.path(), "b").await?;
+    let size = tincan_files::MAX_CLIP_BYTES + MIB;
+    let hash = a.files.import_bytes(Bytes::from(content(size, 13)), BlobKind::Attachment).await?.hash;
+    a.files.set_upload_limit(Some(MIB));
+
+    let mut rb = b.files.subscribe();
+    b.files.download(hash, BlobKind::Clip, vec![a.provider()]);
+    b.files.download(hash, BlobKind::Attachment, vec![a.provider()]);
+    wait_have(&mut rb, hash, 256 * KIB, 20).await?;
+    let t = b.files.transfer(hash).context("in progress")?;
+    assert_eq!(t.state, TransferState::Downloading, "{t:?}");
+    assert_eq!(t.kind, BlobKind::Attachment, "only the attachment kind is left");
+    b.files.cancel(hash);
+
+    let partial = b.files.partial_downloads().await?;
+    assert!(partial.contains(&(hash, BlobKind::Attachment)), "the partial data is tagged as an attachment: {partial:?}");
+    assert!(!partial.contains(&(hash, BlobKind::Clip)), "the clip tag was dropped: {partial:?}");
+
+    a.shutdown().await?;
+    b.shutdown().await?;
     Ok(())
 }

@@ -14,9 +14,10 @@ use tincan_core::state::ConvState;
 use tincan_core::{ChannelId, ConvId, UserId};
 use tincan_net::{ConnState, PathKind as NetPath};
 
-use crate::app::{AttRef, Core};
+use crate::app::Core;
 use crate::dto;
 use crate::emit::Ev;
+use crate::shell::{self, clean_text};
 
 /// One channel of a server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +58,8 @@ pub(crate) struct ConvView {
 }
 
 impl ConvView {
-    /// Build from a state snapshot.
+    /// Build from a state snapshot. Names stay as published (commands compare against
+    /// them); every DTO shows them through [`display`], since they are peer-supplied.
     pub fn from_state(st: &ConvState, me: &UserId) -> Self {
         let info = |c: &tincan_core::state::Channel| ChannelInfo {
             id: c.id,
@@ -81,6 +83,11 @@ impl ConvView {
         }
     }
 
+    /// The name of `user` here for display (cleaned), if it has a visible one.
+    pub fn display_name(&self, user: &UserId) -> Option<String> {
+        self.known_name(user).map(clean_text).filter(|n| !n.is_empty())
+    }
+
     /// The name of `user` here, if known.
     pub fn known_name(&self, user: &UserId) -> Option<&str> { self.names.get(user).map(String::as_str) }
 
@@ -90,6 +97,20 @@ impl ConvView {
 
 /// First 8 characters of the z32 id: the fallback display name.
 pub(crate) fn short_name(user: &UserId) -> String { user.to_z32().chars().take(8).collect() }
+
+/// `s`, or `fallback` when cleaning left nothing.
+fn or_fallback(s: String, fallback: &str) -> String { if s.is_empty() { fallback.to_string() } else { s } }
+
+/// A peer-supplied server, channel or file name for a DTO: control and hidden format
+/// characters removed (`fallback` if nothing is left).
+pub(crate) fn display(name: &str, fallback: &str) -> String { or_fallback(clean_text(name), fallback) }
+
+/// A peer-supplied attachment name for a DTO: like [`display`], and runs of whitespace
+/// (no-break spaces included) fold to one space, as in the exported name, so padding
+/// cannot push the real extension out of sight.
+pub(crate) fn file_display(name: &str) -> String {
+    or_fallback(shell::clean_line(name, tincan_core::state::MAX_ATTACHMENT_NAME_CHARS), "file")
+}
 
 /// Which DTOs of a conversation to recompute.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -185,11 +206,11 @@ impl Core {
             return n;
         }
         let views: Vec<Arc<ConvView>> = self.views.lock().values().cloned().collect();
-        if let Some(n) = views.iter().filter(|v| !v.is_dm).find_map(|v| v.known_name(user).map(str::to_string)) {
+        if let Some(n) = views.iter().filter(|v| !v.is_dm).find_map(|v| v.display_name(user)) {
             return n;
         }
-        match self.storage.get_contact(user) {
-            Ok(Some(c)) if !c.name.is_empty() => c.name,
+        match self.storage.get_contact(user).map(|c| c.map(|c| clean_text(&c.name))) {
+            Ok(Some(name)) if !name.is_empty() => name,
             _ => short_name(user),
         }
     }
@@ -199,10 +220,7 @@ impl Core {
         if view.is_dm {
             return self.user_name(user);
         }
-        match view.known_name(user) {
-            Some(n) => n.to_string(),
-            None => short_name(user),
-        }
+        view.display_name(user).unwrap_or_else(|| short_name(user))
     }
 
     // ------------------------------------------------------------------ DTOs
@@ -239,7 +257,7 @@ impl Core {
         let unread = view.channels.iter().any(|c| self.channel_unread(conv, c));
         Some(dto::ServerSummary {
             id: conv.to_hex(),
-            name: view.name.clone(),
+            name: display(&view.name, "Unnamed server"),
             owner_id: view.owner.map(|o| o.to_z32()).unwrap_or_default(),
             is_owner: view.is_owner(&self.me),
             connection: dto::Connection {
@@ -259,7 +277,7 @@ impl Core {
         dto::Channel {
             id: ch.id.to_hex(),
             server_id: conv.to_hex(),
-            name: ch.name.clone(),
+            name: display(&ch.name, "unnamed"),
             kind: match ch.kind {
                 CoreKind::Text => dto::ChannelKind::Text,
                 CoreKind::Voice => dto::ChannelKind::Voice,
@@ -304,11 +322,15 @@ impl Core {
 
     /// `Message` DTO of a stored message event (None for other bodies). `delivered` is the
     /// DM delivery ack (ignored for servers). Records the attachments in the hash index.
+    ///
+    /// Attachment names are cleaned like every peer name, and the MIME type is the one of
+    /// the name the file would be saved under, not the sender's claim: the UI's icon and
+    /// image preview then match what `open_file` will do with it.
     pub(crate) fn message_dto(&self, view: &ConvView, ev: &StoredEvent, delivered: u64) -> Option<dto::Message> {
         let Body::Message { channel, text, attachments } = &ev.event.body else { return None };
         let author = ev.event.author;
         if !ev.deleted {
-            self.index_attachments(view.conv, author, attachments);
+            self.index_attachments(view.conv, view.is_dm, author, attachments);
         }
         Some(dto::Message {
             id: ev.id.to_hex(),
@@ -322,28 +344,18 @@ impl Core {
             } else {
                 attachments
                     .iter()
-                    .map(|a| dto::Attachment { hash: a.hash.to_hex(), name: a.name.clone(), size: a.size, mime: a.mime.clone() })
+                    .map(|a| dto::Attachment {
+                        hash: a.hash.to_hex(),
+                        name: file_display(&a.name),
+                        size: a.size,
+                        mime: shell::mime_for_name(&shell::safe_file_name(&a.name)).to_string(),
+                    })
                     .collect()
             },
             sent_at: hlc_ms(ev.event.hlc),
             deleted: ev.deleted,
             pending: view.is_dm && author == self.me && ev.event.seq > delivered,
         })
-    }
-
-    /// Remember where the attachments of a message can be fetched.
-    pub(crate) fn index_attachments(&self, conv: ConvId, author: UserId, attachments: &[tincan_core::event::Attachment]) {
-        if attachments.is_empty() {
-            return;
-        }
-        let mut atts = self.atts.lock();
-        if atts.len() > crate::app::MAX_INDEXED_ATTACHMENTS {
-            atts.clear();
-        }
-        for a in attachments {
-            atts.entry(a.hash)
-                .or_insert_with(|| AttRef { conv, author, name: a.name.clone(), size: a.size, mime: a.mime.clone() });
-        }
     }
 
     /// `DmSummary` of a DM conversation.
@@ -448,5 +460,20 @@ impl Core {
     /// Forget what was sent for `conv` (after leaving it).
     pub(crate) fn forget_sent(&self, conv: &ConvId) {
         self.sent.lock().retain(|k, _| !matches!(k, SentKey::Server(c) | SentKey::Channels(c) | SentKey::Members(c) | SentKey::Dm(c) if c == conv));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_names_are_cleaned_for_display() {
+        assert_eq!(display("Gen\u{202E}eral\u{200B}", "unnamed"), "General");
+        assert_eq!(display("\u{2066}\u{2069}\u{7}", "unnamed"), "unnamed");
+        let padded = format!("Invoice.pdf{}.exe", "\u{a0}".repeat(60));
+        assert_eq!(file_display(&padded), "Invoice.pdf .exe", "padding cannot hide the extension");
+        assert_eq!(file_display("photo\u{202E}gnp.exe"), "photognp.exe");
+        assert_eq!(file_display("\u{FEFF}"), "file");
     }
 }

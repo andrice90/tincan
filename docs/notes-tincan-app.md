@@ -7,17 +7,18 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 | File | What it holds |
 |---|---|
 | `lib.rs` | Frozen surface: `App` wraps `Arc<Core>`, plus the test hooks |
-| `app.rs` | `Core`: every subsystem and cache, `start` and `shutdown`, the access policy, `set_name` and Profile publishing |
+| `app.rs` | `Core`: every subsystem and cache, `start` and `shutdown`, conversation membership for the access check, what to announce, `set_name` and Profile publishing, `net_err` |
+| `index.rs` | The hash index (`HashInfo`: references and shares per hash), its kv encoding, the bounded cache, and `Access` / `Policy`, the per (peer, hash) rule the blobs provider applies |
 | `profile.rs` | Profile directory layout, the lock file, `identity.key`, the display-name kv key |
 | `settings.rs` | `Settings` defaults, validation (`normalize`), load and save |
 | `dto.rs` | Every `types.ts` interface (`serde(rename_all = "camelCase")`, exact enum strings) |
 | `emit.rs` | `Ev` (every `Events` name) and `Emitter` (bounded broadcast of `UiEvent`) |
 | `dispatch.rs` | `App::call`: argument structs, routing, `CORE_COMMANDS` |
 | `commands.rs` | Servers, channels, messages, DMs and settings commands; cursor and id parsing |
-| `transfers.rs` | Attachment import, the hash index, auto-fetch, the fetch worker, `transfer` / `download` / `open_file` / `file_url` / `file_for_url`, resume |
+| `transfers.rs` | Attachment import, hash index bookkeeping (references, shares, download nominations), auto-fetch, the fetch worker, `transfer` / `download` / `open_file` / `file_url` / `file_for_url`, resume, lag recovery |
 | `views.rs` | `ConvView` (cached slice of `ConvState`), DTO builders, `refresh` with dedup |
 | `pump.rs` | The event pump: `NetEvent`/`FileEvent` to UI events, debounce and bulk coalescing |
-| `shell.rs` | MIME types, safe export names, unique paths, opening a file with its default app |
+| `shell.rs` | MIME types, safe export names, peer text clean-up, unique paths, the open or reveal decision, the Mark of the Web |
 | `media/mod.rs` | `Media`: state, `COMMANDS`, command routing, the hooks the rest of the app calls, lock order |
 | `media/engine.rs` | The `AudioEngine` slot, its event forwarder, restart after the engine thread dies, the synthetic test microphone, `decode_clip` under `catch_unwind` |
 | `media/session.rs` | Attach and detach of a `MediaSession`, `reconcile`, audio and video pumps, `VoiceSession` and `CallInfo` DTOs, calls, mute and deafen, per-user volume, devices, mic test |
@@ -33,7 +34,8 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 - The display name lives in kv `app/display_name`. It is not in the settings document, because the UI's `Settings` has no name and `settings_set` would erase it.
 - Settings are one JSON document in the store's settings table.
 - Other kv keys:
-  - `app/att/<hash>`: attachment origin (conv, author, name, size, mime). Written when a file is sent or a download is requested.
+  - `app/att/<hash>`: the hash index record (`index.rs`): up to 8 references (conv, DM flag, author, name, declared size, mime) and up to 16 conversations the blob is shared with. Written whenever a message referencing the hash is seen (pages, live events, history sync), a file is sent, a download completes, or a clip is played. A record from before this format (one origin) reads as one reference plus a share with that conversation.
+  - `app/refused/<hash>`: the size an attachment turned out to have when tincan-files refused it (`TooLarge`). Auto-fetch and `download` never ask for it again.
   - `app/export/<hash>`: the exported path, so `open_file` reuses an export that still exists with the right size.
 
 ## Startup
@@ -46,10 +48,10 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
    - mDNS and rendezvous: off under `offline_network`.
    - Bind address: `127.0.0.1:0` under `offline_network`, which also avoids firewall prompts in tests.
    - If a stored custom relay is rejected, the endpoint is rebuilt with the default relays. A toast says so after the UI's first `app_snapshot`.
-3. `Files::load(blobs, endpoint, policy)`. The policy is a closure over `Arc<RwLock<HashSet<UserId>>>`: current members of every server I am in, plus DM peers.
-   - The set is rebuilt from the cached views on startup, joins and leaves.
+3. `Files::load(blobs, endpoint, policy)`. The policy is `index::Policy` over `Arc<RwLock<Access>>` (see Blob access below). It starts empty, so nobody can connect until step 5 fills in the conversations. Then the shares of every held blob are read from kv (`load_shares`).
+   - Conversation membership is rebuilt from the cached views on startup, joins and leaves.
    - It is rebuilt at once on a `Members` change, so a new member can fetch right after joining.
-4. `Net::start(.., |b| b.accept(tincan_files::ALPN, files.protocol()))`. Then subscribe to both event streams and call `net.set_have(files.complete_hashes())`.
+4. `Net::start(.., |b| b.accept(tincan_files::ALPN, files.protocol()))`. Then subscribe to both event streams. The `Have` list is set in step 5 (`update_policy` calls `announce`).
 5. Warm every view and DM delivery mark. Spawn the pump and the fetch worker. Read `files.partial_downloads()` for resuming later.
 
 `TOKIO_WORKER_THREADS=2` is the shell's job (set in `main` before any runtime exists). Tests do not set it.
@@ -145,29 +147,63 @@ Throttling:
 - **Send:**
   - `send_message` attachments are absolute paths: at most 10 files, 25 MiB each, no folders.
   - Each is imported (`Files::import`, TryReference) and becomes `Attachment { hash, size, name (file name, at most 255 chars), mime by extension }`.
-  - The import tags the blob, and `FileEvent::Completed` then announces it (`have_add`).
-- **Hash index:** the hash-only commands need the conversation, author, size and MIME.
-  - `Core::atts` is filled from every message the app sees (pages, live events, bulk).
-  - Download requests and sends also persist the entry (`app/att/<hash>`).
+  - The hash is indexed with me as the author and shared with the conversation it was sent to, which also announces it when that is a server.
+- **Hash index** (`index.rs`, kv `app/att/<hash>`, a cache of 10 000 hashes that evicts the oldest):
+  - Every message the app sees adds a reference (conversation, author, declared name, size and MIME). At most 8 per hash and 2 authors per conversation; past 8 the oldest DM reference goes first (anyone can open a DM; joining a server takes an invite), else the oldest. Nothing is ever cleared all at once.
+  - A download asks `who_has` in every conversation that references the hash and tries every author. Name and size shown for hash-only commands come from the first reference. `download` refuses a hash whose smallest declared size is over 25 MiB.
+  - A reference grants no access (see Blob access).
+  - A new reference to a hash whose download is parked queues a holder lookup: at once for a server reference, under the 10 s throttle for a DM reference.
+- **Size caps:** tincan-files refuses an attachment over 25 MiB and a clip over 5 MiB as soon as the real size is known (`TransferState::TooLarge`, shown as `failed`), and drops its tags so the partial data is freed. The app records the refusal (`app/refused/<hash>`). Declared sizes over the cap are never queued (auto-fetch, `download`, resume).
 - **Auto-fetch:**
-  - Incoming attachments up to `autoFetchLimit` (default 25 MiB, 0 = off) that are not mine, not held and not requested go to the fetch worker. One mpsc worker, queue 1024, one item at a time.
-  - For each item the worker runs `who_has(conv)`, then `files.download(hash, Attachment, providers)`.
-  - Provider order: the author if online, then the other holders, then an offline author last (a dead first provider costs the 4 s connect timeout).
+  - Incoming attachments that declare at most `autoFetchLimit` (default 25 MiB, 0 = off, never past 25 MiB) and that are not mine, not held, not requested and not refused are pushed on `AutoQueue` (1024 hashes). It is served newest first and drops the oldest when full: a history sync streams the oldest messages first, and the newest are on screen and the likeliest to lose their holders.
+  - One fetch worker, one item at a time. Holder lookups (`Peers`), parked-download retries (`Requery`) and resumes go through a separate bounded channel (1024) that the worker serves before any auto-fetch.
+  - For each item the worker runs `who_has` in each referencing conversation, then `files.download(hash, Attachment, providers)`.
+  - Provider order: online authors, then the other holders, then offline authors last (a dead first provider costs the 4 s connect timeout).
   - History attachments are auto-fetched too (architecture.md: every member keeps attachments available).
-- **Parked downloads:** an `unavailable` download is re-queried (`who_has` plus `add_providers`) when rosters change, at most every 10 s per hash.
-- **Resume:** `partial_downloads()` is read at start. The first time any server reaches member, hosting or solo, or a DM link comes up, each entry is queued with its persisted origin. An entry without an origin (for example a clip) asks every server's `who_has`.
+- **Parked downloads:** an `unavailable` download is re-queried when rosters change or a DM link comes up. The 10 s per-hash throttle is checked before queueing (`requery_due`), and only providers online now are added (`online_only`); with none, the download is not woken.
+- **Resume:** `partial_downloads()` is read at start. The first time any server reaches member, hosting or solo, or a DM link comes up, each entry is queued with its indexed references. Entries the queue has no room for wait for the next connection. An entry without references (for example a clip) asks every conversation's `who_has`.
+- **Lost file events:** when the pump's file receiver lags, `on_files_lagged` finishes the shares of downloads that completed meanwhile (`Files::provided_by` names who delivered them), re-announces, re-reads every tracked transfer and open download record through `on_transfer` (which fixes the records and the UI), and finishes clip pulls whose blob is complete.
 - **`transfer`:**
   - `idle` when tincan-files has no record and the blob is not held.
-  - `peers` counts online holders from the last `who_has` (plus the author when online), never me.
+  - `peers` counts online holders from the last `who_has` (plus authors when online), never me.
   - If a hash has no holder information yet, the worker looks it up and emits `transfer-updated`.
-- **`download`:** errors with "This file isn't available on this device." for a hash the app never saw.
-- **`open_file`:**
-  - Exports to `downloadDir` (default `%USERPROFILE%\Downloads\Tincan`) under a sanitized name. If the name is taken, it uses `name (n).ext`.
-  - It then runs `explorer.exe <path>` with `CREATE_NO_WINDOW`.
-  - With `TestOptions::no_devices` it exports but never launches a program.
+- **`download`:** errors with "This file isn't available on this device." for a hash the app never saw, and "This file is larger than 25 MB, so Tincan won't download it." for one over the cap.
+- **`open_file`:** see Blob access below for the open or reveal rule.
+  - Exports to `downloadDir` (default `%USERPROFILE%\Downloads\Tincan`) under `safe_file_name`. If the name is taken, it uses `name (n).ext`. A previous export that still exists with the right size is reused.
+  - Writes the Mark of the Web on the exported file every time (new or reused export).
+  - With `TestOptions::no_devices` it exports and marks but never launches a program.
 - **URLs:**
   - `file_url` returns `file_url_base + hashHex` once the blob is complete.
-  - `file_for_url` reads at most 25 MiB. The MIME is sniffed from magic bytes for common images, else the declared type if it is a raster image, audio or video. Everything else, SVG and HTML included, is served as `application/octet-stream`, so nothing runs script on the app origin.
+  - `file_for_url` reads at most 25 MiB and hands the store's buffer over without a second copy (`Vec::from(Bytes)`). The MIME is sniffed from magic bytes for common images, else the type of the cleaned file name if that is a raster image, audio or video (never the peer's declared type). Everything else, SVG and HTML included, is served as `application/octet-stream`, so nothing runs script on the app origin.
+
+## Blob access
+
+Admitted members and DM contacts are untrusted, and hashes are not secret: tincan-net sends one `Have` list to every host and DM peer, and anyone who can post can name any hash in a message. So knowing or naming a hash grants nothing.
+
+- **The rule** (`Access::allow_blob`, asked by tincan-files for every get and observe request): a peer may fetch hash H from me only if H is *shared* with a conversation that peer is in right now: a current member of that server, or the peer of that DM. A peer must also be in at least one of my conversations to open a blobs connection at all (`allow_peer`). Get requests for child ranges (hash sequences) and get-many requests are refused in tincan-files, so an allowed blob cannot be used to pull others.
+- **What shares H with conversation C** (persisted in the index record, at most 16 per hash):
+  - I sent H in C.
+  - I played clip H in C's voice room or call (`clip_play` shares before announcing).
+  - I downloaded H and the peer that delivered the last verified bytes (`FileEvent::Completed.from`) was named by C: an author of a reference to H in C, or a holder C's host listed in `who_has` (`Core::nominations`, kept per download in flight). Clip pulls nominate the player and the holders of the session's conversation.
+  - Someone reposted H in C while they may already fetch H from me: they could pass the bytes on anyway.
+- **What does not:** a message in C that only references H. This is stricter than "a hash belongs to every conversation that references it", which would let a member of server S post the hash of a DM file in S and then fetch it from me.
+- **Announcements:** `Core::announce` sets the `Have` list and the clip library announcement to held blobs that are shared with a server I am in. A blob shared only with DMs is never announced (DM `who_has` always names the contact). tincan-net still sends that one list to every host and every DM peer, so a server's host also learns hashes shared with my other servers; it cannot fetch them. Per-conversation announcements need a tincan-net API.
+- **Known gaps:** a host is trusted to list real holders, so a host that also references H can get a blob I download from the holder it named shared with its server. A download whose bytes came from two providers is credited to the last one.
+
+### Open or reveal (`shell::open_action`, unit-tested)
+
+`open_file` decides on the final exported name (after `safe_file_name` and `unique_path`, never the peer's raw name) and the file's first 16 bytes:
+
+- **Opened with the default app:** `pdf`, `txt`, and audio and video (`mp3`, `wav`, `ogg`, `oga`, `opus`, `flac`, `m4a`, `mp4`, `m4v`, `webm`, `mov`), plus the images `png`, `jpg`, `jpeg`, `gif`, `webp` and `bmp` when the sniffed type matches the extension.
+- **Revealed** with `explorer.exe /select,"<path>"` (passed as a raw argument; normal quoting would make it one token): everything else (programs, scripts, shortcuts, HTML applications, archives, office files, unknown types), an image whose bytes are not that image type (a GIF polyglot named `.png`), and any file whose Mark of the Web could not be written (FAT and exFAT drives have no streams).
+- **Mark of the Web:** every export gets a `Zone.Identifier` stream with `ZoneId=3`, so SmartScreen, Attachment Manager and Office Protected View treat it as downloaded from the Internet, also when the user opens it later from Explorer.
+- **Export names** (`safe_file_name`): no directories; control and hidden format characters dropped (U+200B-U+200F, U+202A-U+202E, U+2060-U+2069, U+061C, U+FEFF); whitespace runs, no-break spaces included, fold to one space; Windows reserved characters become `_`; at most 200 characters, cut from the stem so the last extension (1 to 16 characters, no spaces) is kept; trailing dots and spaces trimmed after the cut; Windows device names (CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM0-9, LPT0-9 and the superscript 1-3 forms) get a `_` prefix; an empty result is `file`.
+
+## Peer text
+
+- **Names in DTOs:** peer display names (members, authors, DM and call names, typing, voice participants, `sound-played`), contact names, server and channel names, attachment names and clip names have control characters and the hidden format characters above removed (`shell::clean_text`, `views::display`). Attachment names also fold whitespace runs (`views::file_display`), like the export. The attachment MIME in the DTO is the type of the cleaned file name, not the sender's claim, so the UI's icon and image preview match what `open_file` will do. Stored names stay as published, because commands compare against them.
+- The whole range U+200B-U+200F is removed from names, U+200C and U+200D included. That splits emoji joined with ZWJ and changes some Persian and Indic text; it was chosen over keeping invisible joiners that can make two names look the same.
+- **Host refusals** (`net_err`): `NetError::Rejected` text that came from a host is shown as `The host refused this: "<text>"`, with hidden characters removed, whitespace folded and the text cut to 200 characters. Exact matches of the sentences tincan-net writes itself and of an honest host's join refusals (invite not valid, revoked, used up, clock checks) are shown as they are. A tincan-net variant for peer text would replace the string match.
 
 ## Settings
 
@@ -193,7 +229,7 @@ Throttling:
   - The same check runs whenever a server becomes connected, so a rename made while offline still reaches each server.
 - **Contacts:**
   - `add_contact` accepts `tincan1u...` or a bare z32 id (`parse_user_code`), then runs `open_dm`.
-  - `open_dm` calls `net.dm_open`, saves a contact record and adds the peer to the access set.
+  - `open_dm` calls `net.dm_open`, saves a contact record and adds the DM to the access state: the peer may open a blobs connection, and fetches only what is shared with that DM.
   - An incoming DM from a stranger arrives as `DmOpened` and gets the same treatment.
 - **`DmSummary.name`:** in order, a server display name, the contact record, or the first 8 characters of the z32 id. DMs carry no profile, so a contact you share no server with stays a short id.
 
@@ -265,7 +301,7 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
 
 ### Soundboard (`clips.rs`)
 
-- **Library:** the store's `clips` table plus `BlobKind::Clip` blobs. Clips are announced with `net.set_clips` (complete blobs only) at start and after every add, remove, rename or pull, so the host's holder index lists me.
+- **Library:** the store's `clips` table plus `BlobKind::Clip` blobs. Clips are announced with `net.set_clips` at start and after every add, remove, rename, pull or play, so the host's holder index lists me. Only complete clips shared with a server I am in are announced: a clip is shared with a server when I play it in one of its voice rooms, or pull it there (Blob access).
 - **`clips` and `clips-updated`:** the library (`owned: true`), then the clips heard in this session that I don't own (`owned: false`, `heardFrom`, `transfer` while pulling). At most 50 heard clips; the list is cleared when the session ends.
 - **`clip_add`:**
   - The name is trimmed, 1 to 32 characters (the UI's limit); an empty name uses the file stem.
@@ -277,16 +313,16 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
   - Not in voice gives `not-in-voice`; deafened gives `deafened` (checked before and after decoding).
   - A clip not in the library: "Save that sound before playing it."
   - The PCM comes from the cache (at most 4 clips or 2 M samples, dropped on leaving voice) or a fresh decode.
-  - `engine.play_clip`, then `net.sound_played(ClipInfo)`. Playing works while muted.
+  - `engine.play_clip`, then the clip is shared with the session's conversation (the server of the room, or the DM of the call), then `net.sound_played(ClipInfo)`. Playing works while muted.
 - **Incoming `SoundPlayed`:**
   - Only for my attached session.
-  - Announcements over 5 MiB or about 20 s are ignored. Peer names are cleaned of control characters and cut to 32 characters.
+  - Announcements over 5 MiB or about 20 s are ignored. Peer names are cleaned of control and hidden format characters and cut to 32 characters.
   - Emits `sound-played { userId, name, clip }`; `clip.owned` says whether it is in my library. A clip I don't own is remembered as heard.
   - The clip is **not** played locally: the player's engine already mixes it into its voice stream (`AF_SOUNDBOARD`), so a local copy would play it twice.
 - **`clip_fetch`:**
   - Records the pull (kv `app/clip_fetches`, so it survives a restart), then `files.download(hash, Clip, [player, ...who_has(conv)])`.
   - A blob already held as an attachment is tagged as a clip instead of downloaded.
-  - Progress and states re-send `clips-updated`. A download reporting more than 5 MiB is cancelled.
+  - Progress and states re-send `clips-updated`. tincan-files stops a clip download past 5 MiB (`TooLarge`); the app then forgets the pull and says so.
   - On `FileEvent::Completed { kind: Clip }` for a recorded pull, the blob is read and decoded. If it is valid it goes into the library and is announced, so I serve it while I keep it. Otherwise the clip tag is dropped and a toast says so.
   - `Completed` events of clips that were not pulled are ignored, because `clip_add`'s import fires one before its row exists.
 - **`clip_remove`** drops the row and the clip tag (an attachment tag keeps the bytes). **`clip_rename`** errors with "That sound was removed." for a missing clip.
@@ -319,6 +355,9 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
 - `App::test_crash_audio_engine()`: the `no_devices` microphone panics on its next read, killing the engine thread.
 - `App::test_allow_screen_capture()`: real screen capture despite `no_devices` (audio stays synthetic). Only the ignored hardware test uses it.
 - `App::test_media_counters()`: `{ audioIn, videoOut, engineRestarts, engineRunning }` (audio datagrams handed to the engine, video messages delivered to sinks).
+- `App::test_fetch_from(hash, user, addrs, secs)`: fetch a blob straight from a peer over the blobs protocol, as a modified client could (no message, index or holder lookup).
+- `App::test_post_attachment_ref(conv, channel, hash, name, size)`: publish a message whose attachment claims a hash without holding the bytes.
+- `App::test_pause_file_events(paused)`: the pump drops every file event while paused; resuming runs the lag recovery.
 
 Joins need no hook, because invites carry the inviter's loopback address.
 
@@ -335,7 +374,13 @@ Joins need no hook, because invites carry the inviter's loopback address.
   - Attachment errors; A sends 300 kB and B auto-fetches it.
   - A shuts down and B hosts solo; C joins with B's invite.
   - C sees `peers == 1`, downloads it, and gets identical bytes from `file_for_url`.
-  - `open_file` exports once into a temp folder.
+  - `open_file` exports once into a temp folder, with `ZoneId=3` in its `Zone.Identifier` stream, and marks a reused export again.
+- `blobs_are_served_only_where_they_are_shared` (c2):
+  - A server member cannot fetch from Bob a file Alice and Bob exchanged in a DM, also after posting a message in the server that references its hash. The server file is served to her on the same path (control).
+  - A stranger who DMs Alice cannot fetch her server file, also after referencing it in the DM. A file Alice sends him in the DM arrives (control).
+  - An attachment declaring 30 MB is not auto-fetched and `download` refuses it; its name loses the RLO and its MIME follows the cleaned name.
+- `a_new_reference_wakes_a_parked_download` (c3): a stranger names a hash in a DM and never serves it, so Bob's auto-fetch parks. When Alice posts the file in their server, the download completes with no roster change and no click.
+- `lost_file_events_are_recovered` (c4): Bob's pump drops file events while his auto-fetch completes, so the file is not shared; after the lag recovery the UI gets `complete` and Carol can fetch it from Bob.
 - `direct_messages_and_offline_delivery` (d):
   - `add_contact` by code; DMs and DM typing both ways.
   - B shuts down; A's message is pending. B restarts on the same profile, gets the message, and A gets `message-updated` with `pending: false`.

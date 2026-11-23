@@ -25,7 +25,12 @@
 //!
 //! - Connections are intercepted: a peer whose [`UserId`] the [`AccessPolicy`] denies is
 //!   rejected with `AbortReason::Permission` before it can send a request.
-//! - Observe requests are enabled, so a downloader can ask a peer which ranges it holds.
+//! - Every get and observe request is intercepted too: the policy decides per (peer, hash)
+//!   with [`AccessPolicy::allow_blob`], so an allowed peer still gets only the blobs it may
+//!   see, and cannot probe which other blobs this node holds.
+//! - Only single-blob requests are served. A get that asks for children (a hash sequence)
+//!   would make the provider read a held blob as a list of hashes and serve those, so it is
+//!   refused. Get-many requests are disabled.
 //! - Uploads pass through a global token bucket when [`Files::set_upload_limit`] sets a cap.
 //! - Push requests (peers writing into our store) are disabled.
 //!
@@ -38,6 +43,13 @@
 //! has failed, the request turns [`TransferState::Unavailable`] and stays parked until
 //! [`Files::add_providers`] names a holder again. Progress is reported on
 //! [`Files::subscribe`].
+//!
+//! Each kind has a hard size cap ([`BlobKind::max_size`]: 25 MiB for attachments, 5 MiB for
+//! clips). The size a message declares is the sender's claim; the real size arrives with
+//! the first verified chunk (or is already known for a partial blob), and a request whose
+//! size, or whose verified bytes, pass the cap of every kind it was asked for stops there:
+//! it turns [`TransferState::TooLarge`], its tags are dropped so garbage collection frees
+//! the partial data, and it is not resumed or retried.
 //!
 //! Hashes being downloaded or held are tagged `att-<hex>` or `clip-<hex>` in the store, so
 //! garbage collection (hourly) keeps them, partial downloads included, until
@@ -61,21 +73,35 @@ pub const ALPN: &[u8] = iroh_blobs::ALPN;
 
 use tincan_core::{BlobHash, UserId};
 
-/// Decides which remote peers may fetch blobs from this node.
+/// Largest attachment a download accepts: 25 MiB.
+pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+/// Largest soundboard clip a download accepts: 5 MiB.
+pub const MAX_CLIP_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Decides which remote peers may fetch which blobs from this node.
 ///
-/// The app implements it as "member of a server we share, or a DM contact". It is called
-/// once per incoming blobs connection from the provider event loop, so it must be fast
-/// and must not block (no IO; a short lock is fine).
+/// Both methods run on the provider event loop, which also paces every uploaded chunk, so
+/// they must be fast and must not block (no IO; a short lock is fine).
 pub trait AccessPolicy: Send + Sync + 'static {
-    /// True if `peer` may connect and fetch blobs.
+    /// True if `peer` may open a blobs connection at all. Called once per connection.
     fn allow(&self, peer: &UserId) -> bool;
+
+    /// True if `peer` (already allowed to connect) may fetch or observe `hash`. Called once
+    /// per get or observe request.
+    fn allow_blob(&self, peer: &UserId, hash: &BlobHash) -> bool;
 }
 
+/// A closure decides per peer only: a peer it allows may fetch every blob this node holds.
+/// Use a type that implements [`AccessPolicy::allow_blob`] for per-blob rules.
 impl<F> AccessPolicy for F
 where
     F: Fn(&UserId) -> bool + Send + Sync + 'static,
 {
     fn allow(&self, peer: &UserId) -> bool {
+        self(peer)
+    }
+
+    fn allow_blob(&self, peer: &UserId, _hash: &BlobHash) -> bool {
         self(peer)
     }
 }
@@ -105,6 +131,15 @@ impl BlobKind {
     /// Full tag name for `hash` of this kind: prefix plus lowercase hex.
     pub fn tag_name(self, hash: &BlobHash) -> String {
         format!("{}{}", self.tag_prefix(), hash.to_hex())
+    }
+
+    /// The largest blob a download of this kind accepts ([`MAX_ATTACHMENT_BYTES`] or
+    /// [`MAX_CLIP_BYTES`]).
+    pub fn max_size(self) -> u64 {
+        match self {
+            BlobKind::Attachment => MAX_ATTACHMENT_BYTES,
+            BlobKind::Clip => MAX_CLIP_BYTES,
+        }
     }
 }
 
@@ -143,6 +178,11 @@ pub enum TransferState {
     /// A local error (store or disk) stopped the download. Call [`Files::download`] again
     /// to retry.
     Failed,
+    /// The blob is larger than the cap of every kind it was requested as
+    /// ([`BlobKind::max_size`]). The request stopped, its tags were dropped, and asking
+    /// again for a kind with a smaller cap only repeats this state. `total` is the size
+    /// that was refused.
+    TooLarge,
 }
 
 /// Snapshot of one download request.
@@ -175,5 +215,8 @@ pub enum FileEvent {
         hash: BlobHash,
         /// The kind it was completed (tagged) as.
         kind: BlobKind,
+        /// The provider that delivered the last verified bytes of the download. `None` for
+        /// imports and for blobs that were already complete locally.
+        from: Option<UserId>,
     },
 }

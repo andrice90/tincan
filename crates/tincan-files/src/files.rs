@@ -121,6 +121,8 @@ impl Kinds {
 pub(crate) struct Held {
     pub(crate) kinds: Kinds,
     pub(crate) size: u64,
+    /// The provider that delivered its last bytes, when it was downloaded this session.
+    pub(crate) from: Option<UserId>,
 }
 
 /// Mutable state behind one lock. Never held across an await.
@@ -305,7 +307,7 @@ impl Files {
             self.inner.emit(FileEvent::Transfer(complete_info(hash, kind, size)));
         }
         for k in added {
-            self.inner.emit(FileEvent::Completed { hash, kind: k });
+            self.inner.emit(FileEvent::Completed { hash, kind: k, from: None });
         }
         debug!(hash = %hash.short(), size, ?kind, "imported");
         Ok(Imported { hash, size })
@@ -332,6 +334,11 @@ impl Files {
     /// Each provider's [`AddrHint`] is added to the endpoint's address lookup. Progress and
     /// state changes arrive on [`Files::subscribe`]. When all providers fail the request
     /// turns [`TransferState::Unavailable`] and waits for [`Files::add_providers`].
+    ///
+    /// The blob may be at most [`BlobKind::max_size`] of `kind` (of the largest kind asked
+    /// for, when several requests merged). Past that the request turns
+    /// [`TransferState::TooLarge`] as soon as the size is known, and its partial data is
+    /// released.
     pub fn download(&self, hash: BlobHash, kind: BlobKind, providers: Vec<(UserId, AddrHint)>) {
         if self.is_closed() {
             warn!(hash = %hash.short(), "download after shutdown ignored");
@@ -403,6 +410,13 @@ impl Files {
     /// True if `hash` is held completely (any kind).
     pub fn is_complete(&self, hash: &BlobHash) -> bool {
         self.inner.state.lock().held.contains_key(hash)
+    }
+
+    /// The provider that delivered the last bytes of `hash`, if it was downloaded since load
+    /// (the same peer as [`FileEvent::Completed`]'s `from`). Lets a receiver that lagged
+    /// behind the event stream recover it.
+    pub fn provided_by(&self, hash: &BlobHash) -> Option<UserId> {
+        self.inner.state.lock().held.get(hash).and_then(|h| h.from)
     }
 
     /// Tagged blobs that are not complete and not being downloaded: downloads interrupted by
@@ -565,7 +579,7 @@ impl Files {
 
     /// Records `hash` as held with `kinds`; returns the kinds that are new.
     fn mark_held(&self, hash: BlobHash, kinds: Kinds, size: u64) -> Vec<BlobKind> {
-        mark_held(&mut self.inner.state.lock(), hash, kinds, size)
+        mark_held(&mut self.inner.state.lock(), hash, kinds, size, None)
     }
 }
 
@@ -579,10 +593,14 @@ pub(crate) async fn set_tag(store: &FsStore, hash: BlobHash, kind: BlobKind) -> 
         .map_err(store_err)
 }
 
-/// Records `hash` as held with `kinds`; returns the kinds that are new.
-pub(crate) fn mark_held(st: &mut State, hash: BlobHash, kinds: Kinds, size: u64) -> Vec<BlobKind> {
-    let held = st.held.entry(hash).or_insert(Held { kinds: Kinds::default(), size });
+/// Records `hash` as held with `kinds` (downloaded from `from`, if known); returns the kinds
+/// that are new.
+pub(crate) fn mark_held(st: &mut State, hash: BlobHash, kinds: Kinds, size: u64, from: Option<UserId>) -> Vec<BlobKind> {
+    let held = st.held.entry(hash).or_insert(Held { kinds: Kinds::default(), size, from: None });
     held.size = size;
+    if from.is_some() {
+        held.from = from;
+    }
     kinds.iter().filter(|k| held.kinds.insert(*k)).collect()
 }
 
@@ -615,7 +633,7 @@ async fn scan_held(store: &FsStore) -> Result<HashMap<BlobHash, Held>> {
     for (hash, kinds) in tagged {
         let bf = store.blobs().observe(blobs_hash(&hash)).await.map_err(store_err)?;
         if bf.is_complete() {
-            held.insert(hash, Held { kinds, size: bf.size() });
+            held.insert(hash, Held { kinds, size: bf.size(), from: None });
         }
     }
     Ok(held)
