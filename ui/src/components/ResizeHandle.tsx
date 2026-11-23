@@ -57,7 +57,10 @@ export function ResizeHandle({ panel, bounds, edge, label }: ResizeHandleProps) 
     if (e.button !== 0) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
-    drag.current = { startX: e.clientX, startWidth: panel.width, last: panel.width, pointerId: e.pointerId };
+    // Start from the width on screen: in a narrow window the panel may be narrower than saved.
+    const shown = e.currentTarget.parentElement?.getBoundingClientRect().width;
+    const start = shown ? clampWidth(shown, bounds) : panel.width;
+    drag.current = { startX: e.clientX, startWidth: start, last: start, pointerId: e.pointerId };
     setDragging(true);
   };
 

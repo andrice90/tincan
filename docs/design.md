@@ -58,7 +58,7 @@ Motion: `transition: background-color 120ms ease-out, color 120ms ease-out`. No 
 ```
 
 - Custom title bar (decorations off) 32px tall, draggable, with min/max/close on the right. Keeps the window one continuous surface.
-- Channel list and member list widths: a grab bar on the edge that faces the content resizes them (channel list 200 to 420 px, default 240; member list 220 to 360 px, default 220). Drag or use the arrow keys, Home and End; double-click resets. The bar shows a `--border` line on hover and an `--accent` line while dragging or focused. In a narrow window both give way to their minimum before the content goes below 300 px.
+- Channel list and member list widths: a grab bar on the edge that faces the content resizes them (channel list 200 to 420 px, default 240; member list 220 to 360 px, default 220). Drag or use the arrow keys, Home and End; double-click resets. The bar shows a `--border` line on hover and an `--accent` line while dragging or focused. In a narrow window both give way to their minimum before the content goes below 276 px (the room left in the 800 px minimum window at default widths).
 - Rail: DM button, divider, servers (initials on a rounded square, selected = accent fill), add-server button. Unread = small dot under the icon.
 - Unread text channel: name in `--text-1` at weight 600, and a badge at the row's end (a 6 px `--text-1` dot; a count capped at "99+" once the app sends one). The channel on screen never shows one.
 - Channel list header: server name, "Hosted by <name>" (real state from the session), menu: invite people, rename server (owner only), leave server.

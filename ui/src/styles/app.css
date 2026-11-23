@@ -243,7 +243,7 @@
 }
 
 .resize-handle:hover::after {
-  background: var(--border);
+  background: var(--text-3);
 }
 
 .resize-handle.is-dragging::after,
@@ -595,7 +595,8 @@ html:has(.resize-handle.is-dragging) {
 .main {
   position: relative;
   flex: 1;
-  min-width: 300px;
+  /* 800 px window - rail - default sidebar and member list: defaults fit the minimum window. */
+  min-width: 276px;
   display: flex;
   flex-direction: column;
   background: var(--bg-main);
