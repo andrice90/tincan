@@ -67,7 +67,7 @@ The script drives each flow by clicking and typing in the two webviews, with the
 
 ## Results
 
-Last run: 2026-11-23, debug build (`dev` profile) with the embedded UI, started from `ui/e2e/`. All 49 checks passed. It was the fifth passing run in a row since the first UI fix below, and the only one after the last code change (the on-screen re-check in `markSeen`). No instance wrote a warning or error to its log (`TINCAN_LOG=warn,tincan_audio=info`). Both instances that joined voice opened and closed the microphone and speaker exactly once: on joining voice, and on leaving it (the speaker 0.5 s later). The restarted instance never joined voice and opened no device. The numbers below come from that run. The earlier passing runs were within a few ms of them, except the host exit, which varied from 92 to 219 ms.
+Last run: 2026-11-23, after the round 2 fixes and the round 3 review fixes (`docs/review/findings.md`), debug build (`dev` profile) with the embedded UI, started from the repository root. All 49 checks passed. The first run after those fixes failed one check, "B sees who hosts": it read B's header once, right after B's member list showed both names, and got "Hosted by w67ra3gh" (Alice's short id). One refresh emits `members-updated` before `server-updated`, and the header shown before the sync still had the short id, so the read fell between the two events. The check now waits up to 5 s for "Hosted by Alice"; the next two runs passed all 49 checks, the header within the first poll. No instance wrote a warning or error to its log (`TINCAN_LOG=warn,tincan_audio=info`). Both instances that joined voice opened and closed the microphone and speaker exactly once: on joining voice, and on leaving it. The restarted instance never joined voice and opened no device. The numbers below come from the last run. The run before (2026-11-23, before the round 2 fixes) was within a few ms of them, except the host exit (219 ms then).
 
 ### Timings (loopback, offline network)
 
@@ -77,22 +77,22 @@ Waits poll every 50 ms. Message latencies are stamped in the pages themselves: f
 |---|---|
 | Create server (click to "Only you are online") | 81 ms |
 | Join: click "Join server" to the server shown on B | 77 ms |
-| Join: to both online in B's member list / in A's | 78 ms / 205 ms |
-| Message latency A to B, median of 10 (samples 2-4 ms) | 3 ms |
-| Message latency B to A, median of 10 (samples 2-3 ms) | 3 ms |
-| Attachment (180 B PNG): Enter to B's inline preview loaded, auto-fetched | 63 ms |
-| DM A to B, including B opening the new conversation / DM B to A | 74 ms / 19 ms |
-| Voice: both listed in Lounge on both sides | 302 ms |
-| Sound played on A to "Heard in this call" on B | 18 ms |
-| Clip pull on B (Save to playable tile) | 849 ms |
-| Screen share: Share click to "Stop sharing" | 334 ms |
-| Watch click to first decoded frame on B | 24 ms |
-| Stop sharing to the share gone on B | 323 ms |
-| Host migration: Close click to survivor "Only you are online" | 162 ms |
-| Host migration: Close click to the host process exiting (clean handoff) | 219 ms |
-| Close click to the survivor having sent two messages (includes typing) | 1213 ms |
-| Restart: launch to "Hosted by Bob" / to the missed messages shown | 416 ms / 418 ms |
-| First message after the rejoin | 4 ms |
+| Join: to both online in B's member list / in A's | 79 ms / 200 ms |
+| Message latency A to B, median of 10 | 4 ms |
+| Message latency B to A, median of 10 | 4 ms |
+| Attachment (180 B PNG): Enter to B's inline preview loaded, auto-fetched | 60 ms |
+| DM A to B, including B opening the new conversation / DM B to A | 28 ms / 12 ms |
+| Voice: both listed in Lounge on both sides | 297 ms |
+| Sound played on A to "Heard in this call" on B | 14 ms |
+| Clip pull on B (Save to playable tile) | 843 ms |
+| Screen share: Share click to "Stop sharing" | 328 ms |
+| Watch click to first decoded frame on B | 14 ms |
+| Stop sharing to the share gone on B | 322 ms |
+| Host migration: Close click to survivor "Only you are online" | 156 ms |
+| Host migration: Close click to the host process exiting (clean handoff) | 98 ms |
+| Close click to the survivor having sent two messages (includes typing) | 1132 ms |
+| Restart: launch to "Hosted by Bob" / to the missed messages shown | 431 ms / 433 ms |
+| First message after the rejoin | 5 ms |
 
 ### Resources after 60 s idle
 
@@ -100,16 +100,16 @@ Debug build, both instances in a server text channel, not in voice, CDP disconne
 
 | Process | e2e-a (restarted, never in voice since) | e2e-b (was in voice earlier) |
 |---|---|---|
-| tincan.exe | 54.1 MB, 9.1 MB, 13, 0.15% | 57.1 MB, 11.2 MB, 17, 0% |
-| WebView2 browser | 126.6 MB, 32.5 MB, 57, 0% | 126.6 MB, 36.2 MB, 51, 0.15% |
-| WebView2 GPU | 72.5 MB, 74.1 MB, 58, 0.3% | 118.3 MB, 109.2 MB, 63, 0.3% |
-| WebView2 renderer | 83.6 MB, 34.9 MB, 26, 0.3% | 116.4 MB, 60.7 MB, 26, 0.15% |
-| WebView2 utility (2) | 40.5 + 22.1 MB, 11.2 + 7.2 MB, 24 + 10, 0% | 42.6 + 22.1 MB, 11.6 + 8.2 MB, 26 + 10, 0% |
-| WebView2 crashpad | 15.7 MB, 3.2 MB, 11, 0% | 15.7 MB, 3.2 MB, 11, 0% |
-| Total (7 processes) | 415 MB working set, 172 MB private, 199 threads, 0.75% | 499 MB working set, 240 MB private, 204 threads, 0.6% |
+| tincan.exe | 57.3 MB, 9.3 MB, 14, 0% | 60.3 MB, 11.3 MB, 18, 0% |
+| WebView2 browser | 121.9 MB, 32.7 MB, 53, 0.15% | 138.2 MB, 38.4 MB, 59, 0.15% |
+| WebView2 GPU | 81.1 MB, 73.9 MB, 61, 0.15% | 119.3 MB, 102.2 MB, 63, 0.6% |
+| WebView2 renderer | 87.5 MB, 38.9 MB, 25, 0.15% | 118.4 MB, 62.6 MB, 27, 0.3% |
+| WebView2 utility (2) | 40.4 + 22.1 MB, 11.1 + 7.2 MB, 23 + 10, 0% | 41 + 22 MB, 11.5 + 7.2 MB, 25 + 10, 0% |
+| WebView2 crashpad | 15.8 MB, 3.2 MB, 12, 0% | 15.8 MB, 3.3 MB, 13, 0% |
+| Total (7 processes) | 426 MB working set, 176 MB private, 198 threads, 0.45% | 515 MB working set, 237 MB private, 215 threads, 1.05% |
 
-- The Rust process idles at about 0% CPU with 9-11 MB of private memory.
-- **The architecture target of under 30 MB RSS for the idle Rust core is not demonstrated.** The debug build's working set is 54-57 MB. Given the 9-11 MB of private bytes, that is likely mostly the debug exe's image pages, but no release build was measured.
+- The Rust process idles at 0% CPU with 9-11 MB of private memory.
+- **The architecture target of under 30 MB RSS for the idle Rust core is not demonstrated.** The debug build's working set is 57-60 MB. Given the 9-11 MB of private bytes, that is likely mostly the debug exe's image pages, but no release build was measured.
 - B's 4 extra threads are likely its audio engine, which stays parked after the first voice use (by design, per the app notes). Its devices were closed, as the logs show.
 - B's larger GPU and renderer processes are likely left over from decoding the screen share. This was not measured separately.
 

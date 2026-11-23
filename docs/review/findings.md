@@ -4,7 +4,7 @@ Status of every confirmed finding from the two review rounds on 2026-11-23. Each
 
 Status values: `open`, `fixed` (with the subjects of the commits that fixed it), `deferred` (with reason). Aliases share their id's row and status.
 
-Round 2 fixes landed on 2026-11-23: four fix branches (`fix/net`, `fix/files-sec`, `fix/ui`, `fix/shell`) merged into main, then the app-side follow-ups on main. Not verified on real hardware or the real Tauri app since: the two-profile UI e2e (`ui/e2e`), the NSIS installer and its delete-data box, a real Windows logoff.
+Round 2 fixes landed on 2026-11-23: four fix branches (`fix/net`, `fix/files-sec`, `fix/ui`, `fix/shell`) merged into main, then the app-side follow-ups on main. Round 3 fixes (the review of the round 2 fixes, below) landed on main the same day. After them the two-profile UI e2e (`ui/e2e`, docs/e2e.md) passed all 49 checks with the embedded UI. Not verified on real hardware or the real Tauri app since: the NSIS installer and its delete-data box, a real Windows logoff, and the merge, flood and stranger paths of round 3 (covered by the in-process tests only).
 
 ## Round 3: review of the round 2 fixes
 

@@ -261,6 +261,9 @@ async function flowA(a, b) {
   timing("join_until_both_online_on_a", now() - t);
   check("A's member list shows both online", true, (await membersOnline(a)).join(", "));
   check("B's member list shows both online", true, (await membersOnline(b)).join(", "));
+  // One refresh sends members-updated before server-updated, so the header can trail the
+  // member list by an event: wait for it instead of reading it once.
+  await waitText(b, ".side-header .side-sub", "Hosted by Alice", { timeout: 5000 }).catch(() => {});
   check("B sees who hosts", /Hosted by Alice/.test(await sideSub(b)), await sideSub(b));
   await Promise.all([shot(a, "a3-members"), shot(b, "a3-members")]);
   await noErrorToast(a, "a");
