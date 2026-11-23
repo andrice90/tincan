@@ -1,0 +1,113 @@
+# Review findings
+
+Status of every confirmed finding from the two review rounds on 2026-11-23. Each finding was found by one agent and confirmed by a second agent that tried to refute it. Full scenarios, the verifier's reasoning and the proposed fixes are in `round1-net-confirmed.json` and `round2-app-confirmed.json` next to this file.
+
+Status values: `open`, `fixed` (with commit), `deferred` (with reason).
+
+## Round 2: tincan-app, src-tauri, ui
+
+| Id (aliases) | Sev | Where | Finding | Status |
+|---|---|---|---|---|
+| APP-CORE-01 (RESOURCES-1) | high | `crates/tincan-app/src/transfers.rs:267` | Auto-fetch trusts the peer-declared attachment size; the real blob size is never checked or capped | open |
+| APP-CORE-02 (SECURITY-1, SECURITY-5) | high | `crates/tincan-app/src/shell.rs:101` | open_file shell-executes peer-named files; the name sanitizer can turn '.pdf' into '.exe' and keeps RTLO | open |
+| APP-CORE-03 (SECURITY-2) | high | `crates/tincan-app/src/app.rs:178` | Every held blob is announced to every server host and DM peer, and any member or contact may fetch any of them | open |
+| APP-MEDIA-1 (UI-LOGIC-01, SPEC-GAPS-1) | high | `ui/src/store/actions.ts:647` | Leave voice while an outgoing call rings only cancels the call; the user stays in the room with a live mic while the UI shows them as gone | open |
+| APP-CORE-05 | medium | `crates/tincan-app/src/pump.rs:225` | Bulk window has no maximum length: steady traffic (or one spamming member) suppresses all live messages in a server | open |
+| APP-MEDIA-2 | medium | `crates/tincan-app/src/media/session.rs:221` | reconcile reads voice_info/call_info before taking the state lock, so a stale read can detach a room that was just joined | open |
+| APP-MEDIA-3 (RESOURCES-4) | medium | `crates/tincan-app/src/media/clips.rs:391` | Heard clips are capped at 50 in the app but the UI appends every sound-played clip without limit; older tiles can't be saved | open |
+| RESOURCES-2 | medium | `crates/tincan-app/src/transfers.rs:278` | Every roster update redials offline providers for every parked download and floods the shared fetch queue | open |
+| SECURITY-3 | medium | `crates/tincan-app/src/shell.rs:88` | Bidi-override and zero-width characters in peer file names and display names are kept, so extensions and nearby UI text can be spoofed | open |
+| SECURITY-4 | medium | `crates/tincan-app/src/views.rs:198` | Peer display names are not unique and nothing in the UI tells two users apart, so impersonating a contact is trivial | open |
+| SHELL-1 | medium | `src-tauri/src/main.rs:99` | Windows logoff, shutdown and Restart Manager exit without App::shutdown (no host handoff, store not flushed) | open |
+| SHELL-2 | medium | `src-tauri/tauri.conf.json:48` | Uninstaller's 'Delete the application data' option leaves every Tincan profile (identity key, messages, files) on disk | open |
+| SPEC-GAPS-2 | medium | `ui/src/components/ChatView.tsx:65` | DM-only contacts look offline and can't be called once the DM link has idled out (120 s) or after a restart | open |
+| UI-LOGIC-03 | medium | `ui/src/components/Composer.tsx:51` | Composer erases text typed while a send is in flight | open |
+| APP-CORE-04 | low | `crates/tincan-app/src/pump.rs:121` | FileEvent lag is only logged: lost Completed and Transfer events are never recovered | open |
+| APP-CORE-06 (SECURITY-8, RESOURCES-12) | low | `crates/tincan-app/src/views.rs:344` | Attachment index is first-writer-wins per hash, so downloads are routed to the wrong conversation (and the index can be poisoned) | open |
+| APP-CORE-07 | low | `crates/tincan-app/src/views.rs:164` | view() cache can store a stale ConvView that was built before a concurrent invalidation | open |
+| APP-CORE-08 | low | `crates/tincan-app/src/app.rs:313` | A rename made while a Profile publish is in flight is dropped | open |
+| APP-CORE-10 (SPEC-GAPS-10) | low | `crates/tincan-app/src/pump.rs:228` | My own DM messages never refresh DmSummary.lastMessageAt, so the DM list order goes stale | open |
+| APP-CORE-11 | low | `crates/tincan-app/src/views.rs:187` | DM names and DM author names depend on which server views happen to be cached | open |
+| APP-MEDIA-4 | low | `crates/tincan-app/src/media/clips.rs:409` | clip_fetch on an already-held blob that can't be read or tagged leaves a persisted pull that never resolves and looks complete | open |
+| RESOURCES-10 | low | `crates/tincan-app/src/transfers.rs:381` | Image serving copies every blob twice, reads the whole blob for HEAD, and loads every image in the history eagerly | open |
+| RESOURCES-13 | low | `ui/src/media/ScreenView.tsx:61` | screen_unwatch can overtake an in-flight screen_watch, leaving a sink that streams frames to a dead channel until the share ends | open |
+| RESOURCES-3 | low | `crates/tincan-app/src/transfers.rs:270` | Joining a server with a large history fills the 1024 fetch queue with the oldest attachments, drops the newest for good, and starves the UI's holder lookups | open |
+| RESOURCES-6 | low | `crates/tincan-app/src/pump.rs:264` | Every Members change does a full Net::conv_state clone (the message index included), per event and peer-triggerable | open |
+| RESOURCES-8 | low | `ui/src/media/ScreenView.tsx:85` | A watched screen share keeps being received, copied over IPC and decoded while the window is minimized, with no backpressure when the decoder falls behind | open |
+| RESOURCES-9 | low | `crates/tincan-app/src/pump.rs:269` | Each roster update recomputes members, the server summary and every DM summary, even when nothing they show changed | open |
+| SECURITY-7 | low | `crates/tincan-app/src/app.rs:407` | Reject text from a host is shown to the user unchanged as Tincan's own error message | open |
+| SHELL-4 | low | `src-tauri/src/main.rs:185` | Relaunching during the close window, or a plain double launch, ends with an 'already running' dialog and nothing on screen | open |
+| SPEC-GAPS-3 | low | `crates/tincan-app/src/pump.rs:252` | Deleting a voice room leaves the people inside connected to a room nobody can see | open |
+| SPEC-GAPS-4 | low | `ui/src/components/MemberList.tsx:17` | A call started from the member list never shows the call stage, so the peer's screen share and per-user volume can't be reached | open |
+| SPEC-GAPS-8 | low | `ui/src/components/Soundboard.tsx:14` | The Add sound picker offers .opus files, which the decoder can never read | open |
+| SPEC-GAPS-9 | low | `ui/src/dialogs/SettingsDialog.tsx:371` | Settings > Network says "No peers" for a server this PC hosts, even with members connected | open |
+| UI-LOGIC-02 | low | `ui/src/store/actions.ts:195` | message-added and message-updated that arrive while a conversation's first page loads are dropped; the message is also marked read | open |
+| UI-LOGIC-04 | low | `ui/src/store/actions.ts:173` | Page responses that started before a snapshot are merged into the reloaded cache, leaving a permanent hole | open |
+| UI-LOGIC-05 | low | `ui/src/store/actions.ts:307` | Every snapshot drops the cache of the conversation on screen, which loses the reading position | open |
+| UI-LOGIC-06 | low | `ui/src/store/actions.ts:334` | Each typing event restarts the sweep timer, so a typer who stopped stays listed while someone else keeps typing | open |
+| UI-LOGIC-07 | low | `ui/src/components/MessageList.tsx:174` | The load-older scroll anchor is used up by a new message at the bottom, so the older page prepends without compensation | open |
+| UI-LOGIC-08 | low | `ui/src/media/ScreenView.tsx:137` | An unsupported codec never shows the 'can't decode' error; the decoder is rebuilt and fails again at every keyframe | open |
+| UI-LOGIC-09 | low | `ui/src/components/CallPanel.tsx:41` | No hang-up control when the call is active but no voice session is attached | open |
+| UI-LOGIC-10 | low | `ui/src/store/actions.ts:613` | The download command's result can overwrite a newer transfer-updated, leaving an attachment card stuck | open |
+| UI-LOGIC-11 | low | `ui/src/dialogs/SettingsDialog.tsx:182` | Closing Settings or switching tabs within 250 ms of moving a volume slider drops the change | open |
+| UI-LOGIC-12 (SPEC-GAPS-11) | low | `ui/src/dialogs/SettingsDialog.tsx:267` | The auto-download menu offers 50 MB and 100 MB, but the backend silently clamps to 25 MB | open |
+| UI-LOGIC-13 (SPEC-GAPS-5) | low | `ui/src/components/VoiceView.tsx:17` | After a restart the per-user volume slider shows 100% while a saved volume is applied | open |
+| UI-LOGIC-14 | low | `ui/src/store/actions.ts:292` | A lag snapshot does not resync the keyed transfer and speaking stores | open |
+| UI-LOGIC-15 (RESOURCES-5) | low | `ui/src/store/actions.ts:205` | Message caches of loaded conversations grow without limit for the whole session | open |
+
+Also queued, from the phase 2 build notes (`docs/notes-tincan-app.md`):
+
+| Id | Finding | Status |
+|---|---|---|
+| Q1 | tincan-net emits no end-of-sync event; the app guesses bulk sync with a heuristic (`session/member.rs`) | open |
+| Q2 | `dm.rs` ensure_connect drops wake-ups during an in-flight dial, so a new address waits a full backoff | open |
+| Q3 | `Net::conv_state` clones the whole conversation state on every call | open |
+| Q4 | After a clean handoff `Net::roster` lists the departed host for up to 250 ms | open |
+| Q5 | DMs carry no display name, so a DM-only contact shows as a short id | open |
+| Q6 | `call_short_id` is crate-private and calls report no RTT | open |
+| Q7 | tincan-audio has no `is_running()` probe | open |
+| Q8 | Windows logoff runs no host handoff; second launch of a profile does not focus the first window | open (see SHELL-1, SHELL-4) |
+| Q9 | `tincan-store` test `simultaneous_first_open_migrates_once` flakes under load with "database is locked": `PRAGMA journal_mode = WAL` on a fresh file (`lib.rs:92`) does not wait on the busy handler | open |
+| Q10 | Storage trait has no batch insert for sync pages (`tincan-core` `Storage`); `tincan-store` has one but net inserts one by one | open |
+
+## Round 1: tincan-net and tincan-core hardening (fixed before commit 'Harden tincan-net against malicious members')
+
+| Id | Sev | Where | Finding | Status |
+|---|---|---|---|---|
+| S1 | high | `crates/tincan-net/src/session/host.rs:873` | Partition merge trusts the peer's HostCompare.connected, .score and self-signed epoch, so any member can take over a live host | fixed |
+| N1 | high | `crates/tincan-net/src/session/mod.rs:1252` | Welcome.your_next_seq from the host is trusted, so a malicious host can permanently silence a member | fixed |
+| N2 | high | `crates/tincan-net/src/session/host.rs:790` | Unthrottled fan-out (Typing, Publish, Status) overflows honest members' live queues, and the host then disconnects them as 'too slow' | fixed |
+| N3 | high | `crates/tincan-net/src/dm.rs:445` | tincan/dm/1 accepts any stranger: unbounded DM conversations, replicas, pending buffers and rings | fixed |
+| N4 | high | `crates/tincan-net/src/session/mod.rs:698` | A malicious successor can block failover forever by answering 'alive, not hosting' | fixed |
+| N5 | high | `crates/tincan-net/src/media/track.rs:424` | KeyframeRequest and Subscribe re-seed the whole GOP cache without a rate limit (up to 2 MiB per 5-byte frame) | fixed |
+| N6 | medium | `crates/tincan-net/src/media/sfu.rs:366` | Member uplink media is not rate-limited: an audio datagram flood drowns the room, and video uploads ignore TargetBitrate | fixed |
+| N7 | medium | `crates/tincan-net/src/session/host.rs:758` | Every SyncHave spawns a new full-history send_missing task (unbounded tasks and memory) | fixed |
+| N8 | medium | `crates/tincan-net/src/media/recv.rs:128` | Video receive path buffers up to 8 MiB per stream across about 100 concurrent streams, and pending groups are unbounded | fixed |
+| E1 | medium | `crates/tincan-net/src/session/mod.rs:811` | Self-signed epochs and the unsigned Hello.epoch_seen are unbounded: overflow panics or wraps, and epochs get poisoned permanently | fixed |
+| N9 | medium | `crates/tincan-net/src/session/member.rs:213` | A rejected PublishAck releases a signed seq, so a malicious host can make an honest member equivocate; the reason text is shown verbatim | fixed |
+| N10 | medium | `crates/tincan-core/src/state.rs:567` | Author equivocation is silently dropped as Stale and never detected, so honest members diverge permanently | fixed |
+| N11 | medium | `crates/tincan-net/src/session/host.rs:323` | The roster's voice field comes from self-reported Status while the SFU forwards by VoiceJoin, allowing invisible listening | fixed |
+| N12 | medium | `crates/tincan-net/src/rdv.rs:346` | Any current or former member can permanently pin the rendezvous record (seq exhaustion, published_ms in the future) | fixed |
+| N14 | medium | `crates/tincan-net/src/session/mod.rs:1323` | Members accept arbitrary roster contents from the host (non-members, unbounded size), which poisons storage and the next host's short ids | fixed |
+| N15 | medium | `crates/tincan-net/src/session/host.rs:774` | Per-member Have set and clip list are unbounded and unvalidated | fixed |
+| N16 | low | `crates/tincan-net/src/session/host.rs:752` | Junk Events from a member fill and evict the shared pending buffer (non-member authors are buffered as Gap) | fixed |
+| N18 | low | `crates/tincan-net/src/media/voice.rs:503` | Member side accepts any 'by' in host-relayed SoundPlayed and Typing, so a malicious host can impersonate members | fixed |
+| N19 | low | `crates/tincan-net/src/media/sfu.rs:506` | SoundPlayed is forwarded to the room without validation or rate limit | fixed |
+| N20 | low | `crates/tincan-net/src/session/host.rs:453` | Admissions are not rate-limited, and default invites have unlimited uses | fixed |
+| DOS-01 | high | `crates/tincan-net/src/media/recv.rs:240` | Video group reordering keeps unlimited pending groups and drains them recursively, so one stream sequence crashes the process with a stack overflow | fixed |
+| DOS-02 | high | `crates/tincan-net/src/session/host.rs:757` | Every SyncHave spawns a full-history send_missing task, with no coalescing or rate limit (host, member, probe and DM paths) | fixed |
+| DOS-03 | high | `crates/tincan-net/src/session/host.rs:790` | Typing and SoundPlayed are fanned out to everyone with no rate limit, and the host then disconnects honest members whose queues fill | fixed |
+| DOS-04 | high | `crates/tincan-net/src/session/host.rs:873` | Any member can make the host re-claim its epoch and broadcast HostMoved to all members on every HostCompare | fixed |
+| DOS-05 | high | `crates/tincan-net/src/media/sfu.rs:366` | The SFU forwards voice datagrams verbatim with no rate or size limit, and the forwarded flood starves every room member's control stream | fixed |
+| DOS-06 | high | `crates/tincan-net/src/media/track.rs:382` | Repeated Subscribe or KeyframeRequest re-seeds the 2 MiB GOP cache each time and leaks writer tasks that can block forever | fixed |
+| DOS-07 | high | `crates/tincan-net/src/media/recv.rs:104` | Video ingress allows 8 MiB per stream across 100 streams, decodes tiny frames in quadratic time, and does not police a sharer that ignores its target | fixed |
+| DOS-09 | high | `crates/tincan-net/src/config.rs:79` | Endpoint-wide QUIC defaults let a peer park about 250 MB per connection in streams nobody accepts (DM strangers included) | fixed |
+| DOS-10 | high | `crates/tincan-net/src/session/host.rs:453` | Unlimited sybil joins grow every replica forever and can push SyncHave past MAX_FRAME, after which it is silently dropped and sync stops for everyone | fixed |
+| DOS-11 | medium | `crates/tincan-net/src/session/host.rs:774` | Per-member Have set and clip list are unbounded, and every WhoHas scans all clips of all members | fixed |
+| DOS-12 | medium | `crates/tincan-net/src/session/mod.rs:1268` | Event signatures are verified on the session actor while holding the replica lock, without a stale pre-check, and all links share one FIFO | fixed |
+| DOS-13 | medium | `crates/tincan-net/src/session/host.rs:767` | Status flapping makes the host broadcast the full roster every 250 ms, and every member rewrites storage | fixed |
+| DOS-14 | medium | `crates/tincan-net/src/session/mod.rs:1323` | A malicious host can poison members' address tables and peers with fake roster entries (unbounded memory and disk writes, cold-open eclipse) | fixed |
+| DOS-15 | medium | `crates/tincan-net/src/dm.rs:435` | Any stranger identity creates a persistent DM conversation and a peer entry, holds a connection open, and can flood typing, call and state events (documented gap) | fixed |
+| DOS-17 | low | `crates/tincan-core/src/state.rs:98` | One author can fill the global PendingBuffer and evict honest early events | fixed |
+| DOS-19 | low | `crates/tincan-net/src/net.rs:147` | mDNS sightings from any LAN host grow the hints table and MemoryLookup without bound | fixed |
+| DOS-20 | low | `crates/tincan-net/src/media/voice.rs:141` | The voice session command channel is unbounded and fed by remote media control frames | fixed |

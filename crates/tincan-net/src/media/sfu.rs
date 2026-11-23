@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use tincan_core::event::ChannelKind;
 use tincan_core::media::{AudioHeader, KIND_SCREEN, KIND_VOICE, VideoFrame, track_id, track_kind, track_short_id};
 use tincan_core::wire::{ClipInfo, Ctl};
-use tincan_core::{ChannelId, ServerId, UserId};
+use tincan_core::{BlobHash, ChannelId, ServerId, UserId};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
@@ -36,6 +36,7 @@ use super::wire::{CtlTx, VideoOut};
 use super::{HOST_UPLINK_BUDGET_BPS, RELAYED_SHARER_BPS, RELAYED_VIEWER_BPS, VIDEO_MAX_BPS};
 use crate::events::NetEvent;
 use crate::inner::Inner;
+use crate::limits::{AudioPolicer, VideoPolicer, VideoVerdict};
 use crate::link::Tasks;
 
 /// Media tick (bitrate targets, receiver reports).
@@ -91,7 +92,18 @@ struct State {
     last_loss: Option<u8>,
     ticker: Option<AbortHandle>,
     closed: bool,
+    /// Audio datagram policers per member (kept across a member's reconnects).
+    policers: HashMap<UserId, AudioPolicer>,
+    /// Last soundboard announcement relayed per member.
+    sound_last: HashMap<UserId, Instant>,
+    /// Clips announced recently per member (relayed once per `SOUND_DEDUPE`).
+    sound_seen: HashMap<(UserId, BlobHash), Instant>,
 }
+
+/// A member's soundboard announcements are relayed at most this often.
+const SOUND_EVERY: Duration = Duration::from_secs(2);
+/// The same clip is announced at most once in this window.
+const SOUND_DEDUPE: Duration = Duration::from_secs(30);
 
 impl State {
     fn room(&mut self, ch: ChannelId) -> Arc<Room> {
@@ -154,15 +166,26 @@ impl Sfu {
                 last_loss: None,
                 ticker: None,
                 closed: false,
+                policers: HashMap::new(),
+                sound_last: HashMap::new(),
+                sound_seen: HashMap::new(),
             }),
         })
     }
+
+    /// The voice room the SFU forwards to `user` (set only by VoiceJoin / VoiceLeave).
+    pub fn voice_of(&self, user: &UserId) -> Option<ChannelId> { self.st.lock().members.get(user).and_then(|m| m.voice) }
+
+    /// A track (tests).
+    #[cfg(test)]
+    pub fn track(&self, id: u16) -> Option<Arc<VideoTrack>> { self.st.lock().tracks.get(&id).cloned() }
 
     /// A member's link came up (or was replaced).
     pub fn add_member(self: &Arc<Self>, user: UserId, short_id: u16, conn: Connection, ctl: CtlTx) {
         let weak = Arc::downgrade(self);
         let fwd = self.tasks.spawn(forward_task(weak.clone(), conn.clone(), user, short_id));
-        let vid = spawn_video_rx(&self.tasks, conn.clone(), Arc::new(Upload { sfu: weak, short_id }), self.pause.clone());
+        let upload = Upload { sfu: weak, short_id, policer: Mutex::new(VideoPolicer::new(Instant::now())) };
+        let vid = spawn_video_rx(&self.tasks, conn.clone(), Arc::new(upload), self.pause.clone());
         let relayed = crate::addr::path_snapshot(&conn).relay;
         let member = Member { short_id, conn, ctl, voice: None, relayed, subs: HashSet::new(), tasks: vec![fwd, vid] };
         let old = {
@@ -362,17 +385,21 @@ impl Sfu {
         }
     }
 
-    /// Forward a batch of datagrams from `from`.
+    /// Forward a batch of datagrams from `from`. Each member's datagrams are policed (size,
+    /// packets and bytes per second) before anything is counted or fanned out.
     fn forward(&self, from: UserId, short_id: u16, pkts: &mut [Bytes]) {
         let now = Instant::now();
         let room = {
             let mut st = self.st.lock();
             let Some(ch) = st.members.get(&from).and_then(|m| m.voice) else { return };
-            for p in pkts.iter() {
-                if let Some((h, _)) = AudioHeader::parse(p)
-                    && track_kind(h.track) == KIND_VOICE
-                    && track_short_id(h.track) == short_id
-                {
+            let st = &mut *st;
+            let policer = st.policers.entry(from).or_insert_with(|| AudioPolicer::new(now));
+            for p in pkts.iter_mut() {
+                if super::wire::voice_track_from(p, short_id).is_none() || !policer.allow(p.len(), now) {
+                    *p = Bytes::new();
+                    continue;
+                }
+                if let Some((h, _)) = AudioHeader::parse(p) {
                     st.uplink.entry(h.track).or_default().audio(h.seq, h.ts, now);
                 }
             }
@@ -380,7 +407,7 @@ impl Sfu {
         };
         for p in pkts.iter_mut() {
             let p = std::mem::take(p);
-            if super::wire::voice_track_from(&p, short_id).is_none() {
+            if p.is_empty() {
                 continue;
             }
             for (u, c, _) in &room.members {
@@ -438,6 +465,25 @@ impl Sfu {
         }
     }
 
+    /// The roster shows rooms as the SFU forwards them: tell the session to rebuild it.
+    fn voice_changed(&self, net: &Inner) {
+        if let Some(s) = net.sessions.lock().get(&self.server) {
+            let _ = s.tx.try_send(crate::session::SessionCmd::StatusChanged);
+        }
+    }
+
+    /// May `member` report on, or ask for keyframes of, `track`? Screen tracks: only a
+    /// subscriber. Voice tracks: only someone in the owner's room.
+    fn may_report(st: &State, member: &UserId, track: u16) -> bool {
+        let Some(m) = st.members.get(member) else { return false };
+        if track_kind(track) == KIND_SCREEN {
+            return m.subs.contains(&track);
+        }
+        let owner = track_short_id(track);
+        let owner_room = if owner == st.my_short { st.local.as_ref().map(|l| l.channel) } else { st.member_by_short(owner).and_then(|o| o.voice) };
+        m.voice.is_some() && m.voice == owner_room
+    }
+
     /// A media control message from a member.
     pub fn on_ctl(self: &Arc<Self>, net: &Inner, member: UserId, short_id: u16, ctl: Ctl) {
         match ctl {
@@ -446,26 +492,42 @@ impl Sfu {
                     tracing::debug!(member = %member.short(), "VoiceJoin for a channel that is not a voice room");
                     return;
                 }
-                let mut st = self.st.lock();
-                if let Some(m) = st.members.get_mut(&member) {
-                    m.voice = Some(channel);
-                    st.rooms.clear();
-                    self.ensure_ticker(&mut st);
+                let changed = {
+                    let mut st = self.st.lock();
+                    let changed = st.members.get_mut(&member).is_some_and(|m| m.voice.replace(channel) != Some(channel));
+                    if st.members.contains_key(&member) {
+                        st.rooms.clear();
+                        self.ensure_ticker(&mut st);
+                    }
+                    changed
+                };
+                if changed {
+                    self.voice_changed(net);
                 }
             }
             Ctl::VoiceLeave => {
-                let mut st = self.st.lock();
-                if let Some(m) = st.members.get_mut(&member) {
-                    m.voice = None;
-                    st.rooms.clear();
-                    st.uplink.remove(&track_id(short_id, KIND_VOICE));
+                let changed = {
+                    let mut st = self.st.lock();
+                    let changed = st.members.get_mut(&member).is_some_and(|m| m.voice.take().is_some());
+                    if changed {
+                        st.rooms.clear();
+                        st.uplink.remove(&track_id(short_id, KIND_VOICE));
+                    }
+                    changed
+                };
+                if changed {
+                    self.voice_changed(net);
                 }
             }
             Ctl::Subscribe { track } if track_kind(track) == KIND_SCREEN => {
                 let found = {
                     let mut st = self.st.lock();
                     let Some(m) = st.members.get_mut(&member) else { return };
-                    m.subs.insert(track);
+                    // Already subscribed: nothing to do (a repeated Subscribe must not
+                    // re-seed the whole GOP cache).
+                    if !m.subs.insert(track) {
+                        return;
+                    }
                     let conn = m.conn.clone();
                     self.ensure_ticker(&mut st);
                     st.tracks.get(&track).cloned().map(|t| (t, conn))
@@ -487,32 +549,52 @@ impl Sfu {
                 }
             }
             Ctl::KeyframeRequest { track } => {
-                let t = self.st.lock().tracks.get(&track).cloned();
+                let t = {
+                    let st = self.st.lock();
+                    if !Self::may_report(&st, &member, track) {
+                        return;
+                    }
+                    st.tracks.get(&track).cloned()
+                };
                 if let Some(t) = t {
                     t.viewer_wants_key(ViewerId::Peer(member));
                 }
             }
             Ctl::ReceiverReport { track, rx, lost, late, jitter_ms } => {
                 let r = Report { rx, lost, late, jitter_ms };
+                let mut st = self.st.lock();
+                if !Self::may_report(&st, &member, track) {
+                    return;
+                }
                 if track_kind(track) == KIND_VOICE && track_short_id(track) != short_id {
-                    merge_worst(&mut self.st.lock().reports, track, r);
+                    merge_worst(&mut st.reports, track, r);
                 } else if track_kind(track) == KIND_SCREEN && lost > 0 {
-                    let t = self.st.lock().tracks.get(&track).cloned();
+                    let t = st.tracks.get(&track).cloned();
+                    drop(st);
                     if let Some(t) = t {
                         t.report_loss();
                     }
                 }
             }
-            Ctl::SoundPlayed { by, clip } if by == member => {
+            Ctl::SoundPlayed { by, clip } if by == member && clip.is_valid() => {
+                let now = Instant::now();
                 let room = {
                     let mut st = self.st.lock();
                     let Some(ch) = st.members.get(&member).and_then(|m| m.voice) else { return };
+                    if st.sound_last.get(&member).is_some_and(|t| now.duration_since(*t) < SOUND_EVERY)
+                        || st.sound_seen.get(&(member, clip.hash)).is_some_and(|t| now.duration_since(*t) < SOUND_DEDUPE)
+                    {
+                        return;
+                    }
+                    st.sound_last.insert(member, now);
+                    st.sound_seen.retain(|_, t| now.duration_since(*t) < SOUND_DEDUPE);
+                    st.sound_seen.insert((member, clip.hash), now);
                     st.room(ch)
                 };
                 let fwd = Ctl::SoundPlayed { by, clip: clip.clone() };
                 for (u, _, tx) in &room.members {
                     if *u != member {
-                        let _ = tx.send(&fwd);
+                        let _ = tx.send_relayed(&fwd);
                     }
                 }
                 if room.local.is_some() {
@@ -631,16 +713,27 @@ fn is_voice_channel(net: &Inner, server: &ServerId, ch: &ChannelId) -> bool {
     net.replica(server).is_some_and(|r| r.lock().state.channels.get(ch).is_some_and(|c| c.kind == ChannelKind::Voice && !c.deleted))
 }
 
-/// Uploads from one member: only its own screen track is accepted.
+/// Uploads from one member: only its own screen track is accepted, and its ingress is
+/// policed (a sharer that ignores `TargetBitrate` cannot push more than the cap to every
+/// viewer).
 struct Upload {
     sfu: Weak<Sfu>,
     short_id: u16,
+    policer: Mutex<VideoPolicer>,
 }
 
 impl VideoSink for Upload {
     fn accept(&self, track: u16) -> bool { track_kind(track) == KIND_SCREEN && track_short_id(track) == self.short_id }
 
     fn frame(&self, track: u16, f: VideoFrame) -> bool {
+        let verdict = self.policer.lock().check(f.data.len(), f.keyframe, Instant::now());
+        if let VideoVerdict::Drop { gap } = verdict {
+            if gap {
+                tracing::debug!(track, "video upload over its budget: dropping to the next keyframe");
+                self.gap(track);
+            }
+            return true;
+        }
         if let Some(t) = self.sfu.upgrade().and_then(|s| s.upload_track(track)) {
             t.push(f);
         }

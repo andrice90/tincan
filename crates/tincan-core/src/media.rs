@@ -197,38 +197,54 @@ pub fn encode_video_frame(f: &VideoFrame) -> Bytes {
     Bytes::from(out)
 }
 
-/// Largest accepted frame on a video stream (a 4K keyframe is well under this).
-pub const MAX_VIDEO_FRAME: usize = 8 * 1024 * 1024;
+/// Largest accepted frame on a video stream. Encoder input is at most 1920 wide, and the
+/// GOP cache holds at most 2 MiB anyway, so a bigger frame is never legitimate.
+pub const MAX_VIDEO_FRAME: usize = 2 * 1024 * 1024;
 
-/// Incremental reader: push stream bytes, pop frames.
+/// Incremental reader: push stream bytes, pop frames. Consumed bytes are dropped lazily
+/// (a read offset, compacted on push), so many small frames cost linear time.
 #[derive(Debug, Default)]
 pub struct VideoFrameReader {
     buf: Vec<u8>,
+    pos: usize,
 }
 
 impl VideoFrameReader {
     /// Empty reader.
     pub fn new() -> Self { Self::default() }
     /// Append bytes read from the stream.
-    pub fn push(&mut self, bytes: &[u8]) { self.buf.extend_from_slice(bytes); }
+    pub fn push(&mut self, bytes: &[u8]) {
+        if self.pos > 0 && self.pos >= self.buf.len() / 2 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        self.buf.extend_from_slice(bytes);
+    }
     /// Bytes buffered but not yet returned as frames.
-    pub fn buffered(&self) -> usize { self.buf.len() }
+    pub fn buffered(&self) -> usize { self.buf.len() - self.pos }
+    /// True while part of a frame is buffered (a frame has started but is not complete).
+    pub fn mid_frame(&self) -> bool { self.buffered() > 0 }
     /// Next complete frame. Returns Err(()) on a malformed or oversized frame (reset the stream).
     #[allow(clippy::should_implement_trait, clippy::result_unit_err)]
     pub fn next(&mut self) -> Result<Option<VideoFrame>, ()> {
-        let Some((len, used)) = get_varint(&self.buf) else { return Ok(None) };
+        let avail = &self.buf[self.pos..];
+        let Some((len, used)) = get_varint(avail) else { return Ok(None) };
         let Ok(len) = usize::try_from(len) else { return Err(()) };
         if !(5..=MAX_VIDEO_FRAME).contains(&len) {
             return Err(());
         }
-        if self.buf.len() < used + len {
+        if avail.len() < used + len {
             return Ok(None);
         }
-        let body = &self.buf[used..used + len];
+        let body = &avail[used..used + len];
         let ts = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
         let keyframe = body[4] & VF_KEYFRAME != 0;
         let data = Bytes::copy_from_slice(&body[5..]);
-        self.buf.drain(..used + len);
+        self.pos += used + len;
+        if self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        }
         Ok(Some(VideoFrame { ts, keyframe, data }))
     }
 }
@@ -420,6 +436,30 @@ mod tests {
         assert_eq!(r.next(), Ok(None));
         r.push(&full[full.len() - 1..]);
         assert!(r.next().unwrap().unwrap().keyframe);
+        // a 3 MiB frame (allowed before) is now refused
+        let mut r = VideoFrameReader::new();
+        let mut b = Vec::new();
+        put_varint(&mut b, 3 * 1024 * 1024);
+        r.push(&b);
+        assert!(r.next().is_err());
+    }
+
+    #[test]
+    fn video_reader_is_linear_in_many_tiny_frames() {
+        // A buffer full of minimal frames used to cost O(n^2) (a drain per frame): 220k
+        // frames took minutes.
+        let one = encode_video_frame(&VideoFrame { ts: 1, keyframe: false, data: Bytes::new() });
+        let all: Vec<u8> = one.iter().copied().cycle().take(one.len() * 220_000).collect();
+        let mut r = VideoFrameReader::new();
+        let t0 = std::time::Instant::now();
+        let mut n = 0usize;
+        r.push(&all);
+        while r.next().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 220_000);
+        assert!(!r.mid_frame());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "took {:?}", t0.elapsed());
     }
 
     #[test]

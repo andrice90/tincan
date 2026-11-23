@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use tincan_core::event::StoredEvent;
 use tincan_core::hlc::Hlc;
 use tincan_core::keys::ServerKeys;
-use tincan_core::state::{Change, ConvState, PendingBuffer, Verdict};
+use tincan_core::state::{Change, ConvState, PendingBuffer, PendingLimits, Verdict};
 use tincan_core::storage::{ConvRecord, Storage};
 use tincan_core::sync::{Heads, SYNC_PAGE_BYTES};
 use tincan_core::wire::Ctl;
@@ -49,9 +49,19 @@ pub(crate) struct Ingested {
     pub verdict: Verdict,
     /// Every event applied and stored, in order (the incoming one first if accepted).
     pub applied: Vec<(StoredEvent, Change)>,
+    /// The incoming event and the stored one are two different events by the same author
+    /// with the same seq (equivocation). Both are signed: a proof.
+    pub conflict: Option<StoredEvent>,
 }
 
+/// A stored own-seq floor further than this above the applied head can only come from a
+/// host that fed us a bogus `your_next_seq`; events signed that far ahead never apply, so
+/// reusing the lower seqs is safe.
+const FLOOR_POISON_GAP: u64 = 1_000_000;
+
 fn floor_key(conv: &ConvId) -> String { format!("net/own_seq/{}", conv.to_hex()) }
+
+fn equiv_key(conv: &ConvId, author: &UserId) -> String { format!("net/equiv/{}/{}", conv.to_hex(), author.to_hex()) }
 
 fn load_floor(storage: &dyn Storage, conv: &ConvId) -> u64 {
     match storage.get_kv(&floor_key(conv)) {
@@ -73,7 +83,8 @@ impl Replica {
     pub fn new(storage: &dyn Storage, record: ConvRecord, state: ConvState) -> Self {
         let keys = record.server_secret.map(|s| ServerKeys::derive(&s, &record.id));
         let own_floor = load_floor(storage, &record.id);
-        Self { record, keys, state, pending: PendingBuffer::new(), own_floor }
+        let limits = if record.is_dm { PendingLimits::dm() } else { PendingLimits::network() };
+        Self { record, keys, state, pending: PendingBuffer::with_limits(limits), own_floor }
     }
 
     /// Rebuild a replica from every stored event of `record`'s conversation.
@@ -85,13 +96,34 @@ impl Replica {
         }
         let parties = if record.is_dm { record.peer.map(|p| (*me, p)) } else { None };
         let state = ConvState::rebuild(conv, parties, events, now_ms());
-        Ok(Self::new(storage, record, state))
+        let mut r = Self::new(storage, record, state);
+        r.repair_floor(storage, me);
+        Ok(r)
+    }
+
+    /// A floor poisoned by a host's bogus seq hint (far above the head) is reset to the head.
+    fn repair_floor(&mut self, storage: &dyn Storage, me: &UserId) {
+        let head = self.state.head(me);
+        if self.own_floor > self.state.next_seq(me).saturating_add(FLOOR_POISON_GAP) {
+            tracing::warn!(conv = %self.record.id.short(), floor = self.own_floor, head, "own seq floor far above the head: reset");
+            self.own_floor = head;
+            if let Err(e) = storage.set_kv(&floor_key(&self.record.id), &head.to_le_bytes()) {
+                tracing::error!(error = %e, "persisting own seq floor failed");
+            }
+        }
     }
 
     /// Validate, apply and persist one event (buffering it if early), plus everything it
-    /// unblocked. Storage failures are logged; the state still advances.
+    /// unblocked. Storage failures are logged; the state still advances. A second event for
+    /// an (author, seq) already stored is reported in `conflict` (and its proof kept in kv).
     pub fn ingest(&mut self, storage: &dyn Storage, hlc: &Hlc, ev: StoredEvent) -> Ingested {
+        // Only an event at or below its author's head can be a second version of a stored one.
+        let incoming = (ev.event.seq <= self.state.head(&ev.event.author)).then(|| ev.clone());
         let (verdict, applied) = self.pending.ingest(&mut self.state, ev, now_ms());
+        let conflict = match (&verdict, &incoming) {
+            (Verdict::Stale, Some(inc)) => self.find_conflict(storage, inc),
+            _ => None,
+        };
         for (e, change) in &applied {
             hlc.observe(e.event.hlc);
             if let Err(err) = storage.insert_event(e) {
@@ -103,7 +135,26 @@ impl Replica {
                 tracing::error!(error = %err, "marking event deleted failed");
             }
         }
-        Ingested { verdict, applied }
+        Ingested { verdict, applied, conflict }
+    }
+
+    /// `ev` was Stale: is a different event stored for its (author, seq)? Then keep both as
+    /// a proof (first proof per author only) and return the stored one.
+    fn find_conflict(&self, storage: &dyn Storage, ev: &StoredEvent) -> Option<StoredEvent> {
+        if matches!(storage.event(&ev.id), Ok(Some(_))) {
+            return None;
+        }
+        let (author, seq) = (ev.event.author, ev.event.seq);
+        let stored = storage.events_range(&self.state.conv, &author, seq, seq).ok()?.into_iter().find(|e| e.id != ev.id)?;
+        let key = equiv_key(&self.state.conv, &author);
+        if matches!(storage.get_kv(&key), Ok(None))
+            && let Ok(bytes) = postcard::to_stdvec(&(&stored.signed, &ev.signed))
+            && let Err(e) = storage.set_kv(&key, &bytes)
+        {
+            tracing::warn!(error = %e, "persisting an equivocation proof failed");
+        }
+        tracing::warn!(conv = %self.state.conv.short(), author = %author.short(), seq, "author signed two different events with the same seq");
+        Some(stored)
     }
 
     /// The seq my next event must carry: past both the applied head and every seq I signed.

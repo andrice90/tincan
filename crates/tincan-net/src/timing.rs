@@ -60,6 +60,16 @@ pub(crate) struct Timings {
     pub who_has: Duration,
     /// A call rings this long before it ends unanswered.
     pub call_ring: Duration,
+    /// A host handles at most one partition-merge comparison per peer this often.
+    pub compare_cooldown: Duration,
+    /// How often a member re-attests to its host (`Ctl::Attest`).
+    pub attest_every: Duration,
+    /// Minimum interval between roster broadcasts (more after many changes in a minute).
+    pub roster_min_interval: Duration,
+    /// A published event the host refused is re-sent this often (and after every Welcome).
+    pub publish_park_retry: Duration,
+    /// A joiner must send its Hello within this after JoinAccepted.
+    pub joiner_hello: Duration,
 }
 
 impl Default for Timings {
@@ -97,6 +107,11 @@ impl Default for Timings {
             proactive_interval: Duration::from_millis(election::PROACTIVE_MIN_INTERVAL_MS),
             who_has: Duration::from_secs(3),
             call_ring: Duration::from_secs(45),
+            compare_cooldown: Duration::from_secs(60),
+            attest_every: Duration::from_millis(election::ATTEST_EVERY_MS),
+            roster_min_interval: Duration::from_secs(1),
+            publish_park_retry: Duration::from_secs(30),
+            joiner_hello: Duration::from_secs(10),
         }
     }
 }

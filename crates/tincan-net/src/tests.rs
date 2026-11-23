@@ -33,6 +33,9 @@ pub(super) fn fast() -> Timings {
         merge_timeout: Duration::from_secs(3),
         failover_redial: Duration::from_millis(300),
         dm_retry: vec![Duration::from_millis(500), Duration::from_secs(1)],
+        compare_cooldown: Duration::from_secs(1),
+        roster_min_interval: Duration::from_millis(200),
+        publish_park_retry: Duration::from_millis(500),
         ..Timings::default()
     }
 }
@@ -440,10 +443,9 @@ async fn ephemeral_state_restored_after_migration() {
     let s1 = succ[0];
     // The non-successor member carries the ephemeral state, so it must survive the move.
     let (holder, asker) = if s1 == b.net.me() { (&c, &b) } else { (&b, &c) };
-    holder.net.set_status(|s| {
-        s.voice = Some(voice);
-        s.muted = true;
-    });
+    // The roster's room comes from what the host's SFU forwards (VoiceJoin), mute from Status.
+    let _session = within("voice_join", Duration::from_secs(5), holder.net.voice_join(server, voice)).await.expect("voice_join");
+    holder.net.set_status(|s| s.muted = true);
     let blob = BlobHash([9; 32]);
     holder.net.have_add(blob);
     until("host sees voice", Duration::from_secs(5), || {

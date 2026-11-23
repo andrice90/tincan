@@ -2,12 +2,13 @@
 //! drop policy, GOP cache), soundboard announcements and 1:1 calls. Relays disabled, loopback.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
 use tincan_core::event::{Body, ChannelKind};
 use tincan_core::media::{AudioHeader, KIND_SCREEN, KIND_VOICE, VideoFrame, track_id};
-use tincan_core::wire::ClipInfo;
+use tincan_core::wire::{ClipInfo, Ctl};
 use tincan_core::{BlobHash, ChannelId, ServerId, UserId};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
@@ -697,6 +698,204 @@ async fn voice_resumes_after_host_crash() {
     assert!(c.net.voice_info().is_some_and(|v| v.connected));
     pb.abort();
     for n in [b, c] {
+        n.net.shutdown().await;
+    }
+}
+
+/// N11: the roster's room is what the SFU forwards (VoiceJoin / VoiceLeave), not the room a
+/// member claims in its Status: no invisible listeners, no ghost participants.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n11_roster_rooms_follow_the_sfu() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    let c = node("carol", fast()).await;
+    wire(&[&a, &b, &c]);
+    let server = cluster(&a, &[&b, &c]).await;
+    let lounge = voice_channel(&a, &server);
+    let (bid, cid) = (b.net.me(), c.net.me());
+    let room_of = |u: UserId| a.net.roster(&server).and_then(|r| r.online.iter().find(|e| e.user == u).map(|e| e.voice));
+    // Bob joins the SFU room but keeps his Status empty: he still shows in the room.
+    assert!(b.net.send_ctl_to_host(&server, Ctl::VoiceJoin { channel: lounge }).await);
+    until("listener visible in the roster", Duration::from_secs(5), || room_of(bid) == Some(Some(lounge))).await;
+    // Carol claims the room in her Status without joining: no ghost.
+    c.net.set_status(|s| s.voice = Some(lounge));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(room_of(cid), Some(None), "a Status claim alone does not put anyone in a room");
+    assert!(b.net.send_ctl_to_host(&server, Ctl::VoiceLeave).await);
+    until("left", Duration::from_secs(5), || room_of(bid) == Some(None)).await;
+    for n in [a, b, c] {
+        n.net.shutdown().await;
+    }
+}
+
+/// N5 + S2: repeated Subscribe / KeyframeRequest from a viewer cannot re-seed the GOP cache
+/// over and over; keyframe requests and receiver reports from members that do not watch the
+/// track (or are not in its owner's room) are ignored; real viewers and room members still
+/// get through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n5_s2_media_control_is_bounded_and_scoped() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    let c = node("carol", fast()).await;
+    let d = node("dave", fast()).await;
+    wire(&[&a, &b, &c, &d]);
+    let server = cluster(&a, &[&b, &c, &d]).await;
+    let lounge = voice_channel(&a, &server);
+    let _sb = join_voice(&b, server, lounge).await;
+    let mut sc = join_voice(&c, server, lounge).await;
+    connected(&[&b, &c]).await;
+    let (tb, frames) = b.net.share_start().unwrap();
+    // One keyframe, then deltas, and a keyframe whenever one is requested.
+    let sharer = spawn_sharer(&b.net, frames, tb, 100_000, 2000, true);
+    c.net.subscribe_track(tb);
+    let got = collect_frames(&mut sc.video_in, tb, 5, Duration::from_secs(5)).await;
+    assert!(!got.is_empty(), "the viewer gets video");
+    let sfu = a.net.inner().media.sfu_for_test(&server).expect("host SFU");
+    let track = sfu.track(tb).expect("track at the host");
+    let seeds0 = track.seeds.load(Ordering::Relaxed);
+    for _ in 0..30 {
+        let _ = c.net.send_ctl_to_host(&server, Ctl::Subscribe { track: tb }).await;
+        let _ = c.net.send_ctl_to_host(&server, Ctl::KeyframeRequest { track: tb }).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let seeds = track.seeds.load(Ordering::Relaxed) - seeds0;
+    assert!(seeds <= 2, "{seeds} cache re-seeds for 30 Subscribe + 30 KeyframeRequest");
+    assert_eq!(track.remote_viewers(), 1, "one writer per viewer");
+    // Unsubscribe + Subscribe toggling cannot re-send the cache each time either.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let seeds1 = track.seeds.load(Ordering::Relaxed);
+    for _ in 0..20 {
+        let _ = c.net.send_ctl_to_host(&server, Ctl::Unsubscribe { track: tb }).await;
+        let _ = c.net.send_ctl_to_host(&server, Ctl::Subscribe { track: tb }).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let toggled = track.seeds.load(Ordering::Relaxed) - seeds1;
+    assert!(toggled <= 2, "{toggled} cache re-seeds for 20 Unsubscribe/Subscribe toggles");
+    until("still one viewer", Duration::from_secs(3), || track.remote_viewers() == 1).await;
+    // Nobody watches now: whatever asks the sharer for a keyframe below is Dave, who never
+    // subscribed, and he must not get through.
+    c.net.unsubscribe_track(tb);
+    until("viewer gone", Duration::from_secs(5), || track.remote_viewers() == 0).await;
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    let asked0 = track.keyframes_asked.load(Ordering::Relaxed);
+    for _ in 0..12 {
+        let _ = d.net.send_ctl_to_host(&server, Ctl::KeyframeRequest { track: tb }).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let asked = track.keyframes_asked.load(Ordering::Relaxed) - asked0;
+    assert_eq!(asked, 0, "keyframe requests from a non-viewer went upstream");
+    // A real viewer's request still gets a keyframe (a re-seed or an upstream request).
+    c.net.subscribe_track(tb);
+    until("viewer back", Duration::from_secs(5), || track.remote_viewers() == 1).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let served = || track.seeds.load(Ordering::Relaxed) + track.keyframes_asked.load(Ordering::Relaxed);
+    let before = served();
+    let _ = c.net.send_ctl_to_host(&server, Ctl::KeyframeRequest { track: tb }).await;
+    until("viewer's keyframe request served", Duration::from_secs(3), || served() > before).await;
+    // Loss reports about Bob's voice: Dave is in no room and is ignored; Carol counts.
+    let tbv = voice_track(&b);
+    let mut b_ev = b.net.subscribe();
+    for _ in 0..10 {
+        let _ = d.net.send_ctl_to_host(&server, Ctl::ReceiverReport { track: tbv, rx: 10, lost: 90, late: 0, jitter_ms: 5 }).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let mut lossy = 0;
+    while let Ok(e) = b_ev.try_recv() {
+        if matches!(e, NetEvent::LossReport { pct } if pct > 50) {
+            lossy += 1;
+        }
+    }
+    assert_eq!(lossy, 0, "an out-of-room member's loss reports reached the speaker");
+    for _ in 0..3 {
+        let _ = c.net.send_ctl_to_host(&server, Ctl::ReceiverReport { track: tbv, rx: 10, lost: 90, late: 0, jitter_ms: 5 }).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    next_event(&mut b_ev, "a room member's loss report", Duration::from_secs(5), |e| match e {
+        NetEvent::LossReport { pct } if *pct > 50 => Some(()),
+        _ => None,
+    })
+    .await;
+    sharer.abort();
+    for n in [a, b, c, d] {
+        n.net.shutdown().await;
+    }
+}
+
+/// N19: soundboard announcements are validated and rate limited at the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n19_sound_played_flood_is_limited() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    let c = node("carol", fast()).await;
+    wire(&[&a, &b, &c]);
+    let server = cluster(&a, &[&b, &c]).await;
+    let lounge = voice_channel(&a, &server);
+    let _sb = join_voice(&b, server, lounge).await;
+    let _sc = join_voice(&c, server, lounge).await;
+    connected(&[&b, &c]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut c_ev = c.net.subscribe();
+    let bid = b.net.me();
+    let bad = ClipInfo { hash: BlobHash([200; 32]), name: "huge".into(), size: u64::MAX, duration_ms: u32::MAX };
+    let _ = b.net.send_ctl_to_host(&server, Ctl::SoundPlayed { by: bid, clip: bad }).await;
+    for i in 0..40u8 {
+        let clip = ClipInfo { hash: BlobHash([i; 32]), name: format!("clip {i}"), size: 1000, duration_ms: 500 };
+        let _ = b.net.send_ctl_to_host(&server, Ctl::SoundPlayed { by: bid, clip }).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut heard = Vec::new();
+    while let Ok(e) = c_ev.try_recv() {
+        if let NetEvent::SoundPlayed { clip, .. } = e {
+            heard.push(clip);
+        }
+    }
+    assert!(!heard.is_empty() && heard.len() <= 2, "{} announcements relayed", heard.len());
+    assert!(heard.iter().all(|c| c.is_valid()));
+    for n in [a, b, c] {
+        n.net.shutdown().await;
+    }
+}
+
+/// N6: a member flooding audio datagrams is cut to a voice-sized budget before fan-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n6_audio_flood_is_policed_at_the_sfu() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    let c = node("carol", fast()).await;
+    wire(&[&a, &b, &c]);
+    let server = cluster(&a, &[&b, &c]).await;
+    let lounge = voice_channel(&a, &server);
+    let _sb = join_voice(&b, server, lounge).await;
+    let mut sc = join_voice(&c, server, lounge).await;
+    connected(&[&b, &c]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let tb = voice_track(&b);
+    let (_, conn) = b.net.host_connection(&server).expect("host connection");
+    let counter = tokio::spawn(async move {
+        let mut n = 0usize;
+        let end = Instant::now() + Duration::from_millis(1500);
+        while let Ok(Some(p)) = tokio::time::timeout_at(end, sc.audio_in.recv()).await {
+            if AudioHeader::parse(&p).is_some_and(|(h, _)| h.track == tb) {
+                n += 1;
+            }
+        }
+        n
+    });
+    let t0 = Instant::now();
+    let mut seq = 0u16;
+    while t0.elapsed() < Duration::from_secs(1) {
+        for _ in 0..50 {
+            let pkt = AudioHeader { track: tb, seq, ts: u32::from(seq) * 960, ..AudioHeader::default() }.packet(&[0u8; 1188]);
+            let _ = conn.send_datagram(pkt);
+            seq = seq.wrapping_add(1);
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let got = counter.await.unwrap();
+    eprintln!("sent {seq} flood datagrams, the room member got {got}");
+    assert!(got <= 200, "{got} flood datagrams forwarded");
+    for n in [a, b, c] {
         n.net.shutdown().await;
     }
 }

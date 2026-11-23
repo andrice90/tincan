@@ -108,6 +108,10 @@ pub(crate) enum VoiceCmd {
     Stop(Option<oneshot::Sender<()>>),
 }
 
+/// Commands that come from the network (`FromPeer`, `NeedKeyframe`) wait in a bounded queue
+/// and are dropped when it is full; the app's own commands are never dropped.
+const REMOTE_CMD_QUEUE: usize = 256;
+
 /// Handle to a running session.
 pub(crate) struct VoiceHandle {
     /// What it is.
@@ -116,6 +120,8 @@ pub(crate) struct VoiceHandle {
     pub conv: ConvId,
     /// Commands.
     pub cmd: mpsc::UnboundedSender<VoiceCmd>,
+    /// Commands sourced from the network (bounded).
+    pub remote: mpsc::Sender<VoiceCmd>,
     /// Current state.
     pub info: Arc<Mutex<VoiceInfo>>,
 }
@@ -123,6 +129,9 @@ pub(crate) struct VoiceHandle {
 impl VoiceHandle {
     /// Send a command (the session may already be gone).
     pub fn send(&self, c: VoiceCmd) { let _ = self.cmd.send(c); }
+
+    /// Queue a command that came from the network; dropped when the queue is full.
+    pub fn send_remote(&self, c: VoiceCmd) { let _ = self.remote.try_send(c); }
 
     /// Stop and wait (briefly) until it left.
     pub async fn stop(&self) {
@@ -139,6 +148,7 @@ pub(crate) fn spawn(net: &Arc<Inner>, kind: VoiceKind, conv: ConvId, short_id: u
     let (audio_in_tx, audio_in) = mpsc::channel(AUDIO_IN_QUEUE);
     let (video_tx, video_in) = mpsc::channel(VIDEO_IN_QUEUE);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (remote_tx, remote_rx) = mpsc::channel(REMOTE_CMD_QUEUE);
     let local_track = track_id(short_id, KIND_VOICE);
     let epoch_byte = (epoch & 0xff) as u8;
     let (channel, peer) = match kind {
@@ -153,7 +163,7 @@ pub(crate) fn spawn(net: &Arc<Inner>, kind: VoiceKind, conv: ConvId, short_id: u
         kind,
         conv,
         call_id,
-        cmd_tx: cmd_tx.clone(),
+        remote_tx: remote_tx.clone(),
         audio_in: audio_in_tx,
         video_in: VideoOut::new(video_tx),
         info: info.clone(),
@@ -171,9 +181,9 @@ pub(crate) fn spawn(net: &Arc<Inner>, kind: VoiceKind, conv: ConvId, short_id: u
         pause: net.media.pause(),
         report_at: None,
     };
-    net.tasks.spawn(actor.run(cmd_rx, audio_out_rx));
+    net.tasks.spawn(actor.run(cmd_rx, remote_rx, audio_out_rx));
     let session = MediaSession { conv, local_track, epoch: epoch_byte, audio_out, audio_in, video_in };
-    (VoiceHandle { kind, conv, cmd: cmd_tx, info }, session)
+    (VoiceHandle { kind, conv, cmd: cmd_tx, remote: remote_tx, info }, session)
 }
 
 struct Share {
@@ -188,7 +198,7 @@ struct Voice {
     kind: VoiceKind,
     conv: ConvId,
     call_id: u64,
-    cmd_tx: mpsc::UnboundedSender<VoiceCmd>,
+    remote_tx: mpsc::Sender<VoiceCmd>,
     audio_in: mpsc::Sender<Bytes>,
     video_in: VideoOut,
     info: Arc<Mutex<VoiceInfo>>,
@@ -222,11 +232,16 @@ async fn sleep_opt(at: Option<Instant>) {
 }
 
 impl Voice {
-    async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<VoiceCmd>, mut audio_out: mpsc::Receiver<Bytes>) {
+    async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<VoiceCmd>, mut remote_rx: mpsc::Receiver<VoiceCmd>, mut audio_out: mpsc::Receiver<Bytes>) {
         let mut audio_open = true;
         loop {
             tokio::select! {
                 biased;
+                Some(c) = remote_rx.recv(), if cmd_rx.is_empty() => match c {
+                    VoiceCmd::FromPeer(ctl) => self.on_peer_ctl(ctl),
+                    VoiceCmd::NeedKeyframe(t) => self.need_keyframe(t),
+                    _ => {}
+                },
                 c = cmd_rx.recv() => match c {
                     None => {
                         self.leave();
@@ -337,7 +352,7 @@ impl Voice {
                 let (short_id, epoch) = (*short_id, *epoch);
                 self.set_ids(short_id, epoch);
                 self.rx_tasks.push(self.tasks.spawn(recv::audio_rx(conn.clone(), self.own_voice.clone(), self.audio_in.clone(), self.stats.clone())));
-                let sink = Arc::new(SessionSink { video_in: self.video_in.clone(), subs: self.subs.clone(), stats: self.stats.clone(), cmd: self.cmd_tx.clone() });
+                let sink = Arc::new(SessionSink { video_in: self.video_in.clone(), subs: self.subs.clone(), stats: self.stats.clone(), cmd: self.remote_tx.clone() });
                 self.rx_tasks.push(spawn_video_rx(&self.tasks, conn.clone(), sink, self.pause.clone()));
                 if let VoiceKind::Room { channel, .. } = self.kind {
                     let _ = ctl.send(&Ctl::VoiceJoin { channel });
@@ -501,12 +516,13 @@ impl Voice {
                 }
             }
             Ctl::SoundPlayed { by, clip } => {
-                if by != self.me {
+                if by != self.me && clip.is_valid() && self.may_have_played(&by) {
                     self.emit(NetEvent::SoundPlayed { conv: self.conv, by, clip });
                 }
             }
             Ctl::Subscribe { track } if in_call => {
-                if track == track_id(self.short_id, KIND_SCREEN) {
+                // A repeated Subscribe changes nothing (it must not re-seed the cache).
+                if track == track_id(self.short_id, KIND_SCREEN) && !self.peer_watching {
                     self.peer_watching = true;
                     if let (Transport::Remote { conn, peer, .. }, Some(s)) = (&self.transport, &self.share) {
                         s.track.add_remote(*peer, conn.clone());
@@ -522,6 +538,20 @@ impl Voice {
                 }
             }
             other => tracing::trace!(?other, "voice: ignoring control message"),
+        }
+    }
+
+    /// Could `by` really have played a clip here? In a call only the peer; in a room only a
+    /// current member that the host lists as online (the host relays, it could name anyone).
+    fn may_have_played(&self, by: &UserId) -> bool {
+        match self.kind {
+            VoiceKind::Call { peer } => *by == peer,
+            VoiceKind::Room { server, .. } => {
+                let Some(net) = self.net() else { return false };
+                let member = net.replica(&server).is_some_and(|r| r.lock().state.is_member(by));
+                let online = net.sessions.lock().get(&server).is_some_and(|s| s.shared.roster.lock().as_ref().is_some_and(|r| r.online.iter().any(|e| e.user == *by)));
+                member && online
+            }
         }
     }
 
@@ -661,7 +691,7 @@ struct SessionSink {
     video_in: VideoOut,
     subs: Arc<Mutex<HashSet<u16>>>,
     stats: Arc<RxStats>,
-    cmd: mpsc::UnboundedSender<VoiceCmd>,
+    cmd: mpsc::Sender<VoiceCmd>,
 }
 
 impl VideoSink for SessionSink {
@@ -686,6 +716,6 @@ impl VideoSink for SessionSink {
 
     fn gap(&self, track: u16) {
         self.stats.with(track, |t| t.lost(1));
-        let _ = self.cmd.send(VoiceCmd::NeedKeyframe(track));
+        let _ = self.cmd.try_send(VoiceCmd::NeedKeyframe(track));
     }
 }

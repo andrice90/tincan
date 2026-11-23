@@ -146,6 +146,10 @@ impl CtlTx {
             None => false,
         }
     }
+
+    /// Queue an ephemeral frame relayed from someone else (`SoundPlayed`): only while the
+    /// queue is less than half full, so relayed chatter never crowds out session frames.
+    pub fn send_relayed(&self, ctl: &Ctl) -> bool { self.0.capacity() > crate::link::LIVE_QUEUE / 2 && self.send(ctl) }
 }
 
 #[cfg(test)]

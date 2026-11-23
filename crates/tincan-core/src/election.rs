@@ -168,9 +168,165 @@ pub struct HostSide {
 /// Winner = max by (connected, epoch, score, then LOWER UserId). Returns true if `a` wins.
 /// Antisymmetric: merge_winner(a, b) == !merge_winner(b, a) when a.host != b.host.
 /// Returns false for two sides with the same host (nobody wins against itself).
+///
+/// This trusts self-reported `connected` and `score`; tincan-net uses
+/// [`merge_winner_attested`] instead.
 pub fn merge_winner(a: &HostSide, b: &HostSide) -> bool {
     let key = |s: &HostSide| (s.connected, s.epoch, s.score, Reverse(s.host));
     key(a) > key(b)
+}
+
+/// Partition merge on verified inputs only: max by (connected, epoch, then LOWER UserId),
+/// where `connected` must be the number of verified member attestations
+/// ([`count_attests`]). `score` is self-reported and ignored. Antisymmetric like
+/// [`merge_winner`].
+pub fn merge_winner_attested(a: &HostSide, b: &HostSide) -> bool {
+    let key = |s: &HostSide| (s.connected, s.epoch, Reverse(s.host));
+    key(a) > key(b)
+}
+
+/// May a host that lost the merge comparison actually hand its members over?
+///
+/// Only when the peer proved at least as many members (`their_verified`) as this host has
+/// connected right now (`my_links`, the peer excluded). A solo host (`my_links == 0`) always
+/// may (nobody is moved). On equal numbers the shared (epoch, id) key decides, so two
+/// populated partitions of the same size still merge. A host never moves its members to a
+/// peer that proved fewer.
+pub fn may_yield(my_links: u32, their_verified: u32) -> bool { their_verified >= my_links }
+
+/// Guard band below `u64::MAX` that no epoch may enter (see [`next_epoch`], [`sane_epoch`]).
+pub const MAX_EPOCH_JUMP: u64 = 1_000_000;
+
+/// Constant part of the epoch ceiling ([`epoch_ceiling`]). Honest epochs grow by one per
+/// migration and stay far below it.
+pub const EPOCH_SLACK: u64 = 1_000_000;
+
+/// Clock skew allowed when checking a peer's epoch against the ceiling (seconds of ceiling).
+pub const EPOCH_SKEW: u64 = 300;
+
+/// The highest epoch anyone may claim at `now_ms`: one epoch per second of unix time plus
+/// [`EPOCH_SLACK`]. Every node computes the same value (up to clock skew) without any history,
+/// so a fresh joiner or a member that was offline for months accepts the live host, and
+/// `u64` can never run out. Pushing the epoch up gains nothing: everyone accepts any epoch
+/// below the ceiling.
+pub fn epoch_ceiling(now_ms: u64) -> u64 { (now_ms / 1000).saturating_add(EPOCH_SLACK) }
+
+/// Is a peer's claimed `epoch` plausible at `now_ms` (at most the ceiling, plus
+/// [`EPOCH_SKEW`] for clocks that are behind the claimer's)?
+pub fn epoch_plausible(epoch: u64, now_ms: u64) -> bool { epoch <= epoch_ceiling(now_ms).saturating_add(EPOCH_SKEW) }
+
+/// May I claim `epoch` now so that my members (whose clocks may be up to [`EPOCH_SKEW`]
+/// behind mine) accept it? Used when a merge win would claim above a peer's epoch.
+pub fn epoch_claimable(epoch: u64, now_ms: u64) -> bool { epoch <= epoch_ceiling(now_ms) }
+
+/// The epoch to claim after `seen`, or None when that would overflow (never claim then).
+/// Epochs this close to `u64::MAX` are treated as corrupt by [`sane_epoch`].
+pub fn next_epoch(seen: u64) -> Option<u64> { seen.checked_add(1).filter(|e| *e <= u64::MAX - MAX_EPOCH_JUMP) }
+
+/// A persisted epoch, or 0 if it is above what anyone may claim at `now_ms` (it can only come
+/// from a poisoned claim or a clock that was far ahead): starting over from 0 is safe, members
+/// accept a lower epoch from a host they dial.
+pub fn sane_epoch(epoch: u64, now_ms: u64) -> u64 {
+    if epoch > u64::MAX - MAX_EPOCH_JUMP || !epoch_plausible(epoch, now_ms) { 0 } else { epoch }
+}
+
+const ATTEST_CONTEXT: &[u8] = b"tincan-attest1";
+
+/// Most attestations carried by one `Ctl::HostCompare2`.
+pub const MAX_ATTESTS: usize = 64;
+/// How often a member re-attests to its host.
+pub const ATTEST_EVERY_MS: u64 = 60_000;
+/// A host keeps (and counts) a member's attestation for this long after it arrived (host
+/// clock, so the member's clock does not matter).
+pub const ATTEST_KEEP_MS: u64 = 120_000;
+/// Allowed clock skew between a member and a host that checks its attestation (rendezvous
+/// and joins allow 5 minutes; attestations a little more).
+pub const ATTEST_SKEW_MS: u64 = 600_000;
+/// Oldest `issued_ms` (by the checking host's clock) an attestation is counted with: two
+/// re-attest periods plus the allowed skew.
+pub const ATTEST_ACCEPT_MS: u64 = ATTEST_SKEW_MS + 2 * ATTEST_EVERY_MS;
+
+/// "I am connected to `host` of `server` at `epoch`", signed by the member.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attestation {
+    /// The server.
+    pub server: ServerId,
+    /// The host the member is connected to.
+    pub host: UserId,
+    /// That host's claim epoch.
+    pub epoch: u64,
+    /// The attesting member (signer).
+    pub member: UserId,
+    /// When it was issued (unix ms, member clock).
+    pub issued_ms: u64,
+}
+
+/// An `Attestation` signed by `att.member`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedAttestation {
+    /// The attestation.
+    pub att: Attestation,
+    /// ed25519 by att.member over "tincan-attest1" || postcard(att)
+    pub sig: Sig64,
+}
+
+impl SignedAttestation {
+    /// Sign `att`. `CoreError::BadKey` if `att.member != identity.user()`.
+    pub fn sign(identity: &Identity, att: Attestation) -> Result<Self> {
+        if att.member != identity.user() {
+            return Err(CoreError::BadKey);
+        }
+        let msg = attest_message(&att)?;
+        Ok(Self { sig: identity.sign(&msg), att })
+    }
+    /// Check the signature by `att.member`.
+    pub fn verify(&self) -> Result<()> {
+        let msg = attest_message(&self.att)?;
+        verify(&self.att.member, &msg, &self.sig)
+    }
+    /// Is this attestation fresh at `now_ms` (issued at most `max_age_ms` ago, and not more
+    /// than the allowed skew in the future)?
+    pub fn fresh(&self, now_ms: u64, max_age_ms: u64) -> bool {
+        self.att.issued_ms <= now_ms.saturating_add(ATTEST_SKEW_MS) && now_ms.saturating_sub(self.att.issued_ms) <= max_age_ms
+    }
+}
+
+fn attest_message(att: &Attestation) -> Result<Vec<u8>> {
+    let bytes = postcard::to_stdvec(att)?;
+    let mut m = Vec::with_capacity(ATTEST_CONTEXT.len() + bytes.len());
+    m.extend_from_slice(ATTEST_CONTEXT);
+    m.extend_from_slice(&bytes);
+    Ok(m)
+}
+
+/// Count the distinct members that vouch for `host` of `server` at `epoch`: only the first
+/// `MAX_ATTESTS` entries are looked at, and only attestations that name exactly that
+/// server, host and epoch, are fresh (`max_age_ms`), come from an `eligible` member other
+/// than the host itself, appear once, and carry a valid signature count.
+pub fn count_attests(
+    attests: &[SignedAttestation],
+    server: &ServerId,
+    host: &UserId,
+    epoch: u64,
+    now_ms: u64,
+    max_age_ms: u64,
+    mut eligible: impl FnMut(&UserId) -> bool,
+) -> u32 {
+    let mut seen: Vec<UserId> = Vec::new();
+    for a in attests.iter().take(MAX_ATTESTS) {
+        let att = &a.att;
+        if att.server != *server || att.host != *host || att.epoch != epoch || att.member == *host {
+            continue;
+        }
+        if !a.fresh(now_ms, max_age_ms) || seen.contains(&att.member) || !eligible(&att.member) {
+            continue;
+        }
+        if a.verify().is_err() {
+            continue;
+        }
+        seen.push(att.member);
+    }
+    u32::try_from(seen.len()).unwrap_or(u32::MAX)
 }
 
 /// Proactive migration hysteresis (all must hold): no active voice room, best candidate's
@@ -373,6 +529,117 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn attested_merge_ignores_score_and_is_antisymmetric() {
+        let side = |h: u8, connected, epoch, score| HostSide { host: UserId([h; 32]), epoch, connected, score };
+        // A huge self-reported score does not help.
+        assert!(!merge_winner_attested(&side(9, 0, 1, 9999), &side(1, 0, 1, 0)));
+        assert!(merge_winner_attested(&side(9, 1, 1, 0), &side(1, 0, 9, 9999)));
+        assert!(merge_winner_attested(&side(9, 1, 2, 0), &side(1, 1, 1, 0)));
+        assert!(merge_winner_attested(&side(1, 1, 1, 0), &side(9, 1, 1, 0)));
+        for a in 1..=3u8 {
+            for b in 1..=3u8 {
+                for (ca, cb) in [(0, 0), (1, 0), (2, 2)] {
+                    for (ea, eb) in [(1, 1), (2, 1)] {
+                        let (x, y) = (side(a, ca, ea, 7), side(b, cb, eb, 3));
+                        if a != b {
+                            assert_eq!(merge_winner_attested(&x, &y), !merge_winner_attested(&y, &x));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yield_rule() {
+        // A solo host may always yield (nobody is moved).
+        assert!(may_yield(0, 0));
+        assert!(may_yield(0, 5));
+        // A host with members yields to at least as many proven members (a tie goes to the
+        // shared epoch/id key), never to fewer.
+        assert!(!may_yield(3, 0));
+        assert!(!may_yield(3, 2));
+        assert!(may_yield(3, 3));
+        assert!(may_yield(3, 4));
+        assert!(may_yield(1, 1));
+    }
+
+    #[test]
+    fn epoch_bounds() {
+        let now = 1_800_000_000_000u64;
+        let ceiling = now / 1000 + EPOCH_SLACK;
+        assert_eq!(epoch_ceiling(now), ceiling);
+        // The ceiling needs no history: a fresh joiner accepts any honest epoch.
+        assert!(epoch_plausible(5003, now));
+        assert!(epoch_plausible(ceiling + EPOCH_SKEW, now));
+        assert!(!epoch_plausible(ceiling + EPOCH_SKEW + 1, now));
+        assert!(!epoch_plausible(u64::MAX, now));
+        assert!(!epoch_plausible(u64::MAX, u64::MAX), "no clock lets an epoch reach the guard band");
+        assert!(epoch_claimable(ceiling, now));
+        assert!(!epoch_claimable(ceiling + 1, now));
+        // It grows with time, so a pushed epoch is accepted by everyone soon after.
+        assert!(epoch_plausible(ceiling + EPOCH_SKEW + 10, now + 10_000));
+        // Even a clock at 0 accepts every honest epoch.
+        assert!(epoch_plausible(100_000, 0));
+        assert_eq!(next_epoch(1), Some(2));
+        assert_eq!(next_epoch(u64::MAX), None);
+        assert_eq!(next_epoch(u64::MAX - MAX_EPOCH_JUMP), None);
+        assert_eq!(sane_epoch(7, now), 7);
+        assert_eq!(sane_epoch(u64::MAX, now), 0);
+        assert_eq!(sane_epoch(ceiling + EPOCH_SKEW + 1, now), 0);
+        assert_eq!(sane_epoch(ceiling, now), ceiling);
+        const { assert!(EPOCH_SLACK > 5003 && EPOCH_SLACK < u64::MAX / 4) };
+    }
+
+    fn attest(id: &Identity, server: ServerId, host: UserId, epoch: u64, issued_ms: u64) -> SignedAttestation {
+        SignedAttestation::sign(id, Attestation { server, host, epoch, member: id.user(), issued_ms }).unwrap()
+    }
+
+    #[test]
+    fn attestations_count_only_valid_fresh_unique_members() {
+        let server = ServerId::from_bytes([1; 32]);
+        let host = Identity::generate();
+        let h = host.user();
+        let now = 10_000_000;
+        let (m1, m2, m3, outsider) = (Identity::generate(), Identity::generate(), Identity::generate(), Identity::generate());
+        let members = [m1.user(), m2.user(), m3.user()];
+        let eligible = |u: &UserId| members.contains(u);
+        let good = vec![attest(&m1, server, h, 4, now - 1000), attest(&m2, server, h, 4, now)];
+        assert_eq!(count_attests(&good, &server, &h, 4, now, ATTEST_ACCEPT_MS, eligible), 2);
+        // Stale, from the future, foreign server, foreign host, wrong epoch.
+        let bad = vec![
+            attest(&m1, server, h, 4, now - ATTEST_ACCEPT_MS - 1),
+            attest(&m2, server, h, 4, now + ATTEST_SKEW_MS + 1),
+            attest(&m3, ServerId::from_bytes([2; 32]), h, 4, now),
+            attest(&m3, server, UserId([7; 32]), 4, now),
+            attest(&m3, server, h, 5, now),
+        ];
+        assert_eq!(count_attests(&bad, &server, &h, 4, now, ATTEST_ACCEPT_MS, eligible), 0);
+        // Duplicates count once.
+        let dup = vec![attest(&m1, server, h, 4, now), attest(&m1, server, h, 4, now - 5)];
+        assert_eq!(count_attests(&dup, &server, &h, 4, now, ATTEST_ACCEPT_MS, eligible), 1);
+        // Forged: a signature by someone else, or a tampered body.
+        let mut forged = attest(&outsider, server, h, 4, now);
+        forged.att.member = m3.user();
+        let mut tampered = attest(&m2, server, h, 3, now);
+        tampered.att.epoch = 4;
+        assert_eq!(count_attests(&[forged, tampered], &server, &h, 4, now, ATTEST_ACCEPT_MS, eligible), 0);
+        // Not a member, or the host vouching for itself.
+        let others = vec![attest(&outsider, server, h, 4, now), attest(&host, server, h, 4, now)];
+        assert_eq!(count_attests(&others, &server, &h, 4, now, ATTEST_ACCEPT_MS, |_| true), 1, "only the outsider, when eligible");
+        assert_eq!(count_attests(&others, &server, &h, 4, now, ATTEST_ACCEPT_MS, eligible), 0);
+        // Only the first MAX_ATTESTS entries are looked at.
+        let mut long: Vec<SignedAttestation> = (0..MAX_ATTESTS).map(|_| attest(&outsider, server, h, 4, now)).collect();
+        long.push(attest(&m1, server, h, 4, now));
+        assert_eq!(count_attests(&long, &server, &h, 4, now, ATTEST_ACCEPT_MS, eligible), 0);
+        // A signature cannot be made for another member.
+        assert!(SignedAttestation::sign(&m1, Attestation { server, host: h, epoch: 4, member: m2.user(), issued_ms: now }).is_err());
+        // Members whose clocks are minutes off (either way) still count.
+        let skewed = vec![attest(&m1, server, h, 4, now + 9 * 60_000), attest(&m2, server, h, 4, now - 9 * 60_000 - 60_000)];
+        assert_eq!(count_attests(&skewed, &server, &h, 4, now, ATTEST_ACCEPT_MS, eligible), 2);
     }
 
     #[test]

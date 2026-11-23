@@ -44,6 +44,20 @@ use crate::session::{SessionCmd, SessionShared};
 const RECORD_TTL_S: u32 = 30;
 /// A foreign host's record younger than this wins over publishing (clobber rule).
 const FOREIGN_FRESH_MS: u64 = 15 * 60 * 1000;
+/// A packet whose timestamp (seq) is further ahead of the clock than this is ignored: any
+/// holder of the server secret (ex-members too) could otherwise pin the record forever.
+const MAX_PACKET_AHEAD_US: u64 = 10 * 60 * 1_000_000;
+/// A record whose `published_ms` is further ahead of the clock than this is ignored.
+const MAX_RECORD_AHEAD_MS: u64 = 5 * 60 * 1000;
+
+/// Is a packet's timestamp plausible (not far in the future)?
+fn packet_time_ok(seq_us: u64, now_us: u64) -> bool { seq_us <= now_us.saturating_add(MAX_PACKET_AHEAD_US) }
+
+/// Is a record plausible (published at most a little in the future)?
+fn record_time_ok(rec: &RdvRecord, now_ms: u64) -> bool { rec.published_ms <= now_ms.saturating_add(MAX_RECORD_AHEAD_MS) }
+
+/// Is a record fresh enough to defer to (published within the last 15 minutes)?
+pub(crate) fn record_fresh(rec: &RdvRecord, now_ms: u64) -> bool { record_time_ok(rec, now_ms) && now_ms.saturating_sub(rec.published_ms) < FOREIGN_FRESH_MS }
 /// Budget of a relay GET or PUT.
 const RELAY_TIMEOUT: Duration = Duration::from_secs(4);
 /// Budget of a DHT query (bootstrap included, about 3.5 s cold).
@@ -165,20 +179,49 @@ pub(crate) struct Latest {
 
 impl Latest {
     fn note(&mut self, sp: &SignedPacket, rdv_pk: &PublicKey, read_key: &[u8; 32], from_dht: bool) {
+        self.note_at(sp, rdv_pk, read_key, from_dht, Timestamp::now().as_micros(), now_ms());
+    }
+
+    /// `note` with explicit clocks. Far-future packets and records are left out entirely
+    /// (also from `max_seq` / `dht_seq`, so they cannot push honest publishes out of range).
+    fn note_at(&mut self, sp: &SignedPacket, rdv_pk: &PublicKey, read_key: &[u8; 32], from_dht: bool, now_us: u64, now_ms: u64) {
         if sp.public_key() != *rdv_pk {
             return;
         }
         let seq = sp.timestamp().as_micros();
+        if !packet_time_ok(seq, now_us) {
+            tracing::debug!(seq, "ignoring a rendezvous packet from the far future");
+            return;
+        }
+        let rec = match open_packet(sp, rdv_pk, read_key) {
+            Ok(rec) if !record_time_ok(&rec, now_ms) => {
+                tracing::debug!("ignoring a rendezvous record published in the future");
+                return;
+            }
+            Ok(rec) => Some(rec),
+            Err(e) => {
+                tracing::debug!(error = %e, "ignoring an unreadable rendezvous record");
+                None
+            }
+        };
         self.max_seq = Some(self.max_seq.map_or(seq, |m| m.max(seq)));
         if from_dht {
             self.dht_seq = Some(self.dht_seq.map_or(seq, |m| m.max(seq)));
         }
-        match open_packet(sp, rdv_pk, read_key) {
-            Ok(rec) if self.record.as_ref().is_none_or(|(s, _)| seq > *s) => self.record = Some((seq, rec)),
-            Ok(_) => {}
-            Err(e) => tracing::debug!(error = %e, "ignoring an unreadable rendezvous record"),
+        if let Some(rec) = rec
+            && self.record.as_ref().is_none_or(|(s, _)| seq > *s)
+        {
+            self.record = Some((seq, rec));
         }
     }
+}
+
+/// A record from `sp` if it is readable and not from the future.
+fn plausible_record(sp: &SignedPacket, rdv_pk: &PublicKey, read_key: &[u8; 32]) -> Option<RdvRecord> {
+    if !packet_time_ok(sp.timestamp().as_micros(), Timestamp::now().as_micros()) {
+        return None;
+    }
+    open_packet(sp, rdv_pk, read_key).ok().filter(|r| record_time_ok(r, now_ms()))
 }
 
 /// Outcome of a publish attempt.
@@ -286,11 +329,11 @@ impl Rendezvous {
     pub async fn resolve_first(&self, rdv_pk: &PublicKey, read_key: &[u8; 32]) -> Option<RdvRecord> {
         let relay = async {
             let sp = self.relay_get(rdv_pk).await?;
-            open_packet(&sp, rdv_pk, read_key).ok()
+            plausible_record(&sp, rdv_pk, read_key)
         };
         let dht = async {
             let items = Self::dht_get(rdv_pk, read_key, true).await;
-            items.iter().find_map(|sp| open_packet(sp, rdv_pk, read_key).ok())
+            items.iter().find_map(|sp| plausible_record(sp, rdv_pk, read_key))
         };
         tokio::pin!(relay);
         tokio::pin!(dht);
@@ -339,7 +382,7 @@ impl Rendezvous {
             && let Some((_, r)) = &latest.record
             && r.host != rec.host
             && r.epoch >= rec.epoch
-            && now_ms().saturating_sub(r.published_ms) < FOREIGN_FRESH_MS
+            && record_fresh(r, now_ms())
         {
             return Published::Foreign(r.clone());
         }
@@ -553,7 +596,7 @@ async fn host_runner(net: Weak<Inner>, rdv: Arc<Rendezvous>, server: ServerId, m
             let latest = rdv.resolve_latest(&keys.rdv_pk(), &keys.rdv_read_key).await;
             if let Some((_, other)) = latest.record
                 && other.host != me
-                && now_ms().saturating_sub(other.published_ms) < FOREIGN_FRESH_MS
+                && record_fresh(&other, now_ms())
                 && let Some(inner) = net.upgrade()
             {
                 wake_from_record(&inner, &server, &other);
@@ -692,6 +735,34 @@ mod tests {
         assert_eq!(l.max_seq, Some(30));
         assert_eq!(l.dht_seq, Some(30));
         assert_eq!(l.record, Some((20, r2)));
+    }
+
+    #[test]
+    fn far_future_packets_and_records_cannot_pin_the_record() {
+        let k = keys();
+        let now_us = 1_800_000_000_000_000u64;
+        let now = now_us / 1000;
+        let honest = RdvRecord { published_ms: now - 1000, ..record(1) };
+        let ok = record_packet(&k.rdv_sk, &k.rdv_read_key, &honest, now_us - 1_000_000).unwrap();
+        // A former member pins seq near the i64 limit, and one claims "published in 2100".
+        let pinned = record_packet(&k.rdv_sk, &k.rdv_read_key, &RdvRecord { published_ms: now, ..record(1) }, i64::MAX as u64 - 10).unwrap();
+        let eternal = RdvRecord { published_ms: u64::MAX, ..record(1) };
+        let eternal_pkt = record_packet(&k.rdv_sk, &k.rdv_read_key, &eternal, now_us).unwrap();
+        let mut l = Latest::default();
+        l.note_at(&ok, &k.rdv_pk(), &k.rdv_read_key, true, now_us, now);
+        l.note_at(&pinned, &k.rdv_pk(), &k.rdv_read_key, true, now_us, now);
+        l.note_at(&eternal_pkt, &k.rdv_pk(), &k.rdv_read_key, true, now_us, now);
+        assert_eq!(l.max_seq, Some(now_us - 1_000_000), "the far-future seq is not counted");
+        assert_eq!(l.dht_seq, Some(now_us - 1_000_000));
+        assert_eq!(l.record.as_ref().map(|(_, r)| r.published_ms), Some(honest.published_ms));
+        // The next honest publish stays in range.
+        let next = next_seq(now_us, l.max_seq);
+        assert!(record_packet(&k.rdv_sk, &k.rdv_read_key, &honest, next).is_ok());
+        // Freshness: a record from the future is never "fresh forever".
+        assert!(!record_fresh(&eternal, now));
+        assert!(record_fresh(&RdvRecord { published_ms: now + 60_000, ..record(1) }, now), "small clock skew is fine");
+        assert!(record_fresh(&honest, now));
+        assert!(!record_fresh(&RdvRecord { published_ms: now - FOREIGN_FRESH_MS, ..record(1) }, now));
     }
 
     #[test]

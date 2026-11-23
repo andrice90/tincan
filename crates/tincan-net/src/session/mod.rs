@@ -16,7 +16,7 @@ use std::time::Duration;
 use iroh::endpoint::{Connection, SendStream};
 use parking_lot::Mutex;
 use tincan_core::build::{self, HelloInfo};
-use tincan_core::election::SignedHostClaim;
+use tincan_core::election::{self, SignedHostClaim};
 use tincan_core::event::{Body, SignedEvent, StoredEvent};
 use tincan_core::keys::ServerKeys;
 use tincan_core::state::{Change, Verdict};
@@ -174,6 +174,11 @@ struct Queued {
 }
 
 /// A signed publish waiting for the host's ack.
+///
+/// Once sent, the signed event is never dropped and its seq never released while some host
+/// might hold it (an honest replica could store it): a refusal parks it and it is re-sent
+/// later and on the next host. Only a local `Reject` (no honest replica can store it either)
+/// or a local `Stale` (it arrived through sync) ends it.
 pub(super) struct Inflight {
     event: StoredEvent,
     reply: Option<oneshot::Sender<Result<StoredEvent>>>,
@@ -181,6 +186,8 @@ pub(super) struct Inflight {
     sent_on: Option<u64>,
     gap_retries: u32,
     retry_at: Option<Instant>,
+    /// It left this device at least once.
+    sent: bool,
 }
 
 /// Publish pipeline (one event in flight at a time, so seqs stay contiguous at the host).
@@ -197,6 +204,12 @@ pub(super) struct Seek {
     deadline: Instant,
     /// Last time a higher-ranked successor answered without being host yet.
     alive_above: Option<Instant>,
+    /// When each successor was first seen "alive, not hosting" in this failover. After
+    /// `host_dead + stagger` its notices no longer postpone anything (a successor that never
+    /// promotes cannot hold the server hostless).
+    alive_first: HashMap<UserId, Instant>,
+    /// Non-successors: cold open at the latest by then, whatever answers.
+    hard_deadline: Option<Instant>,
 }
 
 /// Why we are seeking.
@@ -244,8 +257,6 @@ pub(super) struct MemberStart {
     pub roster: Roster,
     /// My short id.
     pub short_id: u16,
-    /// Host's view of my next seq.
-    pub next_seq: u64,
 }
 
 /// How to become host.
@@ -338,7 +349,8 @@ pub(crate) fn spawn(net: &Arc<Inner>, server: ServerId, replica: ReplicaRef, mod
         Ok(Some(b)) => postcard::from_bytes::<Roster>(&b).ok(),
         _ => None,
     };
-    let epoch_seen = replica.lock().record.last_epoch;
+    // An epoch above what anyone may claim can only come from a poisoned claim: start over.
+    let epoch_seen = election::sane_epoch(replica.lock().record.last_epoch, now_ms());
     // Visible right away, before the actor's first step.
     *shared.info.lock() = match &mode {
         StartMode::NewServer => {
@@ -404,7 +416,7 @@ impl Session {
         let first = match mode {
             StartMode::ColdOpen => Next::Seek(SeekKind::ColdOpen, None),
             StartMode::NewServer => Next::Host(Box::new(HostStart {
-                epoch: self.ctx.epoch_seen + 1,
+                epoch: election::next_epoch(self.ctx.epoch_seen).unwrap_or(1),
                 prev: None,
                 inherit: None,
                 accept: None,
@@ -593,7 +605,9 @@ impl Session {
             }
             SessionCmd::HaveChanged { add, remove } => {
                 if let Role::Member(m) = &mut self.role {
-                    let _ = m.link.send(&Ctl::Have { add, remove });
+                    for f in tincan_core::wire::have_frames(&add, &remove) {
+                        let _ = m.link.send(&f);
+                    }
                 }
                 Next::Stay
             }
@@ -652,20 +666,20 @@ impl Session {
             }
         };
         match dialed.reply.clone() {
-            Ctl::Welcome { claim, roster, your_short_id, your_next_seq } => {
-                let valid = claim.verify_for(&self.ctx.server).is_ok() && claim.claim.host == d.user && roster.host == d.user;
+            // `your_next_seq` is ignored: a host must never be able to raise my seqs.
+            Ctl::Welcome { claim, roster, your_short_id, your_next_seq: _ } => {
+                let valid = claim.verify_for(&self.ctx.server).is_ok()
+                    && claim.claim.host == d.user
+                    && roster.host == d.user
+                    && self.ctx.may_host(&d.user)
+                    && self.ctx.epoch_ok(claim.claim.epoch);
                 if !valid {
                     link::close_conn(&dialed.conn, tincan_core::CLOSE_NORMAL, "bad welcome");
                     return Next::Stay;
                 }
-                self.ctx.epoch_seen = self.ctx.epoch_seen.max(claim.claim.epoch);
-                let start = MemberStart {
-                    link: Box::new(dialed),
-                    claim,
-                    roster,
-                    short_id: your_short_id,
-                    next_seq: your_next_seq,
-                };
+                // epoch_seen follows this claim only if I become its member (become_member);
+                // a probed host's claim must not raise it.
+                let start = MemberStart { link: Box::new(dialed), claim, roster, short_id: your_short_id };
                 match &mut self.role {
                     Role::Seeking(_) | Role::Offline { .. } => Next::Member(Box::new(start)),
                     Role::Host(_) => host::start_probe_merge(self, d.user, start),
@@ -697,14 +711,23 @@ impl Session {
 
     /// A peer answered but is not hosting.
     fn note_alive_not_host(&mut self, user: UserId) {
+        let now = Instant::now();
+        // An honest successor that has not noticed the loss yet promotes within host_dead
+        // (plus its stagger); one that keeps answering "not hosting" after that is ignored.
+        let window = self.ctx.net.timings.host_dead + self.ctx.net.timings.stagger;
         if let Role::Seeking(s) = &mut self.role
             && let SeekKind::Failover { succession, rank, .. } = &s.kind
             && let Some(pos) = succession.iter().position(|u| *u == user)
         {
-            if rank.is_none_or(|r| pos < r) {
-                s.alive_above = Some(Instant::now());
+            let first = *s.alive_first.entry(user).or_insert(now);
+            if now.duration_since(first) >= window {
+                tracing::debug!(server = %self.ctx.server.short(), peer = %user.short(), "successor still not hosting: no longer waiting for it");
+                return;
             }
-            let at = Instant::now() + self.ctx.net.timings.failover_redial;
+            if rank.is_none_or(|r| pos < r) {
+                s.alive_above = Some(now);
+            }
+            let at = now + self.ctx.net.timings.failover_redial;
             self.ctx.redials.push((at, user, DialPurpose::Seek));
         }
     }
@@ -721,7 +744,10 @@ impl Session {
     }
 
     fn on_redirect(&mut self, from: UserId, purpose: DialPurpose, claim: SignedHostClaim, host: UserId, addr: AddrHint) -> Next {
-        if claim.verify_for(&self.ctx.server).is_err() || claim.claim.host != host {
+        if claim.verify_for(&self.ctx.server).is_err() || claim.claim.host != host || !self.ctx.epoch_ok(claim.claim.epoch) {
+            return Next::Stay;
+        }
+        if !self.ctx.may_host(&host) {
             return Next::Stay;
         }
         if host == self.ctx.me {
@@ -791,11 +817,9 @@ impl Session {
                         Next::Stay
                     }
                     Role::Seeking(Seek { kind: SeekKind::ColdOpen, .. }) | Role::Offline { .. } => {
-                        let their_epoch = match &first {
-                            Ctl::Hello { epoch_seen, .. } => *epoch_seen,
-                            _ => 0,
-                        };
-                        if member && self.ctx.net.allow_hosting() && self.ctx.me < peer {
+                        // `Hello.epoch_seen` is not signed: it never chooses my epoch.
+                        let next_epoch = election::next_epoch(self.ctx.epoch_seen);
+                        if member && self.ctx.net.allow_hosting() && self.ctx.me < peer && next_epoch.is_some() && !self.ctx.never_promote() {
                             // Two members looking for each other: the lower id hosts. Not while
                             // my dial to the last known host is still out (it may be alive).
                             let last_host = self.ctx.replica.lock().record.last_host;
@@ -808,7 +832,7 @@ impl Session {
                                 return Next::Stay;
                             }
                             let link = self.ctx.spawn_link(conn, send, reader);
-                            let epoch = self.ctx.epoch_seen.max(their_epoch) + 1;
+                            let epoch = next_epoch.unwrap_or(1);
                             let prev = self.ctx.replica.lock().record.last_host;
                             let inherit = self.ctx.last_roster.clone();
                             return Next::Host(Box::new(HostStart {
@@ -834,11 +858,25 @@ impl Session {
             }
             Ctl::JoinRequest { .. } => match &mut self.role {
                 Role::Host(h) if h.handoff.is_none() => {
+                    if h.joiners.len() >= host::MAX_JOINERS && !h.joiners.values().any(|(l, _)| l.peer == peer) {
+                        reject(&self.ctx, conn, send, RejectCode::Busy, "too many people are joining right now; try again in a minute");
+                        return Next::Stay;
+                    }
                     match h.admit_joiner(&mut self.ctx, &peer, &first) {
                         Ok(accepted) => {
+                            // One pending joiner link per peer; it must send its Hello soon.
+                            h.joiners.retain(|_, (l, _)| {
+                                if l.peer == peer {
+                                    l.close(tincan_core::CLOSE_NORMAL, "replaced");
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
                             let link = self.ctx.spawn_link(conn, send, reader);
                             let _ = link.send(&accepted);
-                            h.joiners.insert(link.id, link);
+                            let deadline = Instant::now() + self.ctx.net.timings.joiner_hello;
+                            h.joiners.insert(link.id, (link, deadline));
                         }
                         Err(rej) => {
                             let ctl = rej.to_ctl();
@@ -879,7 +917,9 @@ impl Session {
             };
             let seeking = matches!(self.role, Role::Seeking(_));
             for (_, user, purpose) in due {
-                if seeking || purpose == DialPurpose::Probe {
+                // A peer that joined me meanwhile needs no probe.
+                let linked = matches!(&self.role, Role::Host(h) if h.links.contains_key(&user));
+                if seeking || (purpose == DialPurpose::Probe && !linked) {
                     self.ctx.dial(user, purpose, Duration::ZERO);
                 }
             }
@@ -903,11 +943,12 @@ impl Session {
         if s.deadline > now {
             return Next::Stay;
         }
-        let allow = self.ctx.net.allow_hosting();
+        let next_epoch = election::next_epoch(self.ctx.epoch_seen);
+        let allow = self.ctx.net.allow_hosting() && next_epoch.is_some() && !self.ctx.never_promote();
+        let epoch = next_epoch.unwrap_or(1);
         match &s.kind {
             SeekKind::ColdOpen => {
                 if allow {
-                    let epoch = self.ctx.epoch_seen + 1;
                     let prev = self.ctx.replica.lock().record.last_host;
                     tracing::info!(server = %self.ctx.server.short(), epoch, "nobody reachable: hosting solo");
                     Next::Host(Box::new(HostStart {
@@ -930,7 +971,6 @@ impl Session {
                             s.deadline = now + stagger;
                             return Next::Stay;
                         }
-                        let epoch = self.ctx.epoch_seen + 1;
                         let prev = Some(*failed_host);
                         tracing::info!(server = %self.ctx.server.short(), epoch, "host lost: taking over as successor");
                         Next::Host(Box::new(HostStart {
@@ -943,8 +983,9 @@ impl Session {
                         }))
                     }
                     _ => {
-                        if s.alive_above.is_some_and(|t| now.duration_since(t) < stagger) {
-                            s.deadline = now + stagger;
+                        let capped = s.hard_deadline.is_some_and(|h| now >= h);
+                        if !capped && s.alive_above.is_some_and(|t| now.duration_since(t) < stagger) {
+                            s.deadline = s.hard_deadline.map_or(now + stagger, |h| (now + stagger).min(h));
                             return Next::Stay;
                         }
                         Next::Seek(SeekKind::ColdOpen, None)
@@ -995,7 +1036,11 @@ impl Session {
         for (i, u) in order.into_iter().enumerate() {
             self.ctx.dial(u, DialPurpose::Seek, stagger * u32::try_from(i).unwrap_or(u32::MAX));
         }
-        self.role = Role::Seeking(Seek { kind, deadline, alive_above: None });
+        let hard_deadline = match &kind {
+            SeekKind::Failover { rank: None, .. } => Some(deadline + t.host_dead + t.stagger),
+            _ => None,
+        };
+        self.role = Role::Seeking(Seek { kind, deadline, alive_above: None, alive_first: HashMap::new(), hard_deadline });
         self.ctx.update_info(&self.role);
         // A rank-0 successor promotes at once.
         if deadline <= now { self.seek_timer(now) } else { Next::Stay }
@@ -1011,20 +1056,26 @@ impl Session {
         self.ctx.update_record(epoch, host);
         self.ctx.redials.clear();
         let heads = self.ctx.heads();
-        let _ = link.send(&Ctl::SyncHave { heads });
+        self.ctx.send_heads(&link, heads);
+        self.ctx.attest(&link, &start.claim);
         *self.ctx.shared.host_conn.lock() = Some((host, link.conn.clone()));
         let path = crate::addr::path_snapshot(&link.conn);
         tracing::info!(server = %self.ctx.server.short(), host = %host.short(), epoch, "connected to host");
         *self.ctx.shared.my_short_id.lock() = Some(start.short_id);
         let media = self.ctx.net.media.member_started(&self.ctx.net, self.ctx.server, host, &link.conn, link.live(), epoch, start.short_id);
-        let state = MemberState::new(link, start.claim, start.roster.clone(), start.next_seq, path, media);
+        let raw = if start.roster.online.len() <= tincan_core::wire::MAX_ROSTER { start.roster } else { Roster { epoch, host, ..Roster::default() } };
+        let roster = self.ctx.sanitize_roster(raw.clone()).unwrap_or_else(|| Roster { epoch, host, ..Roster::default() });
+        let state = MemberState::new(link, start.claim, roster.clone(), raw, path, media);
         self.role = Role::Member(Box::new(state));
-        self.ctx.note_roster(&start.roster);
+        self.ctx.note_roster(&roster);
         self.ctx.tick_at = Some(Instant::now() + self.ctx.net.timings.tick);
         self.ctx.update_info(&self.role);
-        // Unacked publish from before: resend on the new link (after our sync went out).
+        // Unacked (or refused) publish from before: resend on the new link once the syncs
+        // are done.
         if let Some(i) = &mut self.ctx.pubs.inflight {
             i.sent_on = None;
+            i.retry_at = None;
+            i.gap_retries = 0;
         }
         Next::Stay
     }
@@ -1041,11 +1092,22 @@ impl Session {
         self.ctx.epoch_seen = self.ctx.epoch_seen.max(start.epoch);
         self.ctx.update_record(start.epoch, self.ctx.me);
         self.ctx.redials.clear();
+        // Short ids survive migrations, but only for current members (a roster from a
+        // malicious host could list thousands of strangers and exhaust the id space).
         let mut short_ids: HashMap<UserId, u16> = HashMap::new();
-        for r in start.inherit.iter().chain(self.ctx.last_roster.iter()) {
-            for e in &r.online {
-                if !short_ids.contains_key(&e.user) && !short_ids.values().any(|v| *v == e.short_id) {
-                    short_ids.insert(e.user, e.short_id);
+        {
+            let r = self.ctx.replica.lock();
+            let cap = r.state.members.len();
+            let mut used: HashSet<u16> = HashSet::new();
+            for ro in start.inherit.iter().chain(self.ctx.last_roster.iter()) {
+                for e in &ro.online {
+                    if short_ids.len() >= cap {
+                        break;
+                    }
+                    let id_ok = e.short_id >= 1 && e.short_id <= tincan_core::media::MAX_SHORT_ID;
+                    if id_ok && r.state.is_member(&e.user) && !short_ids.contains_key(&e.user) && used.insert(e.short_id) {
+                        short_ids.insert(e.user, e.short_id);
+                    }
                 }
             }
         }
@@ -1101,24 +1163,38 @@ impl Session {
         match &mut self.role {
             Role::Host(h) => {
                 if let Some(inf) = self.ctx.pubs.inflight.take() {
+                    if inf.retry_at.is_some_and(|t| t > Instant::now()) {
+                        // Parked: retried by the timer.
+                        self.ctx.pubs.inflight = Some(inf);
+                        return;
+                    }
+                    let verdict = self.ctx.replica.lock().state.check(&inf.event.id, &inf.event.event, now_ms());
+                    if inf.sent && matches!(verdict, Verdict::Gap | Verdict::Future) {
+                        // Sent to an earlier host that may store it: keep the seq, retry later.
+                        let retry = Instant::now() + self.ctx.net.timings.publish_park_retry;
+                        self.ctx.pubs.inflight = Some(Inflight { retry_at: Some(retry), ..inf });
+                        return;
+                    }
                     let res = h.publish_local(&mut self.ctx, inf.event);
                     if let Some(r) = inf.reply {
                         let _ = r.send(res);
                     }
                 }
                 while let Some(q) = self.ctx.pubs.queued.pop_front() {
-                    let res = self.ctx.sign_own(q.body, 0).and_then(|ev| h.publish_local(&mut self.ctx, ev));
+                    let res = self.ctx.sign_own(q.body).and_then(|ev| h.publish_local(&mut self.ctx, ev));
                     let _ = q.reply.send(res);
                 }
             }
             Role::Member(m) => {
-                if !m.sync_out_done {
+                // Only after both syncs: the host's history (my own events it holds advance my
+                // seq legitimately) and mine to the host (so it never sees my gaps).
+                if !m.sync_out_done || !m.synced {
                     return;
                 }
                 if self.ctx.pubs.inflight.is_none()
                     && let Some(q) = self.ctx.pubs.queued.pop_front()
                 {
-                    match self.ctx.sign_own(q.body, m.next_seq_hint) {
+                    match self.ctx.sign_own(q.body) {
                         Ok(ev) => {
                             self.ctx.pubs.inflight = Some(Inflight {
                                 event: ev,
@@ -1127,6 +1203,7 @@ impl Session {
                                 sent_on: None,
                                 gap_retries: 0,
                                 retry_at: None,
+                                sent: false,
                             });
                         }
                         Err(e) => {
@@ -1140,6 +1217,7 @@ impl Session {
                     && m.link.send(&Ctl::Publish { event: inf.event.signed.clone() })
                 {
                     inf.sent_on = Some(m.link.id);
+                    inf.sent = true;
                 }
             }
             _ => {}
@@ -1162,6 +1240,13 @@ impl Ctx {
     /// Is `user` a current member of this server?
     pub fn is_member(&self, user: &UserId) -> bool { self.replica.lock().state.is_member(user) }
 
+    /// May `user` be my host? Not if it is known to have left (my history may still lack
+    /// the admission of a newer member, so unknown users are not refused here).
+    pub fn may_host(&self, user: &UserId) -> bool {
+        let r = self.replica.lock();
+        r.state.members.get(user).is_none_or(|m| r.state.is_member(&m.user))
+    }
+
     /// (MAC valid, current member) for an incoming Hello from `peer`.
     fn check_hello(&self, peer: &UserId, hello: &Ctl) -> (bool, bool) {
         let r = self.replica.lock();
@@ -1174,12 +1259,12 @@ impl Ctx {
     /// A Hello addressed to `host`.
     fn hello_for(&self, host: &UserId) -> Option<Ctl> {
         let keys = self.keys()?;
-        let info = HelloInfo {
-            epoch_seen: self.epoch_seen,
-            status: self.net.status_for(&self.server, false),
-            have: self.net.have_list(),
-            clips: self.net.clips(),
-        };
+        // Bounded like the host keeps them (and so the Hello always fits in one frame).
+        let mut have = self.net.have_list();
+        have.truncate(tincan_core::wire::MAX_HAVE);
+        let mut clips = self.net.clips();
+        clips.truncate(tincan_core::wire::MAX_CLIPS);
+        let info = HelloInfo { epoch_seen: self.epoch_seen, status: self.net.status_for(&self.server, false), have, clips };
         Some(build::hello(&self.me, &self.server, &keys.hello_key, host, info))
     }
 
@@ -1206,6 +1291,13 @@ impl Ctx {
         });
     }
 
+    /// Probe `user` once more after `delay` (unless a probe of it is already scheduled).
+    pub fn schedule_probe(&mut self, user: UserId, delay: Duration) {
+        if !self.redials.iter().any(|(_, u, p)| *u == user && *p == DialPurpose::Probe) {
+            self.redials.push((Instant::now() + delay, user, DialPurpose::Probe));
+        }
+    }
+
     /// Start a link for a connection whose control stream is open.
     pub fn spawn_link(&mut self, conn: Connection, send: SendStream, reader: FrameReader) -> Link {
         let id = self.id();
@@ -1215,10 +1307,12 @@ impl Ctx {
     /// Validate a Welcome reply (from the join flow) into a member start.
     fn welcome_start(&mut self, d: Box<Dialed>) -> Option<MemberStart> {
         match d.reply.clone() {
-            Ctl::Welcome { claim, roster, your_short_id, your_next_seq }
-                if claim.verify_for(&self.server).is_ok() && claim.claim.host == crate::addr::remote_user(&d.conn) =>
+            Ctl::Welcome { claim, roster, your_short_id, your_next_seq: _ }
+                if claim.verify_for(&self.server).is_ok()
+                    && claim.claim.host == crate::addr::remote_user(&d.conn)
+                    && self.epoch_ok(claim.claim.epoch) =>
             {
-                Some(MemberStart { link: d, claim, roster, short_id: your_short_id, next_seq: your_next_seq })
+                Some(MemberStart { link: d, claim, roster, short_id: your_short_id })
             }
             _ => {
                 link::close_conn(&d.conn, tincan_core::CLOSE_NORMAL, "bad welcome");
@@ -1227,8 +1321,62 @@ impl Ctx {
         }
     }
 
+    /// Is a peer's claimed epoch plausible (at most the shared, history-free ceiling)?
+    pub fn epoch_ok(&self, epoch: u64) -> bool { election::epoch_plausible(epoch, now_ms()) }
+
+    /// Test hook: this node never promotes itself to host.
+    pub fn never_promote(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.net.test.never_promote.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Send my heads on `link` (split into parts when they do not fit in one frame).
+    pub fn send_heads(&self, link: &Link, heads: Heads) {
+        for f in tincan_core::wire::sync_have_frames(heads) {
+            let _ = link.send(&f);
+        }
+    }
+
+    /// Attest to my host (`claim`) on `link`.
+    pub fn attest(&self, link: &Link, claim: &SignedHostClaim) {
+        let att = election::Attestation { server: self.server, host: claim.claim.host, epoch: claim.claim.epoch, member: self.me, issued_ms: now_ms() };
+        match election::SignedAttestation::sign(&self.net.identity, att) {
+            Ok(a) => {
+                let _ = link.send(&Ctl::Attest(a));
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot sign an attestation"),
+        }
+    }
+
+    /// A roster from my host, cut to what can be true: current members only (deduplicated),
+    /// at most `MAX_ROSTER` entries, bounded addresses, members-only succession. None if the
+    /// roster is too large to be honest.
+    pub fn sanitize_roster(&self, mut roster: Roster) -> Option<Roster> {
+        if roster.online.len() > tincan_core::wire::MAX_ROSTER {
+            return None;
+        }
+        let r = self.replica.lock();
+        let mut seen = HashSet::new();
+        roster.online.retain(|e| r.state.is_member(&e.user) && seen.insert(e.user));
+        for e in &mut roster.online {
+            e.addr = e.addr.bounded();
+        }
+        let mut seen = HashSet::new();
+        roster.succession.retain(|u| r.state.is_member(u) && seen.insert(*u));
+        roster.succession.truncate(election::MAX_SUCCESSORS);
+        Some(roster)
+    }
+
     /// Stream what `theirs` lacks on `link`'s bulk queue; reports `SyncSent` when done.
     pub fn spawn_sync(&self, link: &Link, theirs: Heads) {
+        #[cfg(test)]
+        self.net.test.syncs_started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let storage = self.net.storage.clone();
         let replica = self.replica.clone();
         let bulk = link.bulk();
@@ -1241,15 +1389,16 @@ impl Ctx {
         });
     }
 
-    /// Sign my next event. `seq_hint` is the host's view of my next seq (0 if none).
-    pub fn sign_own(&mut self, body: Body, seq_hint: u64) -> Result<StoredEvent> {
+    /// Sign my next event: the seq is past my applied head and every seq I ever signed. Peers
+    /// cannot move it (a host's `your_next_seq` is ignored).
+    pub fn sign_own(&mut self, body: Body) -> Result<StoredEvent> {
         let mut r = self.replica.lock();
         if let Body::Message { channel, .. } = &body
             && !r.state.can_post(&self.me, channel)
         {
             return Err(NetError::Invalid("You can't post in this channel.".into()));
         }
-        let seq = r.next_own_seq(&self.me).max(seq_hint);
+        let seq = r.next_own_seq(&self.me);
         let body = match body {
             Body::MemberLeave { .. } => Body::MemberLeave { last_seq: seq },
             b => b,
@@ -1265,30 +1414,52 @@ impl Ctx {
     }
 
     /// Verify, validate, apply and store events from a peer; emits app events.
-    pub fn ingest_signed(&mut self, events: Vec<SignedEvent>) -> Vec<(StoredEvent, Change)> {
+    pub fn ingest_signed(&mut self, events: Vec<SignedEvent>) -> Vec<(StoredEvent, Change)> { self.ingest_checked(events).0 }
+
+    /// Like `ingest_signed`; also reports whether a batch carried an event with a bad
+    /// signature (honest peers only forward events they verified). Events already stored
+    /// (same id at or below the author's head) are skipped before the signature check, so
+    /// replayed history costs a hash, not an ed25519 verification.
+    pub fn ingest_checked(&mut self, events: Vec<SignedEvent>) -> (Vec<(StoredEvent, Change)>, bool) {
         let mut applied = Vec::new();
+        let mut bad = false;
+        let mut conflicts = Vec::new();
         {
             let mut r = self.replica.lock();
             for signed in events {
+                if let Ok(ev) = signed.decode()
+                    && ev.seq <= r.state.head(&ev.author)
+                    && matches!(self.net.storage.event(&signed.id()), Ok(Some(_)))
+                {
+                    continue;
+                }
                 let stored = match StoredEvent::from_signed(signed) {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::debug!(error = %e, "dropping unverifiable event");
+                        bad = true;
                         continue;
                     }
                 };
                 if stored.conv() != self.server {
                     continue;
                 }
+                let key = (stored.event.author, stored.event.seq);
                 let res = r.ingest(self.net.storage.as_ref(), &self.net.hlc, stored);
                 if let Verdict::Reject(reason) = &res.verdict {
                     tracing::debug!(%reason, "event rejected");
                 }
+                if res.conflict.is_some() {
+                    conflicts.push(key);
+                }
                 applied.extend(res.applied);
             }
         }
+        for (author, seq) in conflicts {
+            self.net.emit(NetEvent::Equivocation { conv: self.server, author, seq });
+        }
         self.after_applied(&applied);
-        applied
+        (applied, bad)
     }
 
     /// Emit app events for applied events; react to my own MemberLeave.
@@ -1320,6 +1491,8 @@ impl Ctx {
     }
 
     /// Remember a roster: addresses, peers, succession; tell the app and the DM layer.
+    /// Members call it with a roster from `sanitize_roster` (members only, bounded); the
+    /// host with its own.
     pub fn note_roster(&mut self, roster: &Roster) {
         let now = now_ms();
         let mut seen = Vec::new();
@@ -1327,8 +1500,9 @@ impl Ctx {
             if e.user == self.me {
                 continue;
             }
-            self.net.learn_hint(&e.user, &e.addr);
-            self.persist_peer(e.user, &e.addr, now);
+            let addr = e.addr.bounded();
+            self.net.learn_hint(&e.user, &addr);
+            self.persist_peer(e.user, &addr, now);
             seen.push(e.user);
         }
         let mut online: Vec<UserId> = roster.online.iter().map(|e| e.user).collect();
@@ -1452,10 +1626,29 @@ fn rtt_moved(a: Option<u32>, b: Option<u32>) -> bool {
     }
 }
 
-/// Lowest short id not in use (1-based).
-pub(super) fn alloc_short_id(used: &HashMap<UserId, u16>) -> u16 {
+/// Lowest short id not in use (1-based). None when every id is taken: never hand out a
+/// duplicate (two members with one track id would mix their media).
+pub(super) fn alloc_short_id(used: &HashMap<UserId, u16>) -> Option<u16> {
     let taken: HashSet<u16> = used.values().copied().collect();
-    (1..=tincan_core::media::MAX_SHORT_ID).find(|i| !taken.contains(i)).unwrap_or(tincan_core::media::MAX_SHORT_ID)
+    (1..=tincan_core::media::MAX_SHORT_ID).find(|i| !taken.contains(i))
+}
+
+/// A short id for `user`: its own, a free one, or one reclaimed from a user that is not
+/// connected (`online`). None only when every id belongs to a connected member.
+pub(super) fn short_id_for(ids: &mut HashMap<UserId, u16>, user: UserId, online: impl Fn(&UserId) -> bool) -> Option<u16> {
+    if let Some(id) = ids.get(&user) {
+        return Some(*id);
+    }
+    let id = match alloc_short_id(ids) {
+        Some(id) => id,
+        None => {
+            let (victim, id) = ids.iter().find(|(u, _)| **u != user && !online(u)).map(|(u, id)| (*u, *id))?;
+            ids.remove(&victim);
+            id
+        }
+    };
+    ids.insert(user, id);
+    Some(id)
 }
 
 #[cfg(test)]
@@ -1465,10 +1658,34 @@ mod tests {
     #[test]
     fn short_ids_fill_gaps() {
         let mut m = HashMap::new();
-        assert_eq!(alloc_short_id(&m), 1);
+        assert_eq!(alloc_short_id(&m), Some(1));
         m.insert(UserId([1; 32]), 1);
         m.insert(UserId([2; 32]), 3);
-        assert_eq!(alloc_short_id(&m), 2);
+        assert_eq!(alloc_short_id(&m), Some(2));
+    }
+
+    #[test]
+    fn exhausted_short_ids_are_reclaimed_never_duplicated() {
+        let user = |i: u32| {
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&i.to_le_bytes());
+            UserId(b)
+        };
+        let max = u32::from(tincan_core::media::MAX_SHORT_ID);
+        // Every id taken (as by a roster full of strangers from a malicious host).
+        let mut ids: HashMap<UserId, u16> = (1..=max).map(|i| (user(i), u16::try_from(i).unwrap())).collect();
+        assert_eq!(alloc_short_id(&ids), None, "no duplicate id is handed out");
+        let newcomer = user(max + 1);
+        let online = |u: &UserId| *u == user(1);
+        let got = short_id_for(&mut ids, newcomer, online).unwrap();
+        assert_ne!(got, 1, "the connected member keeps its id");
+        let mut all: Vec<u16> = ids.values().copied().collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), ids.len(), "ids stay unique");
+        // When every id belongs to someone connected, the newcomer is refused.
+        let mut full: HashMap<UserId, u16> = (1..=max).map(|i| (user(i), u16::try_from(i).unwrap())).collect();
+        assert_eq!(short_id_for(&mut full, user(max + 2), |_| true), None);
     }
 
     #[test]

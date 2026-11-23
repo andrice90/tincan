@@ -156,6 +156,7 @@ Members re-announce everything ephemeral in `Hello` and on change: `Status` (upt
 
 `Roster { epoch, rev, online: [RosterEntry], succession: [UserId; <=4] }`
 `RosterEntry { user, short_id: u16, addr: AddrHint, since_ms, voice: Option<ChannelId>, muted, deafened, sharing }`
+The host fills `voice` from its SFU (what the member joined with `VoiceJoin`), not from the member's `Status`.
 
 `short_id` is assigned by the host, carried in the roster, and kept by the next host (it reuses the roster it inherited), so media track ids survive migration.
 
@@ -186,9 +187,54 @@ Crash failover: members keep the succession list. On host death, S1 promotes its
 
 Proactive migration ("most stable member hosts"): allowed only when no voice room is active, the best candidate's score has been at least 30% higher for 10 minutes, and 30 minutes have passed since the last migration. Implemented as a clean handoff.
 
-Epochs: `SignedHostClaim { server, epoch, host, prev, issued_ms }` signed by the claiming host. A member follows a new claim only from its current host (`HostMoved`) or after losing its host. Unsolicited higher-epoch claims are ignored.
+Epochs: `SignedHostClaim { server, epoch, host, prev, issued_ms }` signed by the claiming host. A member follows a new claim only from its current host (`HostMoved`) or after losing its host. Unsolicited higher-epoch claims are ignored. Every claim must also be at most the epoch ceiling (one epoch per second of unix time plus 1 000 000, 5 min of skew allowed), which every node computes without history.
 
-Partition merge (two solo hosts is the common case, given the 6 s solo timeout): triggered when a dial, a `Redirect` or the rendezvous record reveals another host for the same server. The hosts exchange `HostCompare{claim, connected, score}`; the winner is `max(connected, epoch, score, -UserId)`. The loser sends `HostMoved(epoch = max+1, winner)` to its members and becomes a member of the winner. Everyone resyncs with `SyncHave`.
+Partition merge (two solo hosts is the common case, given the 6 s solo timeout): triggered when a dial, a `Redirect` or the rendezvous record reveals another host for the same server. The hosts exchange `HostCompare2{claim, attests}`, where each attestation is signed by a connected member for that host and epoch. Winner = max(verified attested members, epoch, -UserId). The loser hands its members over only if the winner proved at least as many members as the loser has connected (re-checked when the winner's `HostMoved` arrives). The winner keeps its claim if its epoch is higher or the loser proved no members; otherwise it claims the loser's epoch + 1. The loser sends `HostMoved(winner's claim)` to its members and becomes a member of the winner. Everyone resyncs with `SyncHave`.
+
+## Security model
+
+### Threat model
+
+- Members are admitted by invite and hold `server_secret`, but none of them is trusted. Any single member may run a modified client.
+- Non-members can reach only the ALPNs. They fail the `Hello` MAC and the join checks. Strangers can open a DM connection, which stores nothing until they send a valid first message.
+- Events are signed by their authors and validated by every member, so nobody (the host included) can forge or alter another member's events.
+- Hosting is not a privilege. Any member can host legitimately by being online first or by ranking as successor. The host forwards media in plaintext (no end-to-end encryption beyond QUIC, by design).
+
+### What a malicious member must not be able to do
+
+1. Take over hosting from a live host that has other members connected.
+2. Degrade or disrupt other members' media or sessions beyond what an honest bad network link would.
+3. Make the host or other members do unbounded work or hold unbounded memory.
+4. Impersonate another member in any control message.
+5. Make honest members diverge.
+
+### How this holds
+
+- Takeover: partition merges count only member-signed attestations (fresh, unique, current members, not the peer's own links). A host with members yields only to a peer that proved at least as many, re-checked when the move arrives. Self-reported counts and scores are ignored, a bare compare never moves the host's epoch, epochs are bounded by a shared ceiling, and compares are rate limited. A successor that never promotes delays a failover by at most `host_dead + stagger`.
+- Disruption and unbounded work: every input a member controls is bounded per member (see notes-tincan-net.md "Hardening"). That covers typing, status and roster, publishes, syncs (one in flight per link), holder queries, held-blob lists, clips, soundboard, admissions, merge compares, attestations, audio datagrams, video uploads, subscriptions and keyframe requests, pending buffers, video receive state, QUIC stream windows and pre-auth connections. Relayed chatter can use at most half of another member's queue and never gets anyone disconnected. Budgets that protect shared resources (admissions, joins) are keyed per member, so one member cannot spend everyone's.
+- Impersonation: the host relays `Typing` and `SoundPlayed` only with `by == sender`. Receivers accept them only for current members listed online (rooms) or from the peer (calls and DMs). Attestations, claims and events are signed by whom they name.
+- Divergence: my seq is never moved by a host and never reused once a signed event left the device. Rule-breaking events are rejected identically everywhere (deterministic validation). Relayed history is never held back by a budget. An author signing two events for one seq is detected, and the proof is kept. Epoch checks need no local history, so no honest node can be locked out by how far the epoch moved while it was away.
+
+### What the host can and cannot do
+
+- It can: see and drop everything it relays (messages it fans out, plaintext media), delay or refuse publishes (censor), choose the order and timing of fan-out, show a wrong online list and succession for its members, push the epoch up to the ceiling, and refuse to yield in a merge it lost (keeping the members it already has).
+- It cannot: forge or alter events, move my seqs, make me sign two events for one seq, admit members past the invite rules, impersonate members to my app beyond "is typing" / "played a clip" for members that are online, put non-members into my stored peers or short-id inheritance, lock anyone out through the epoch, or make me do unbounded work.
+
+### Residual risks
+
+- Sybils: any member can mint invites and admit throwaway identities (its own budget: 20 at once, then one a minute per host). History relayed by another member is never budgeted, so a member with a second identity can author admissions with one and relay them with the other. Each identity attests for free, so a member that controls at least as many admitted identities as the live host has connected members can still win a merge. Counting only attesters admitted long ago was rejected: the admission time (`hlc`) is chosen by the admitting member and can be backdated.
+- Two hosts with 0 attested members still compare by epoch and id, which is equivalent to "online first" because neither side moves attested members.
+- Attestations are accepted up to 12 min old (members' clocks may be off by minutes), so a host can still count members that left it within the last ~12 minutes (but not ones now connected to the comparing host).
+- Two hosts whose membership views differ may both think they won a round; the merge waits for a later round after their histories synced.
+- A rogue host can keep the members it already holds by ignoring a merge it lost, and it can censor them.
+- Equivocation is detected, not resolved. Replicas may show different versions of one seq until a proof-carrying resolution exists.
+- Events arriving in bulk from a member are still signature-checked on the session actor (known events are skipped first, and a bad signature drops the sender).
+- Ex-members keep `server_secret`, so they can pass the `Hello` MAC (but not the membership check) and write the rendezvous record until secret rotation exists.
+- A malicious host can push the epoch up to the ceiling. Every node accepts that, so nobody is locked out. A node whose clock is more than 5 min behind refuses such claims until its clock catches up (at most its clock error), and an honest successor just above the ceiling waits for it the same way.
+- Admission and compare budgets are per host role: they reset when a host stops and starts hosting again.
+- A flood of fresh identities can push real joiners and strangers out of the 32 unknown pre-auth slots before they send their first frame (members and contacts have their own slots).
+- Eight stranger identities can hold every stranger DM slot and use up the stranger connection rate (10 a minute), delaying first contact from real strangers. Contacts and members of shared servers are not affected.
+- Blob transfer throughput under the bounded QUIC windows (16 MiB per connection, 8 bidi streams) has not been measured.
 
 ## Rendezvous record
 
@@ -204,7 +250,7 @@ A hint for cold joiners when every cached peer is stale. Never trusted on its ow
 
 1. Any member authors `InviteCreate{invite_pk = public(derive_key("tincan v1 invite key", seed)), expires_ms, max_uses}` and shares the code.
 2. Joiner dials bootstrap peers and resolves the rendezvous record, then sends the host `JoinRequest{server, invite_pk, profile, ts_ms, invite_sig}` where `invite_sig = ed25519(invite_sk, "tincan-join1" || server || joiner || host || ts_ms)`.
-3. Host checks the invite (exists, not revoked, not expired, uses below max_uses best-effort), authors `MemberAdmit`, replies `JoinAccepted{server_secret, genesis, admit}`. Normal `Hello` and sync follow.
+3. Host checks the invite (exists, not revoked, not expired, uses below max_uses best-effort), authors `MemberAdmit`, replies `JoinAccepted{server_secret, genesis, admit}`. Normal `Hello` and sync follow. Joins are rate limited per invite and per invite creator (refused with `RejectCode::Busy`).
 
 `Hello { server, nonce, mac = keyed_blake3(hello_key, server || client || host || nonce), epoch_seen, next_seq_hint, status, have_hashes }` proves membership to any host.
 

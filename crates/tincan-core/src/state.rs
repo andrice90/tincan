@@ -852,32 +852,146 @@ pub struct PendingBuffer {
     order: BTreeMap<u64, (UserId, u64)>,
     next_stamp: u64,
     bytes: usize,
+    limits: PendingLimits,
+    per_author: HashMap<UserId, (usize, usize)>,
+    non_members: HashSet<(UserId, u64)>,
+}
+
+/// Bounds of a [`PendingBuffer`]. The default keeps only the global caps; buffers fed from
+/// the network use [`PendingLimits::network`] (or [`PendingLimits::dm`]) so that one author,
+/// or a crowd of fresh non-member keys, cannot evict everyone else's early events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingLimits {
+    /// Most events held (oldest dropped first).
+    pub max_events: usize,
+    /// Most bytes (approximate) held (oldest dropped first).
+    pub max_bytes: usize,
+    /// Most events held per author (over: the new event is dropped).
+    pub per_author_events: usize,
+    /// Most bytes held per author (over: the new event is dropped).
+    pub per_author_bytes: usize,
+    /// Most events held whose author is not a member yet, all such authors together.
+    pub non_member_events: usize,
+    /// A `Gap` event more than this many seqs past its author's head is dropped.
+    pub max_ahead: u64,
+    /// A `Future` event more than this far ahead of the clock (ms) is dropped.
+    pub max_future_ms: u64,
+}
+
+impl Default for PendingLimits {
+    fn default() -> Self {
+        Self {
+            max_events: MAX_PENDING_EVENTS,
+            max_bytes: MAX_PENDING_BYTES,
+            per_author_events: usize::MAX,
+            per_author_bytes: usize::MAX,
+            non_member_events: usize::MAX,
+            max_ahead: u64::MAX,
+            max_future_ms: u64::MAX,
+        }
+    }
+}
+
+impl PendingLimits {
+    /// For server replicas fed by peers. Generous enough for honest out-of-order sync (an
+    /// author's run waiting on another author's event), tight enough that no single source
+    /// fills the buffer.
+    pub fn network() -> Self {
+        Self {
+            per_author_events: 2048,
+            per_author_bytes: 8 * 1024 * 1024,
+            non_member_events: 256,
+            max_ahead: 4096,
+            max_future_ms: 60 * 60 * 1000,
+            ..Self::default()
+        }
+    }
+
+    /// For DM replicas (two parties, one contiguous log each).
+    pub fn dm() -> Self {
+        Self {
+            max_events: 64,
+            max_bytes: 256 * 1024,
+            per_author_events: 64,
+            per_author_bytes: 256 * 1024,
+            non_member_events: 0,
+            max_ahead: 64,
+            max_future_ms: 60 * 60 * 1000,
+        }
+    }
 }
 
 impl PendingBuffer {
     /// Empty buffer.
     pub fn new() -> Self { Self::default() }
 
+    /// Empty buffer with these bounds.
+    pub fn with_limits(limits: PendingLimits) -> Self { Self { limits, ..Self::default() } }
+
     /// Buffer an event (typically one whose verdict was `Gap` or `Future`).
-    pub fn insert(&mut self, ev: StoredEvent) {
+    pub fn insert(&mut self, ev: StoredEvent) { self.insert_as(ev, false); }
+
+    fn insert_as(&mut self, ev: StoredEvent, non_member: bool) {
         let key = (ev.event.author, ev.event.seq);
         if self.items.contains_key(&key) {
             return;
         }
         let stamp = self.next_stamp;
         self.next_stamp += 1;
-        self.bytes += ev.approx_size();
+        let size = ev.approx_size();
+        self.bytes += size;
+        let a = self.per_author.entry(key.0).or_default();
+        a.0 += 1;
+        a.1 += size;
+        if non_member {
+            self.non_members.insert(key);
+        }
         self.items.insert(key, ev);
         self.stamps.insert(key, stamp);
         self.order.insert(stamp, key);
-        while self.items.len() > MAX_PENDING_EVENTS || self.bytes > MAX_PENDING_BYTES {
+        while self.items.len() > self.limits.max_events || self.bytes > self.limits.max_bytes {
             let Some((_, oldest)) = self.order.pop_first() else { break };
             self.stamps.remove(&oldest);
-            if let Some(ev) = self.items.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(ev.approx_size());
+            if self.remove_item(&oldest).is_some() {
                 tracing::debug!(author = %oldest.0.short(), seq = oldest.1, "pending buffer full: dropped oldest event");
             }
         }
+    }
+
+    /// May `ev` (verdict `verdict` against `state`) be buffered under the limits?
+    fn admits(&self, state: &ConvState, ev: &StoredEvent, verdict: &Verdict, now_ms: u64) -> Option<bool> {
+        let l = &self.limits;
+        let author = ev.event.author;
+        if hlc_ms(ev.event.hlc) > now_ms.saturating_add(l.max_future_ms) {
+            return None;
+        }
+        if *verdict == Verdict::Gap && ev.event.seq > state.head(&author).saturating_add(l.max_ahead) {
+            return None;
+        }
+        let (n, b) = self.per_author.get(&author).copied().unwrap_or_default();
+        if n >= l.per_author_events || b.saturating_add(ev.approx_size()) > l.per_author_bytes {
+            return None;
+        }
+        let non_member = !state.is_member(&author);
+        if non_member && self.non_members.len() >= l.non_member_events {
+            return None;
+        }
+        Some(non_member)
+    }
+
+    fn remove_item(&mut self, key: &(UserId, u64)) -> Option<StoredEvent> {
+        let ev = self.items.remove(key)?;
+        let size = ev.approx_size();
+        self.bytes = self.bytes.saturating_sub(size);
+        if let Some(a) = self.per_author.get_mut(&key.0) {
+            a.0 = a.0.saturating_sub(1);
+            a.1 = a.1.saturating_sub(size);
+            if a.0 == 0 {
+                self.per_author.remove(&key.0);
+            }
+        }
+        self.non_members.remove(key);
+        Some(ev)
     }
 
     /// Remove and return every buffered event that is now acceptable, applying each one to
@@ -934,7 +1048,10 @@ impl PendingBuffer {
                 (Verdict::Accept, out)
             }
             Verdict::Gap | Verdict::Future => {
-                self.insert(ev);
+                match self.admits(state, &ev, &verdict, now_ms) {
+                    Some(non_member) => self.insert_as(ev, non_member),
+                    None => tracing::debug!(author = %ev.event.author.short(), seq = ev.event.seq, "pending limits: early event dropped"),
+                }
                 (verdict, Vec::new())
             }
             Verdict::Stale | Verdict::Reject(_) => (verdict, Vec::new()),
@@ -956,6 +1073,8 @@ impl PendingBuffer {
         self.stamps.clear();
         self.order.clear();
         self.bytes = 0;
+        self.per_author.clear();
+        self.non_members.clear();
     }
 
     fn next_author(&self, after: Option<UserId>) -> Option<UserId> {
@@ -974,11 +1093,10 @@ impl PendingBuffer {
     }
 
     fn take(&mut self, key: &(UserId, u64)) -> Option<StoredEvent> {
-        let ev = self.items.remove(key)?;
+        let ev = self.remove_item(key)?;
         if let Some(stamp) = self.stamps.remove(key) {
             self.order.remove(&stamp);
         }
-        self.bytes = self.bytes.saturating_sub(ev.approx_size());
         Some(ev)
     }
 }

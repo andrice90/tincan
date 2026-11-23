@@ -198,4 +198,15 @@ pub enum NetEvent {
         /// The call (`state == Ended` once it is over; `Net::call_info` is then None).
         call: CallInfo,
     },
+    /// `author` signed two different events with the same `seq` in `conv` (a modified
+    /// client). Replicas may show either version for that seq; both signed events are kept
+    /// as a proof. Show a warning on that member.
+    Equivocation {
+        /// Server or DM conversation.
+        conv: ConvId,
+        /// The equivocating author.
+        author: UserId,
+        /// The seq both events carry.
+        seq: u64,
+    },
 }

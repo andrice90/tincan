@@ -121,11 +121,14 @@ impl Net {
             router: Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
             freeze: crate::inner::Freeze::default(),
+            #[cfg(test)]
+            test: crate::inner::TestHooks::default(),
         });
         let weak = Arc::downgrade(&inner);
+        let gate = Arc::new(crate::proto::PreAuth::default());
         let builder = Router::builder(endpoint.clone())
-            .accept(ALPN_SERVER, ServerProto { net: weak.clone() })
-            .accept(ALPN_DM, DmProto { net: weak });
+            .accept(ALPN_SERVER, ServerProto { net: weak.clone(), gate: gate.clone() })
+            .accept(ALPN_DM, DmProto { net: weak, gate });
         let router = extra(builder).spawn();
         *inner.router.lock() = Some(router);
 
@@ -151,6 +154,10 @@ impl Net {
                 while let Some(ev) = stream.next().await {
                     if let iroh_mdns_address_lookup::DiscoveryEvent::Discovered { endpoint_info, .. } = ev {
                         let user = UserId::from_public_key(&endpoint_info.endpoint_id);
+                        // Anyone on the LAN can announce ids: only members and contacts count.
+                        if !net.is_known_peer(&user) {
+                            continue;
+                        }
                         let hint = hint_from_addr(&endpoint_info.to_endpoint_addr());
                         net.learn_hint(&user, &hint);
                         wake(&net, user);
@@ -226,7 +233,11 @@ impl Net {
 
     /// Create an invite code for `server`: valid 7 days, unlimited uses, bootstrap = me and
     /// the current host with their addresses. The `InviteCreate` event is published first.
-    pub async fn create_invite(&self, server: ServerId) -> Result<String> {
+    /// Hosts rate limit joins per invite and per invite creator.
+    pub async fn create_invite(&self, server: ServerId) -> Result<String> { self.create_invite_with(server, 0).await }
+
+    /// Like `create_invite`, with a use limit (`0` = unlimited).
+    pub async fn create_invite_with(&self, server: ServerId, max_uses: u32) -> Result<String> {
         let inner = &self.inner;
         let rep = inner.replica(&server).ok_or(NetError::UnknownConv)?;
         let (keys, name) = {
@@ -236,7 +247,7 @@ impl Net {
         let seed: [u8; 16] = random_bytes();
         let invite_pk = *invite_secret(&seed, &server).public().as_bytes();
         let expires_ms = now_ms().saturating_add(build::DEFAULT_INVITE_TTL_MS);
-        self.publish(server, Body::InviteCreate { invite_pk, expires_ms, max_uses: 0 }).await?;
+        self.publish(server, Body::InviteCreate { invite_pk, expires_ms, max_uses }).await?;
         let mut bootstrap = vec![(inner.me, inner.my_hint())];
         if let Some(host) = self.connection(&server).host
             && host != inner.me
@@ -707,6 +718,7 @@ async fn join_dial(inner: &Arc<Inner>, invite: &Invite, name: &str, seq: u64, hl
                     RejectCode::InviteExpired => Some(NetError::Rejected("This invite has expired.".into())),
                     RejectCode::BadInvite => Some(NetError::Rejected(capitalize(&reason))),
                     RejectCode::Version => Some(NetError::Rejected("That server runs an incompatible Tincan version.".into())),
+                    RejectCode::Busy => Some(NetError::Rejected("Too many people are joining right now. Try again in a minute.".into())),
                     RejectCode::NotMember | RejectCode::NotHost | RejectCode::Internal => None,
                 };
                 if let Some(e) = err {

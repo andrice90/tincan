@@ -54,8 +54,11 @@ const CACHE_MAX_TS: u32 = 4 * 90_000;
 const CACHE_FRESH: Duration = Duration::from_millis(1500);
 /// Input rate measurement window.
 const RATE_WINDOW_S: f64 = 1.0;
-/// Keyframe requests upstream are coalesced to one per this interval.
+/// Keyframe requests upstream are coalesced to one per this interval (also the most a
+/// viewer is re-seeded from the cache).
 pub(crate) const KEYFRAME_EVERY: Duration = Duration::from_secs(1);
+/// A group stream that cannot be opened within this is skipped.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Who watches a track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -76,10 +79,29 @@ pub(crate) struct VideoTrack {
     inner: Mutex<Inner>,
     keyframe: KeyframeFn,
     tasks: Arc<Tasks>,
+    /// Remote viewers seeded from the cache so far (tests).
+    #[cfg(test)]
+    pub seeds: AtomicUsize,
+    /// Keyframe requests sent to the source so far (tests).
+    #[cfg(test)]
+    pub keyframes_asked: AtomicUsize,
 }
 
 impl std::fmt::Debug for VideoTrack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "VideoTrack({})", self.track) }
+}
+
+impl VideoTrack {
+    /// Ask the source for a keyframe now (callers coalesce with `kf_due`).
+    fn ask_keyframe(&self) {
+        #[cfg(test)]
+        self.keyframes_asked.fetch_add(1, Ordering::Relaxed);
+        (self.keyframe)(self.track);
+    }
+
+    /// Remote viewers (tests).
+    #[cfg(test)]
+    pub fn remote_viewers(&self) -> usize { self.inner.lock().viewers.values().filter(|v| matches!(v, Viewer::Remote(_))).count() }
 }
 
 struct Inner {
@@ -96,6 +118,10 @@ struct Inner {
     bytes_in: u64,
     window_at: Instant,
     rate_bps: u32,
+    /// Last time each remote viewer was seeded from the cache. Kept outside the viewer, so an
+    /// Unsubscribe and Subscribe toggle cannot re-send the whole cache more than once per
+    /// `KEYFRAME_EVERY` (bounded: entries older than that are pruned).
+    seeded: HashMap<UserId, Instant>,
 }
 
 enum Viewer {
@@ -133,6 +159,9 @@ struct Shared {
     flushes: AtomicU64,
     want_key: AtomicBool,
     flush: Notify,
+    /// The viewer was removed or replaced: the writer stops at once (it may be parked in
+    /// `open_uni` towards a peer that never grants stream credit).
+    closed: AtomicBool,
 }
 
 impl Shared {
@@ -150,11 +179,20 @@ enum WMsg {
     Finish,
 }
 
-/// The producer side of a remote viewer. Dropping it closes the queue: the writer sends what
-/// is left and finishes its stream (or ends with the connection).
+/// The producer side of a remote viewer. Dropping it stops the writer task (its queued
+/// frames are abandoned and its stream finished).
 struct RemoteViewer {
     tx: mpsc::Sender<WMsg>,
     sh: Arc<Shared>,
+    /// `Connection::stable_id` of the viewer's connection.
+    stable: usize,
+}
+
+impl Drop for RemoteViewer {
+    fn drop(&mut self) {
+        self.sh.closed.store(true, Ordering::Release);
+        self.sh.flush.notify_one();
+    }
 }
 
 /// Is a backlog of `frames` / `bytes` too much for a track running at `bps`?
@@ -258,9 +296,14 @@ impl VideoTrack {
                 bytes_in: 0,
                 window_at: now,
                 rate_bps: 0,
+                seeded: HashMap::new(),
             }),
             keyframe,
             tasks,
+            #[cfg(test)]
+            seeds: AtomicUsize::new(0),
+            #[cfg(test)]
+            keyframes_asked: AtomicUsize::new(0),
         })
     }
 
@@ -271,7 +314,7 @@ impl VideoTrack {
             kf_due(&mut t.last_kf, Instant::now())
         };
         if due {
-            (self.keyframe)(self.track);
+            self.ask_keyframe();
         }
     }
 
@@ -301,7 +344,7 @@ impl VideoTrack {
                 need_kf = kf_due(&mut t.last_kf, now);
                 drop(t);
                 if need_kf {
-                    (self.keyframe)(self.track);
+                    self.ask_keyframe();
                 }
                 return;
             }
@@ -343,7 +386,7 @@ impl VideoTrack {
             }
         }
         if need_kf {
-            (self.keyframe)(self.track);
+            self.ask_keyframe();
         }
     }
 
@@ -359,7 +402,7 @@ impl VideoTrack {
             kf_due(&mut t.last_kf, Instant::now())
         };
         if due {
-            (self.keyframe)(self.track);
+            self.ask_keyframe();
         }
     }
 
@@ -377,21 +420,38 @@ impl VideoTrack {
         }
     }
 
-    /// Add (or replace) a remote viewer reached over `conn`. It starts with the cached group
-    /// right away, or waits for the next keyframe.
+    /// Add a remote viewer reached over `conn` (replacing one on another connection). It
+    /// starts with the cached group right away, or waits for the next keyframe. A viewer that
+    /// already exists on the same connection is kept as it is: one writer per (viewer,
+    /// track), and a repeated subscribe does not re-seed the cache. A viewer seeded less than
+    /// `KEYFRAME_EVERY` ago (an Unsubscribe and Subscribe toggle) waits for the next keyframe
+    /// instead of getting the cache again.
     pub fn add_remote(&self, peer: UserId, conn: Connection) {
+        let stable = conn.stable_id();
+        if matches!(self.inner.lock().viewers.get(&ViewerId::Peer(peer)), Some(Viewer::Remote(r)) if r.stable == stable) {
+            return;
+        }
         let sh = Arc::new(Shared::default());
         let (tx, rx) = mpsc::channel(VIEWER_QUEUE);
         self.tasks.spawn(writer(conn, self.track, rx, sh.clone()));
-        let mut v = RemoteViewer { tx, sh };
+        let mut v = RemoteViewer { tx, sh, stable };
+        let now = Instant::now();
         let need_kf = {
             let mut t = self.inner.lock();
-            let need = seed(&mut t, &mut v);
+            let need = if seeded_recently(&t, &peer, now) {
+                v.sh.want_key.store(true, Ordering::Release);
+                true
+            } else {
+                #[cfg(test)]
+                self.seeds.fetch_add(1, Ordering::Relaxed);
+                note_seed(&mut t, peer, now);
+                seed(&mut t, &mut v)
+            };
             t.viewers.insert(ViewerId::Peer(peer), Viewer::Remote(v));
-            need && kf_due(&mut t.last_kf, Instant::now())
+            need && kf_due(&mut t.last_kf, now)
         };
         if need_kf {
-            (self.keyframe)(self.track);
+            self.ask_keyframe();
         }
     }
 
@@ -415,31 +475,41 @@ impl VideoTrack {
             need && kf_due(&mut t.last_kf, Instant::now())
         };
         if need_kf {
-            (self.keyframe)(self.track);
+            self.ask_keyframe();
         }
     }
 
     /// A viewer asked for a keyframe (decoder trouble, a gap): restart it from the cache when
-    /// that is fresh, otherwise ask upstream.
+    /// that is fresh (at most once per `KEYFRAME_EVERY` per viewer, the honest rate),
+    /// otherwise skip it to the next keyframe and ask upstream (coalesced).
     pub fn viewer_wants_key(&self, id: ViewerId) {
+        let now = Instant::now();
         let need_kf = {
             let mut t = self.inner.lock();
             let fresh = t.cache_ok && t.live && t.cache_at.is_some_and(|a| a.elapsed() < CACHE_FRESH);
             let mut need = !fresh;
-            if fresh {
-                let mut v = t.viewers.remove(&id);
-                if let Some(Viewer::Remote(r)) = &mut v {
+            let mut v = t.viewers.remove(&id);
+            if let (Some(Viewer::Remote(r)), ViewerId::Peer(peer)) = (&mut v, id) {
+                let may_seed = !seeded_recently(&t, &peer, now);
+                if fresh && may_seed {
                     r.sh.flush();
+                    note_seed(&mut t, peer, now);
+                    #[cfg(test)]
+                    self.seeds.fetch_add(1, Ordering::Relaxed);
                     need |= seed(&mut t, r);
-                }
-                if let Some(v) = v {
-                    t.viewers.insert(id, v);
+                } else if fresh {
+                    // Too soon for another full re-seed: wait for the next keyframe.
+                    r.sh.flush();
+                    need = true;
                 }
             }
-            need && kf_due(&mut t.last_kf, Instant::now())
+            if let Some(v) = v {
+                t.viewers.insert(id, v);
+            }
+            need && kf_due(&mut t.last_kf, now)
         };
         if need_kf {
-            (self.keyframe)(self.track);
+            self.ask_keyframe();
         }
     }
 
@@ -477,6 +547,19 @@ fn kf_due(last: &mut Option<Instant>, now: Instant) -> bool {
     true
 }
 
+/// Was `peer` seeded from the cache less than `KEYFRAME_EVERY` ago (on this track)?
+fn seeded_recently(t: &Inner, peer: &UserId, now: Instant) -> bool {
+    t.seeded.get(peer).is_some_and(|at| now.saturating_duration_since(*at) < KEYFRAME_EVERY)
+}
+
+/// Remember that `peer` was seeded at `now` (entries past `KEYFRAME_EVERY` are pruned).
+fn note_seed(t: &mut Inner, peer: UserId, now: Instant) {
+    if t.seeded.len() >= 64 {
+        t.seeded.retain(|_, at| now.saturating_duration_since(*at) < KEYFRAME_EVERY);
+    }
+    t.seeded.insert(peer, now);
+}
+
 /// Queue the cached group for a (re)starting viewer. True if a keyframe should be requested
 /// (no usable cache, or it is old).
 fn seed(t: &mut Inner, v: &mut RemoteViewer) -> bool {
@@ -510,7 +593,7 @@ async fn write_or_flush(s: &mut SendStream, bufs: &mut [Bytes], sh: &Shared, see
         tokio::select! {
             biased;
             _ = sh.flush.notified() => {
-                if sh.flushes.load(Ordering::Acquire) != seen {
+                if sh.closed.load(Ordering::Acquire) || sh.flushes.load(Ordering::Acquire) != seen {
                     return Wrote::Flushed;
                 }
             }
@@ -536,6 +619,10 @@ async fn writer(conn: Connection, track: u16, mut rx: mpsc::Receiver<WMsg>, sh: 
     let mut seen = sh.flushes.load(Ordering::Acquire);
     let mut cur: Option<(u32, SendStream)> = None;
     loop {
+        if sh.closed.load(Ordering::Acquire) {
+            reset(&mut cur);
+            break;
+        }
         let msg = tokio::select! {
             biased;
             _ = sh.flush.notified() => {
@@ -586,13 +673,14 @@ async fn writer(conn: Connection, track: u16, mut rx: mpsc::Receiver<WMsg>, sh: 
                 let _ = old.finish();
             }
             let opened = {
-                let fut = conn.open_uni();
+                // A peer that never grants stream credit must not park this task forever.
+                let fut = tokio::time::timeout(OPEN_TIMEOUT, conn.open_uni());
                 tokio::pin!(fut);
                 loop {
                     tokio::select! {
                         biased;
                         _ = sh.flush.notified() => {
-                            if sh.flushes.load(Ordering::Acquire) != seen {
+                            if sh.closed.load(Ordering::Acquire) || sh.flushes.load(Ordering::Acquire) != seen {
                                 break None;
                             }
                         }
@@ -605,8 +693,14 @@ async fn writer(conn: Connection, track: u16, mut rx: mpsc::Receiver<WMsg>, sh: 
                     seen = sh.flushes.load(Ordering::Acquire);
                     continue;
                 }
-                Some(Ok(s)) => s,
-                Some(Err(_)) => break,
+                Some(Ok(Ok(s))) => s,
+                Some(Ok(Err(_))) => break,
+                Some(Err(_)) => {
+                    // No stream within the timeout: skip this group, wait for the next key.
+                    sh.flush();
+                    seen = sh.flushes.load(Ordering::Acquire);
+                    continue;
+                }
             };
             let _ = s.set_priority(PRIO_NEW);
             let header = VideoStreamHeader { track, group_seq: group, codec: CODEC_H264_ANNEXB, flags: 0 }.write();

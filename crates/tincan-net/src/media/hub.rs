@@ -236,6 +236,14 @@ impl MediaHub {
         }
     }
 
+    /// Host side: the voice room the SFU forwards to `user` (set only by its VoiceJoin and
+    /// VoiceLeave), None when not hosting `server`.
+    pub fn voice_of(&self, server: &ServerId, user: &UserId) -> Option<ChannelId> { self.sfu(server).and_then(|s| s.voice_of(user)) }
+
+    /// The SFU of a hosted server (tests).
+    #[cfg(test)]
+    pub fn sfu_for_test(&self, server: &ServerId) -> Option<Arc<Sfu>> { self.sfu(server) }
+
     fn sfu(&self, server: &ServerId) -> Option<Arc<Sfu>> {
         match self.st.lock().roles.get(server) {
             Some(Role::Host { sfu, .. }) => Some(sfu.clone()),
@@ -270,7 +278,7 @@ impl MediaHub {
             CtlSource::FromHost { server, .. } => {
                 let st = self.st.lock();
                 if let Some(r) = st.room.as_ref().filter(|r| matches!(r.kind, VoiceKind::Room { server: s, .. } if s == server)) {
-                    r.send(VoiceCmd::FromPeer(ctl.clone()));
+                    r.send_remote(VoiceCmd::FromPeer(ctl.clone()));
                 }
             }
             CtlSource::Dm { peer } => self.on_dm_ctl(net, peer, ctl),
@@ -314,7 +322,7 @@ impl MediaHub {
                 }
                 _ => {
                     if let Some(v) = st.call.as_ref().filter(|c| c.info.peer == peer && c.info.state == CallState::Active).and_then(|c| c.voice.as_ref()) {
-                        v.send(VoiceCmd::FromPeer(ctl.clone()));
+                        v.send_remote(VoiceCmd::FromPeer(ctl.clone()));
                     }
                 }
             }

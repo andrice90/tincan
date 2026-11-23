@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use iroh::endpoint::{Connection, SendStream};
@@ -28,6 +29,7 @@ use crate::error::{NetError, Result};
 use crate::events::NetEvent;
 use crate::hooks::{CtlSource, is_extra};
 use crate::inner::Inner;
+use crate::limits::{Bucket, Buckets};
 use crate::link::{self, Dialed, FrameReader, Link, LinkEvent};
 use crate::replica::{Replica, ReplicaRef, send_missing};
 
@@ -54,16 +56,64 @@ struct DmPeer {
     holds: usize,
 }
 
+/// Stranger DM connections (no stored conversation, no shared server) held at once.
+pub(crate) const MAX_STRANGER_LINKS: usize = 8;
+/// New stranger DM connections: burst, then one per this (10 per minute).
+const STRANGER_EVERY: Duration = Duration::from_secs(6);
+const STRANGER_BURST: u32 = 10;
+/// Conversations opened by strangers that I never answered, kept at once. Beyond this, a
+/// stranger's first message is not accepted (no row, no `DmOpened`).
+pub(crate) const MAX_UNANSWERED_STRANGER_CONVS: usize = 32;
+/// Typing notices per contact: one per this.
+const DM_TYPING_EVERY: Duration = Duration::from_secs(2);
+/// Rings per contact: a burst of 5, then one per 10 s.
+const CALL_INVITE_EVERY: Duration = Duration::from_secs(10);
+const CALL_INVITE_BURST: u32 = 5;
+/// Call state updates per contact.
+const CALL_STATE_EVERY: Duration = Duration::from_millis(500);
+const CALL_STATE_BURST: u32 = 4;
+
+/// Per-contact budgets of what a DM peer can make this device emit.
+#[derive(Debug)]
+struct DmGates {
+    strangers: Bucket,
+    typing: Buckets<UserId>,
+    call_invite: Buckets<UserId>,
+    call_state: Buckets<UserId>,
+}
+
+impl Default for DmGates {
+    fn default() -> Self {
+        Self {
+            strangers: Bucket::every(STRANGER_EVERY, STRANGER_BURST, Instant::now()),
+            typing: Buckets::new(DM_TYPING_EVERY, 1),
+            call_invite: Buckets::new(CALL_INVITE_EVERY, CALL_INVITE_BURST),
+            call_state: Buckets::new(CALL_STATE_EVERY, CALL_STATE_BURST),
+        }
+    }
+}
+
 /// All DM connections and delivery state.
 #[derive(Debug)]
 pub(crate) struct DmManager {
     peers: Mutex<HashMap<UserId, DmPeer>>,
     next_id: Mutex<u64>,
     changed: watch::Sender<u64>,
+    /// Peers whose connection was accepted while they were strangers (no conversation yet).
+    strangers: Mutex<std::collections::HashSet<UserId>>,
+    gates: Mutex<DmGates>,
 }
 
 impl Default for DmManager {
-    fn default() -> Self { Self { peers: Mutex::new(HashMap::new()), next_id: Mutex::new(0), changed: watch::channel(0).0 } }
+    fn default() -> Self {
+        Self {
+            peers: Mutex::new(HashMap::new()),
+            next_id: Mutex::new(0),
+            changed: watch::channel(0).0,
+            strangers: Mutex::new(std::collections::HashSet::new()),
+            gates: Mutex::new(DmGates::default()),
+        }
+    }
 }
 
 /// Keeps the DM connection to a contact open while held (part B: calls).
@@ -242,11 +292,12 @@ impl DmManager {
 
     /// Send a Have delta on every DM connection.
     pub fn broadcast_have(&self, add: &[BlobHash], remove: &[BlobHash]) {
-        let ctl = Ctl::Have { add: add.to_vec(), remove: remove.to_vec() };
-        let Some(b) = link::encode(&ctl) else { return };
-        for p in self.peers.lock().values() {
-            if let Some(l) = &p.link {
-                let _ = l.live.try_send(b.clone());
+        for ctl in tincan_core::wire::have_frames(add, remove) {
+            let Some(b) = link::encode(&ctl) else { continue };
+            for p in self.peers.lock().values() {
+                if let Some(l) = &p.link {
+                    let _ = l.live.try_send(b.clone());
+                }
             }
         }
     }
@@ -282,6 +333,7 @@ impl DmManager {
             *n
         };
         let (tx, rx) = mpsc::channel(256);
+        let sync_tx = tx.clone();
         let new_link = Link::spawn(&net.tasks, id, d.conn.clone(), d.send, d.reader, tx);
         let keep_new = {
             let mut peers = self.peers.lock();
@@ -313,7 +365,7 @@ impl DmManager {
         net.emit(NetEvent::DmLinkUp { peer });
         tracing::debug!(peer = %peer.short(), "DM connection up");
         let net2 = net.clone();
-        net.tasks.spawn(run_conn(net2, peer, conv, new_link, rx, heads));
+        net.tasks.spawn(run_conn(net2, peer, conv, new_link, rx, sync_tx, heads));
     }
 
     fn unregister(&self, net: &Arc<Inner>, peer: UserId, id: u64) {
@@ -328,14 +380,79 @@ impl DmManager {
             }
         };
         if removed {
+            self.strangers.lock().remove(&peer);
             self.bump();
             net.media.dm_link(net, peer);
             net.emit(NetEvent::DmLinkDown { peer });
             if self.has_pending(net, &peer) {
                 self.dial_failed(net, peer);
             }
+            // A stranger that left nothing behind is forgotten.
+            let conv = ConvId::dm(&net.me, &peer);
+            if net.replica(&conv).is_none() {
+                let mut peers = self.peers.lock();
+                if peers.get(&peer).is_some_and(|p| p.link.is_none() && p.holds == 0 && p.retry.is_none() && !p.dialing) {
+                    peers.remove(&peer);
+                }
+            }
         }
     }
+
+    /// May a stranger's DM connection be accepted now? (A global rate and a cap on stranger
+    /// connections held at once; one per peer.)
+    fn admit_stranger(&self, peer: UserId) -> bool {
+        let mut s = self.strangers.lock();
+        if s.contains(&peer) {
+            return true;
+        }
+        if s.len() >= MAX_STRANGER_LINKS || !self.gates.lock().strangers.take(Instant::now()) {
+            return false;
+        }
+        s.insert(peer);
+        true
+    }
+
+    /// Budget check for something a DM peer makes this device show (typing, rings, state).
+    fn allow(&self, peer: &UserId, ctl: &Ctl) -> bool {
+        let now = Instant::now();
+        let mut g = self.gates.lock();
+        match ctl {
+            Ctl::Typing { .. } => g.typing.take(peer, now),
+            Ctl::CallInvite { .. } => g.call_invite.take(peer, now),
+            Ctl::CallState { .. } => g.call_state.take(peer, now),
+            _ => true,
+        }
+    }
+}
+
+/// Conversations opened by strangers I never wrote in (each one a DM list entry and a row).
+fn unanswered_stranger_convs(net: &Inner) -> usize {
+    let dms: Vec<(UserId, ReplicaRef)> = net
+        .replicas
+        .read()
+        .values()
+        .filter_map(|r| {
+            let g = r.lock();
+            (g.state.is_dm).then(|| g.record.peer.map(|p| (p, r.clone()))).flatten()
+        })
+        .collect();
+    dms.iter().filter(|(p, r)| r.lock().state.head(&net.me) == 0 && !net.shares_server(p)).count()
+}
+
+/// A stranger's batch: does its first event apply in order to an empty DM log (a real,
+/// signed first message from them)? Nothing is stored and nothing is buffered here.
+fn stranger_opens(net: &Inner, conv: &ConvId, peer: &UserId, events: &[tincan_core::event::SignedEvent]) -> bool {
+    let mut state = ConvState::new_dm(net.me, *peer);
+    for signed in events.iter().take(4) {
+        let Ok(stored) = StoredEvent::from_signed(signed.clone()) else { continue };
+        if stored.conv() != *conv || stored.event.author != *peer {
+            continue;
+        }
+        if state.apply(&stored, now_ms()).0 == Verdict::Accept {
+            return true;
+        }
+    }
+    false
 }
 
 /// Make sure the DM record and replica for `peer` exist. Returns the conv and whether it
@@ -442,9 +559,16 @@ pub(crate) async fn accept_incoming(net: Arc<Inner>, conn: Connection, mut send:
         link::close_conn(&conn, tincan_core::CLOSE_REJECTED, "wrong conversation");
         return;
     }
-    if let Err(e) = open_conv(&net, peer) {
-        tracing::warn!(error = %e, "cannot open DM conversation");
-        link::close_conn(&conn, tincan_core::CLOSE_REJECTED, "internal");
+    if net.is_known_peer(&peer) {
+        if let Err(e) = open_conv(&net, peer) {
+            tracing::warn!(error = %e, "cannot open DM conversation");
+            link::close_conn(&conn, tincan_core::CLOSE_REJECTED, "internal");
+            return;
+        }
+    } else if !net.dm.admit_stranger(peer) {
+        // A stranger (no conversation, no shared server): accepted only within the limits,
+        // and nothing is stored until they send a valid first message.
+        link::close_conn(&conn, tincan_core::CLOSE_REJECTED, "busy");
         return;
     }
     let hello = dm_hello(&net, conv);
@@ -455,14 +579,59 @@ pub(crate) async fn accept_incoming(net: Arc<Inner>, conn: Connection, mut send:
     net.dm.register(&net, peer, d, peer);
 }
 
-/// Drive one DM connection until it closes or goes idle.
-async fn run_conn(net: Arc<Inner>, peer: UserId, conv: ConvId, link: Link, mut rx: mpsc::Receiver<LinkEvent>, first_heads: Heads) {
-    let replica: Option<ReplicaRef> = net.replica(&conv);
-    let Some(replica) = replica else {
-        link.close(tincan_core::CLOSE_NORMAL, "no conversation");
-        return;
-    };
-    on_heads(&net, &peer, &conv, &replica, &link, first_heads);
+/// History sync on one DM connection: at most one `send_missing` in flight, the latest
+/// request queued (a peer repeating SyncHave or DmHello cannot start unbounded tasks).
+struct DmSync {
+    running: bool,
+    queued: Option<Heads>,
+    done: mpsc::Sender<LinkEvent>,
+}
+
+impl DmSync {
+    fn request(&mut self, net: &Arc<Inner>, replica: &ReplicaRef, link: &Link, heads: Heads) {
+        if self.running {
+            self.queued = Some(heads);
+            return;
+        }
+        if replica.lock().state.sync_heads().missing_in(&heads).is_empty() {
+            return;
+        }
+        self.running = true;
+        let storage = net.storage.clone();
+        let rep = replica.clone();
+        let bulk = link.bulk();
+        let done = self.done.clone();
+        let id = link.id;
+        net.tasks.spawn(async move {
+            send_missing(storage, rep, heads, bulk).await;
+            let _ = done.send(LinkEvent::SyncSent { link: id }).await;
+        });
+    }
+
+    fn finished(&mut self, net: &Arc<Inner>, replica: &ReplicaRef, link: &Link) {
+        self.running = false;
+        if let Some(h) = self.queued.take() {
+            self.request(net, replica, link, h);
+        }
+    }
+}
+
+/// Drive one DM connection until it closes or goes idle. A stranger's connection runs
+/// without a conversation until their first valid message opens one.
+async fn run_conn(
+    net: Arc<Inner>,
+    peer: UserId,
+    conv: ConvId,
+    link: Link,
+    mut rx: mpsc::Receiver<LinkEvent>,
+    sync_tx: mpsc::Sender<LinkEvent>,
+    first_heads: Heads,
+) {
+    let mut replica: Option<ReplicaRef> = net.replica(&conv);
+    let mut sync = DmSync { running: false, queued: None, done: sync_tx };
+    if let Some(r) = &replica {
+        on_heads(&net, &peer, &conv, r, &link, &mut sync, first_heads);
+    }
     let idle = net.timings.dm_idle;
     let mut idle_at = Instant::now() + idle;
     loop {
@@ -470,9 +639,25 @@ async fn run_conn(net: Arc<Inner>, peer: UserId, conv: ConvId, link: Link, mut r
             ev = rx.recv() => match ev {
                 Some(LinkEvent::Frame { ctl, .. }) => {
                     idle_at = Instant::now() + idle;
-                    on_frame(&net, &peer, &conv, &replica, &link, *ctl);
+                    let ctl = *ctl;
+                    if replica.is_none() {
+                        replica = stranger_frame(&net, &peer, &conv, &ctl);
+                        if replica.is_none() {
+                            if is_extra(&ctl) && net.dm.allow(&peer, &ctl) {
+                                net.extra(CtlSource::Dm { peer }, ctl);
+                            }
+                            continue;
+                        }
+                    }
+                    if let Some(r) = &replica {
+                        on_frame(&net, &peer, &conv, r, &link, &mut sync, ctl);
+                    }
                 }
-                Some(LinkEvent::SyncSent { .. }) => {}
+                Some(LinkEvent::SyncSent { .. }) => {
+                    if let Some(r) = &replica {
+                        sync.finished(&net, r, &link);
+                    }
+                }
                 Some(LinkEvent::Closed { .. }) | None => break,
             },
             _ = tokio::time::sleep_until(idle_at) => {
@@ -490,20 +675,36 @@ async fn run_conn(net: Arc<Inner>, peer: UserId, conv: ConvId, link: Link, mut r
     net.dm.unregister(&net, peer, link.id);
 }
 
-fn on_heads(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef, link: &Link, heads: Heads) {
+fn on_heads(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef, link: &Link, sync: &mut DmSync, heads: Heads) {
     net.dm.note_heads(net, conv, peer, &heads);
-    let missing = replica.lock().state.sync_heads().missing_in(&heads);
-    if !missing.is_empty() {
-        let storage = net.storage.clone();
-        let rep = replica.clone();
-        let bulk = link.bulk();
-        net.tasks.spawn(async move {
-            send_missing(storage, rep, heads, bulk).await;
-        });
+    sync.request(net, replica, link, heads);
+}
+
+/// A frame from a stranger whose conversation does not exist yet. Returns the replica if
+/// this frame opened the conversation (it is then handled normally).
+fn stranger_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, ctl: &Ctl) -> Option<ReplicaRef> {
+    let Ctl::Events { events, .. } = ctl else { return None };
+    if !stranger_opens(net, conv, peer, events) {
+        // Early or invalid events from a stranger are never buffered.
+        return None;
+    }
+    if net.replica(conv).is_none() && unanswered_stranger_convs(net) >= MAX_UNANSWERED_STRANGER_CONVS {
+        tracing::info!(peer = %peer.short(), "too many unanswered stranger conversations; ignoring a new one");
+        return None;
+    }
+    match open_conv(net, *peer) {
+        Ok(_) => {
+            net.dm.strangers.lock().remove(peer);
+            net.replica(conv)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot open DM conversation");
+            None
+        }
     }
 }
 
-fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef, link: &Link, ctl: Ctl) {
+fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef, link: &Link, sync: &mut DmSync, ctl: Ctl) {
     match ctl {
         Ctl::Events { events, .. } => {
             if events.is_empty() {
@@ -526,15 +727,19 @@ fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef
                 let _ = link.send(&Ctl::SyncHave { heads });
             }
         }
-        Ctl::SyncHave { heads } => on_heads(net, peer, conv, replica, link, heads),
+        Ctl::SyncHave { heads } => on_heads(net, peer, conv, replica, link, sync, heads),
         Ctl::Have { .. } => {}
         Ctl::Typing { by, .. } => {
-            if by == *peer {
+            if by == *peer && net.dm.allow(peer, &ctl) {
                 net.emit(NetEvent::Typing { conv: *conv, channel: dm_channel(conv), user: by });
             }
         }
-        Ctl::DmHello { heads, .. } => on_heads(net, peer, conv, replica, link, heads),
-        other if is_extra(&other) => net.extra(CtlSource::Dm { peer: *peer }, other),
+        Ctl::DmHello { heads, .. } => on_heads(net, peer, conv, replica, link, sync, heads),
+        other if is_extra(&other) => {
+            if net.dm.allow(peer, &other) {
+                net.extra(CtlSource::Dm { peer: *peer }, other);
+            }
+        }
         other => tracing::trace!(?other, "DM: ignoring frame"),
     }
 }

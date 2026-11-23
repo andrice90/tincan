@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::election::{SignedHostClaim, Status};
+use crate::election::{MAX_ATTESTS, SignedAttestation, SignedHostClaim, Status};
 use crate::event::SignedEvent;
 use crate::keys::Sig64;
 use crate::sync::Heads;
@@ -94,6 +94,9 @@ pub enum RejectCode {
     Version,
     /// Something broke on the host.
     Internal,
+    /// The host is busy (too many joins right now); try again in a minute. Appended last
+    /// (postcard encodes the index).
+    Busy,
 }
 
 /// Control messages. Append new variants only at the end (postcard encodes the index).
@@ -363,6 +366,152 @@ pub enum Ctl {
         /// Screen share track id, if sharing.
         sharing: Option<u16>,
     },
+
+    // ---- appended (hardening) ----
+    /// Member -> host: "I am connected to you at your current epoch" (signed by the member).
+    /// Sent after Welcome, after every HostMoved and every `ATTEST_EVERY_MS`.
+    Attest(SignedAttestation),
+    /// Host <-> host during partition merge: like `HostCompare`, but the member count is
+    /// proven by member attestations (at most `MAX_ATTESTS`) instead of self-reported.
+    HostCompare2 {
+        /// Sender's claim.
+        claim: SignedHostClaim,
+        /// Attestations of the sender's connected members for that claim's epoch.
+        attests: Vec<SignedAttestation>,
+    },
+    /// Heads too large for one frame, split into parts. The receiver collects parts until
+    /// `more == false` and then handles the union like one `SyncHave`.
+    SyncHavePart {
+        /// Part of the heads.
+        heads: Heads,
+        /// More parts follow.
+        more: bool,
+    },
+}
+
+/// Longest soundboard clip name, in chars (same as other names).
+pub const MAX_CLIP_NAME_CHARS: usize = 100;
+/// Largest soundboard clip file (architecture.md: 5 MB).
+pub const MAX_CLIP_BYTES: u64 = 5 * 1024 * 1024;
+/// Longest soundboard clip (architecture.md: 20 s).
+pub const MAX_CLIP_MS: u32 = 20_000;
+/// Decoder padding slack on top of `MAX_CLIP_MS` (same as `tincan_audio::CLIP_LENGTH_TOLERANCE_MS`:
+/// an MP3 trimmed to exactly 20 s decodes a little longer, and the app stores what it decoded).
+pub const CLIP_DURATION_TOLERANCE_MS: u32 = 100;
+/// Most clips a member may announce.
+pub const MAX_CLIPS: usize = 256;
+/// Most held-blob hashes a host keeps per member (and that one Hello/DmHello may carry).
+pub const MAX_HAVE: usize = 20_000;
+/// Most hashes in one `Have` delta (each of add and remove).
+pub const MAX_HAVE_DELTA: usize = 1024;
+/// Most entries in a roster a member accepts.
+pub const MAX_ROSTER: usize = 256;
+/// Most holders in one `Holders` reply a member accepts.
+pub const MAX_HOLDERS: usize = 32;
+/// Longest reason text in `Reject` / `PublishAck`.
+pub const MAX_REASON_CHARS: usize = 256;
+/// Longest app version string in `Status`.
+pub const MAX_APP_VERSION_CHARS: usize = 32;
+/// Most direct addresses kept from one `AddrHint`.
+pub const MAX_HINT_DIRECT: usize = 8;
+/// Longest relay URL kept from one `AddrHint`, in bytes.
+pub const MAX_HINT_RELAY_BYTES: usize = 256;
+/// Heads entries per `SyncHave` / `SyncHavePart` frame (about 34 B each, well below
+/// `MAX_FRAME`).
+pub const HEADS_PER_FRAME: usize = 8192;
+
+impl ClipInfo {
+    /// Within the soundboard limits: a short name without control characters, at most
+    /// `MAX_CLIP_BYTES` and `MAX_CLIP_MS` (+ `CLIP_DURATION_TOLERANCE_MS`).
+    pub fn is_valid(&self) -> bool {
+        !self.name.is_empty()
+            && self.name.chars().count() <= MAX_CLIP_NAME_CHARS
+            && !self.name.chars().any(char::is_control)
+            && self.size <= MAX_CLIP_BYTES
+            && self.duration_ms <= MAX_CLIP_MS + CLIP_DURATION_TOLERANCE_MS
+    }
+}
+
+impl AddrHint {
+    /// The hint cut to what is ever used: at most `MAX_HINT_DIRECT` direct addresses and a
+    /// relay URL of at most `MAX_HINT_RELAY_BYTES` (dropped if longer).
+    pub fn bounded(&self) -> AddrHint {
+        AddrHint {
+            relay: self.relay.clone().filter(|r| r.len() <= MAX_HINT_RELAY_BYTES),
+            direct: self.direct.iter().take(MAX_HINT_DIRECT).copied().collect(),
+        }
+    }
+
+    fn within_limits(&self) -> bool { self.relay.as_ref().is_none_or(|r| r.len() <= MAX_HINT_RELAY_BYTES) && self.direct.len() <= 4 * MAX_HINT_DIRECT }
+}
+
+/// `text` safe to show a user: control characters removed, at most `max` chars.
+pub fn sanitize_text(text: &str, max: usize) -> String { text.chars().filter(|c| !c.is_control()).take(max).collect() }
+
+impl Ctl {
+    /// Size limits a well-formed message never exceeds (names, lists, reasons). Receivers
+    /// drop messages that fail this before acting on them. Lists an honest peer may grow
+    /// (held blobs and clips in `Hello`) are not checked here: receivers truncate them.
+    pub fn within_limits(&self) -> bool {
+        let reason_ok = |r: &str| r.len() <= 4 * MAX_REASON_CHARS;
+        match self {
+            Ctl::Hello { status, .. } | Ctl::Status(status) => status.app_version.len() <= 4 * MAX_APP_VERSION_CHARS,
+            // A PublishAck is kept whatever its reason (the receiver cleans the text): dropping
+            // it would leave the event unacknowledged.
+            Ctl::Reject { reason, .. } => reason_ok(reason),
+            Ctl::Roster(r) => r.online.len() <= MAX_ROSTER && r.succession.len() <= 16 && r.online.iter().all(|e| e.addr.within_limits()),
+            Ctl::Redirect { addr, .. } | Ctl::HostMoved { addr, .. } => addr.within_limits(),
+            Ctl::Have { add, remove } => add.len() <= MAX_HAVE_DELTA && remove.len() <= MAX_HAVE_DELTA,
+            Ctl::Holders { holders, .. } => holders.len() <= 4 * MAX_HOLDERS && holders.iter().all(|(_, a)| a.within_limits()),
+            Ctl::SoundPlayed { clip, .. } => clip.is_valid(),
+            Ctl::HostCompare2 { attests, .. } => attests.len() <= MAX_ATTESTS,
+            Ctl::SyncHave { heads } | Ctl::SyncHavePart { heads, .. } => heads.0.len() <= 4 * HEADS_PER_FRAME,
+            _ => true,
+        }
+    }
+}
+
+/// A `Have` delta as frames of at most `MAX_HAVE_DELTA` hashes each way.
+pub fn have_frames(add: &[BlobHash], remove: &[BlobHash]) -> Vec<Ctl> {
+    let mut out = Vec::new();
+    for c in remove.chunks(MAX_HAVE_DELTA) {
+        out.push(Ctl::Have { add: Vec::new(), remove: c.to_vec() });
+    }
+    for c in add.chunks(MAX_HAVE_DELTA) {
+        out.push(Ctl::Have { add: c.to_vec(), remove: Vec::new() });
+    }
+    out
+}
+
+/// `SyncHave` for `heads`, split into `SyncHavePart` frames when it would not fit in one.
+pub fn sync_have_frames(heads: Heads) -> Vec<Ctl> {
+    if heads.0.len() <= HEADS_PER_FRAME {
+        return vec![Ctl::SyncHave { heads }];
+    }
+    let chunks: Vec<Vec<(UserId, u64)>> = heads.0.chunks(HEADS_PER_FRAME).map(|c| c.to_vec()).collect();
+    let last = chunks.len() - 1;
+    chunks.into_iter().enumerate().map(|(i, c)| Ctl::SyncHavePart { heads: Heads(c), more: i < last }).collect()
+}
+
+/// Collects `SyncHavePart` frames (bounded).
+#[derive(Debug, Default)]
+pub struct HeadsAssembler {
+    parts: Vec<(UserId, u64)>,
+}
+
+impl HeadsAssembler {
+    /// Most entries collected; beyond that the assembly is dropped.
+    pub const MAX_ENTRIES: usize = 65_536;
+
+    /// Add a part. Returns the complete heads once `more == false`.
+    pub fn push(&mut self, heads: Heads, more: bool) -> Option<Heads> {
+        if self.parts.len() + heads.0.len() > Self::MAX_ENTRIES {
+            self.parts.clear();
+            return None;
+        }
+        self.parts.extend(heads.0);
+        if more { None } else { Some(Heads(std::mem::take(&mut self.parts))) }
+    }
 }
 
 /// Encode one frame (length prefix + postcard).
@@ -555,5 +704,73 @@ mod tests {
         assert_eq!(idx(&Ctl::SyncHave { heads: Heads::default() }), 6);
         assert_eq!(idx(&Ctl::Tick { epoch: 0, t_ms: 0 }), 13);
         assert_eq!(idx(&Ctl::CallState { call_id: 0, muted: false, deafened: false, sharing: None }), 35);
+        assert_eq!(idx(&Ctl::SyncHavePart { heads: Heads::default(), more: false }), 38);
+    }
+
+    #[test]
+    fn appended_variants_round_trip() {
+        let id = Identity::generate();
+        let server = ServerId::from_bytes([1; 32]);
+        let claim = crate::election::SignedHostClaim::sign(&id, HostClaim { server, epoch: 3, host: id.user(), prev: None, issued_ms: 9 }).unwrap();
+        let att = crate::election::SignedAttestation::sign(
+            &id,
+            crate::election::Attestation { server, host: UserId([2; 32]), epoch: 3, member: id.user(), issued_ms: 9 },
+        )
+        .unwrap();
+        for msg in [Ctl::Attest(att.clone()), Ctl::HostCompare2 { claim, attests: vec![att] }] {
+            let f = encode_frame(&msg).unwrap();
+            assert_eq!(decode_body(&f[4..]).unwrap(), msg);
+        }
+        assert_eq!(postcard::to_stdvec(&Ctl::Attest(crate::election::SignedAttestation {
+            att: crate::election::Attestation { server, host: UserId([2; 32]), epoch: 0, member: UserId([3; 32]), issued_ms: 0 },
+            sig: Sig64::ZERO
+        }))
+        .unwrap()[0], 36);
+    }
+
+    #[test]
+    fn large_heads_are_split_and_reassembled() {
+        let big = Heads((0..(HEADS_PER_FRAME * 2 + 5)).map(|i| (UserId([(i % 251) as u8; 32]), i as u64)).collect());
+        let frames = sync_have_frames(big.clone());
+        assert_eq!(frames.len(), 3);
+        let mut asm = HeadsAssembler::default();
+        let mut out = None;
+        for f in frames {
+            assert!(encode_frame(&f).is_ok(), "every part fits in a frame");
+            let Ctl::SyncHavePart { heads, more } = f else { panic!("expected parts") };
+            out = asm.push(heads, more);
+        }
+        assert_eq!(out, Some(big));
+        let small = Heads(vec![(UserId([1; 32]), 3)]);
+        assert_eq!(sync_have_frames(small.clone()), vec![Ctl::SyncHave { heads: small }]);
+    }
+
+    #[test]
+    fn limits() {
+        let clip = ClipInfo { hash: BlobHash([5; 32]), name: "boing".into(), size: 1000, duration_ms: 900 };
+        assert!(clip.is_valid());
+        assert!(!ClipInfo { name: "x".repeat(MAX_CLIP_NAME_CHARS + 1), ..clip.clone() }.is_valid());
+        assert!(!ClipInfo { name: "a\u{7}b".into(), ..clip.clone() }.is_valid());
+        assert!(!ClipInfo { name: String::new(), ..clip.clone() }.is_valid());
+        assert!(!ClipInfo { size: MAX_CLIP_BYTES + 1, ..clip.clone() }.is_valid());
+        assert!(!ClipInfo { duration_ms: u32::MAX, ..clip.clone() }.is_valid());
+        // A 20 s file with decoder padding (the app stores the decoded length).
+        assert!(ClipInfo { duration_ms: 20_050, ..clip.clone() }.is_valid());
+        assert!(ClipInfo { duration_ms: MAX_CLIP_MS + CLIP_DURATION_TOLERANCE_MS, ..clip.clone() }.is_valid());
+        assert!(!ClipInfo { duration_ms: MAX_CLIP_MS + CLIP_DURATION_TOLERANCE_MS + 1, ..clip.clone() }.is_valid());
+        assert!(!Ctl::SoundPlayed { by: UserId([1; 32]), clip: ClipInfo { name: "n".repeat(500_000), ..clip.clone() } }.within_limits());
+        assert!(Ctl::SoundPlayed { by: UserId([1; 32]), clip }.within_limits());
+        assert!(!Ctl::Have { add: vec![BlobHash([1; 32]); MAX_HAVE_DELTA + 1], remove: vec![] }.within_limits());
+        // An honest sender splits large deltas so every frame passes.
+        let frames = have_frames(&vec![BlobHash([1; 32]); 3 * MAX_HAVE_DELTA + 1], &[BlobHash([2; 32])]);
+        assert_eq!(frames.len(), 5);
+        assert!(frames.iter().all(Ctl::within_limits));
+        assert!(!Ctl::Reject { code: RejectCode::Internal, reason: "r".repeat(100_000) }.within_limits());
+        assert_eq!(sanitize_text("a\u{1b}[31mb\nc", 200), "a[31mbc");
+        assert_eq!(sanitize_text(&"z".repeat(500), 200).len(), 200);
+        let hint = AddrHint { relay: Some("r".repeat(MAX_HINT_RELAY_BYTES + 1)), direct: vec!["127.0.0.1:1".parse().unwrap(); 20] };
+        let b = hint.bounded();
+        assert!(b.relay.is_none());
+        assert_eq!(b.direct.len(), MAX_HINT_DIRECT);
     }
 }

@@ -73,14 +73,31 @@ impl Default for NetConfig {
     }
 }
 
+/// Data a peer may have in flight towards us per connection (all streams together). The
+/// QUIC default is unlimited, which let a peer park 100 streams x 1.25 MB in streams the
+/// app never reads.
+pub const RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+/// Per-stream receive window.
+pub const STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// Concurrent bidi streams a peer may open (control stream, blob requests).
+pub const MAX_BIDI_STREAMS: u32 = 8;
+/// Concurrent uni streams a peer may open (one per video group and track).
+pub const MAX_UNI_STREAMS: u32 = 16;
+
 /// The media-tuned QUIC transport config from docs/architecture.md "Connections":
 /// idle timeout 10 s, keep-alive 2 s, 16 KiB datagram send buffer, 256 KiB receive buffer,
-/// default congestion controller. Applied endpoint-wide (dial and accept).
+/// default congestion controller, plus bounded receive windows and stream counts. Applied
+/// endpoint-wide (dial and accept, blobs connections included).
 pub fn transport_config() -> QuicTransportConfig {
+    use iroh::endpoint::VarInt;
     let mut builder = QuicTransportConfig::builder()
         .keep_alive_interval(Duration::from_secs(2))
         .datagram_send_buffer_size(16 * 1024)
-        .datagram_receive_buffer_size(Some(256 * 1024));
+        .datagram_receive_buffer_size(Some(256 * 1024))
+        .receive_window(VarInt::from_u32(RECEIVE_WINDOW))
+        .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW))
+        .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BIDI_STREAMS))
+        .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS));
     match IdleTimeout::try_from(Duration::from_secs(10)) {
         Ok(t) => builder = builder.max_idle_timeout(Some(t)),
         Err(e) => tracing::warn!(error = %e, "idle timeout out of range; using the iroh default"),

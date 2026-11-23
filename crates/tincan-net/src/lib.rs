@@ -23,6 +23,7 @@ mod error;
 mod events;
 pub mod hooks;
 mod inner;
+mod limits;
 mod link;
 mod media;
 mod net;
@@ -37,6 +38,8 @@ mod timing;
 mod tests;
 #[cfg(test)]
 mod tests_media;
+#[cfg(test)]
+mod tests_security;
 
 pub use config::{MDNS_CADENCE, MDNS_SERVICE_NAME, NetConfig, RelayChoice, build_endpoint, transport_config};
 pub use dm::DmHold;

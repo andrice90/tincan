@@ -75,11 +75,16 @@ impl FrameReader {
     /// Wrap a receive stream.
     pub fn new(recv: RecvStream) -> Self { Self { recv, dec: FrameDecoder::new() } }
 
-    /// Next message. Undecodable frames (for example from a newer peer) are skipped.
+    /// Next message. Undecodable frames (for example from a newer peer) and frames over the
+    /// size limits of `Ctl::within_limits` are skipped.
     pub async fn next(&mut self) -> Result<Ctl, ReadEnd> {
         loop {
             match self.dec.next() {
-                Ok(Some(c)) => return Ok(c),
+                Ok(Some(c)) if c.within_limits() => return Ok(c),
+                Ok(Some(_)) => {
+                    tracing::debug!("skipping a control frame over the size limits");
+                    continue;
+                }
                 Ok(None) => {}
                 Err(CoreError::FrameTooLarge(n)) => return Err(ReadEnd::Failed(format!("frame of {n} bytes"))),
                 Err(e) => {
@@ -149,6 +154,11 @@ impl Tasks {
     }
 }
 
+/// Frames of one link that may wait in the actor's shared queue at once. The reader takes a
+/// permit per frame and the actor releases it once the frame is handled, so one flooding
+/// peer cannot fill the queue that every other link of the actor shares.
+pub(crate) const LINK_INFLIGHT: usize = 8;
+
 /// Something that happened on a link, delivered to the owning actor.
 #[derive(Debug)]
 pub(crate) enum LinkEvent {
@@ -158,6 +168,8 @@ pub(crate) enum LinkEvent {
         link: u64,
         /// The message (boxed: `Ctl` is large and most frames are small).
         ctl: Box<Ctl>,
+        /// Released when the event is dropped (after it was handled).
+        _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     /// The link ended. `code` is the peer's application close code, if it closed on purpose.
     Closed {
@@ -186,6 +198,7 @@ pub(crate) struct Link {
     bulk: mpsc::Sender<Bytes>,
     reader: AbortHandle,
     writer: AbortHandle,
+    extra: AbortHandle,
 }
 
 impl Link {
@@ -218,11 +231,13 @@ impl Link {
             let _ = send.finish();
         });
         let rconn = conn.clone();
+        let inflight = Arc::new(tokio::sync::Semaphore::new(LINK_INFLIGHT));
         let reader = tasks.spawn(async move {
             loop {
                 match reader.next().await {
                     Ok(ctl) => {
-                        if events.send(LinkEvent::Frame { link: id, ctl: Box::new(ctl) }).await.is_err() {
+                        let Ok(permit) = inflight.clone().acquire_owned().await else { return };
+                        if events.send(LinkEvent::Frame { link: id, ctl: Box::new(ctl), _permit: Some(permit) }).await.is_err() {
                             return;
                         }
                     }
@@ -242,19 +257,32 @@ impl Link {
             };
             let _ = events.send(LinkEvent::Closed { link: id, code }).await;
         });
-        Link { id, peer, conn, live, bulk, reader, writer }
+        // Only the dialer's control stream is ever accepted: stop any further bidi stream at
+        // once, so a peer cannot park data in streams nobody reads.
+        let xconn = conn.clone();
+        let extra = tasks.spawn(async move {
+            while let Ok((mut send, mut recv)) = xconn.accept_bi().await {
+                let _ = recv.stop(VarInt::from_u32(0));
+                let _ = send.reset(VarInt::from_u32(0));
+            }
+        });
+        Link { id, peer, conn, live, bulk, reader, writer, extra }
     }
 
-    /// Queue a frame on the live queue. False if the queue is full or the link is gone.
+    /// Queue a frame on the live queue. False if the queue is full, the link is gone or the
+    /// frame cannot be encoded (too large).
     pub fn send(&self, ctl: &Ctl) -> bool {
         match encode(ctl) {
             Some(b) => self.send_bytes(b),
-            None => true,
+            None => false,
         }
     }
 
     /// Queue pre-encoded bytes on the live queue.
     pub fn send_bytes(&self, b: Bytes) -> bool { self.live.try_send(b).is_ok() }
+
+    /// Free slots in the live queue.
+    pub fn live_free(&self) -> usize { self.live.capacity() }
 
     /// A sender for history pages (awaits queue space).
     pub fn bulk(&self) -> mpsc::Sender<Bytes> { self.bulk.clone() }
@@ -270,6 +298,7 @@ impl Drop for Link {
     fn drop(&mut self) {
         self.reader.abort();
         self.writer.abort();
+        self.extra.abort();
     }
 }
 

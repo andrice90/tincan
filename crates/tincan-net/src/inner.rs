@@ -60,6 +60,23 @@ impl Freeze {
     }
 }
 
+/// Test hooks that make a node misbehave the way a modified client would (tests only).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct TestHooks {
+    /// Host: put this into every `Welcome.your_next_seq` (0 = honest).
+    pub welcome_next_seq: std::sync::atomic::AtomicU64,
+    /// Host: store and fan out every member Publish, but answer it with this refusal.
+    pub refuse_publish: parking_lot::Mutex<Option<String>>,
+    /// Never promote to host (a successor that answers "not hosting" forever).
+    pub never_promote: AtomicBool,
+    /// History sync tasks started (host side, any link).
+    pub syncs_started: std::sync::atomic::AtomicUsize,
+}
+
+/// Most known addresses kept (LAN sightings of strangers cannot grow it beyond this).
+pub(crate) const MAX_HINTS: usize = 4096;
+
 /// User-controlled presence fields and held blobs.
 #[derive(Debug, Default)]
 pub(crate) struct Local {
@@ -116,6 +133,9 @@ pub(crate) struct Inner {
     pub closed: AtomicBool,
     /// Test hook (see [`Freeze`]).
     pub freeze: Freeze,
+    /// Test hooks (see [`TestHooks`]).
+    #[cfg(test)]
+    pub test: TestHooks,
 }
 
 impl std::fmt::Debug for Inner {
@@ -213,10 +233,14 @@ impl Inner {
         if *user == self.me || (hint.relay.is_none() && hint.direct.is_empty()) {
             return false;
         }
+        let hint = hint.bounded();
         let merged = {
             let mut hints = self.hints.lock();
+            if hints.len() >= MAX_HINTS && !hints.contains_key(user) {
+                return false;
+            }
             let entry = hints.entry(*user).or_default();
-            let merged = merge_hint(entry, hint);
+            let merged = merge_hint(entry, &hint);
             if merged == *entry {
                 return false;
             }
@@ -258,6 +282,23 @@ impl Inner {
             }
         }
         None
+    }
+
+    /// Is `user` a member of one of my servers?
+    pub fn shares_server(&self, user: &UserId) -> bool {
+        let reps: Vec<ReplicaRef> = self.replicas.read().values().cloned().collect();
+        reps.iter().any(|r| {
+            let r = r.lock();
+            !r.state.is_dm && r.state.is_member(user)
+        })
+    }
+
+    /// Is `user` a member of one of my servers or a DM contact (a stored DM conversation)?
+    pub fn is_known_peer(&self, user: &UserId) -> bool {
+        if *user == self.me {
+            return false;
+        }
+        self.replica(&ConvId::dm(&self.me, user)).is_some() || self.shares_server(user)
     }
 
     /// Is `user` online in any server roster I know of, or connected over a DM?

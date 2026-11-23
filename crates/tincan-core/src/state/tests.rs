@@ -824,6 +824,54 @@ fn fake(author: UserId, seq: u64, name_len: usize) -> StoredEvent {
 }
 
 #[test]
+fn pending_limits_keep_junk_from_evicting_honest_early_events() {
+    let mut fx = Fx::new();
+    let m = fx.member("m");
+    // An honest early event: m's next-but-one event (its predecessor is still on the way).
+    let seq = fx.next_seq(&m);
+    let honest = raw(&m, fx.conv, seq + 1, hlc_from_ms(fx.clock_ms + 5000), named("early"));
+    let mut pending = PendingBuffer::with_limits(PendingLimits::network());
+    assert_eq!(pending.ingest(&mut fx.state, honest.clone(), NOW).0, Verdict::Gap);
+    // A flood of validly signed events from fresh non-member keys (each a Gap).
+    for _ in 0..(MAX_PENDING_EVENTS + 50) {
+        let junk = Identity::generate();
+        let e = raw(&junk, fx.conv, 1, hlc_from_ms(T0), named("junk"));
+        assert_eq!(pending.ingest(&mut fx.state, e, NOW).0, Verdict::Gap);
+    }
+    assert!(pending.contains(&m.user(), seq + 1), "the honest early event survived the flood");
+    assert!(pending.len() <= 1 + PendingLimits::network().non_member_events);
+    // One author far ahead of its head, or far in the future, is not buffered.
+    let far = raw(&m, fx.conv, seq + 10_000, hlc_from_ms(fx.clock_ms + 6000), named("far"));
+    pending.ingest(&mut fx.state, far, NOW);
+    assert!(!pending.contains(&m.user(), seq + 10_000));
+    let future = raw(&m, fx.conv, seq, hlc_from_ms(NOW + 2 * 3_600_000), named("future"));
+    assert_eq!(pending.ingest(&mut fx.state, future, NOW).0, Verdict::Future);
+    assert!(!pending.contains(&m.user(), seq));
+    let future_gap = raw(&m, fx.conv, seq + 2, hlc_from_ms(NOW + 2 * 3_600_000), named("future gap"));
+    pending.ingest(&mut fx.state, future_gap, NOW);
+    assert!(!pending.contains(&m.user(), seq + 2));
+    // A per-author quota: one member's run cannot fill the buffer either.
+    let limits = PendingLimits { per_author_events: 3, ..PendingLimits::network() };
+    let mut small = PendingBuffer::with_limits(limits);
+    for i in 1..=10 {
+        small.ingest(&mut fx.state, raw(&m, fx.conv, seq + i, hlc_from_ms(fx.clock_ms + 7000 + i), named("run")), NOW);
+    }
+    assert_eq!(small.len(), 3);
+    // Draining still works and the counters follow.
+    let next = raw(&m, fx.conv, seq, hlc_from_ms(fx.clock_ms + 4000), named("next"));
+    let (v, applied) = pending.ingest(&mut fx.state, next, NOW);
+    assert_eq!(v, Verdict::Accept);
+    assert_eq!(applied.len(), 2, "the honest early event applied right after its predecessor");
+    // The default buffer is unchanged: it takes everything up to the global caps.
+    let mut plain = PendingBuffer::new();
+    for _ in 0..300 {
+        let junk = Identity::generate();
+        plain.ingest(&mut fx.state, raw(&junk, fx.conv, 1, hlc_from_ms(T0), named("junk")), NOW);
+    }
+    assert_eq!(plain.len(), 300);
+}
+
+#[test]
 fn pending_future_events_wait_for_the_clock() {
     let mut fx = Fx::new();
     let o = fx.owner.clone();
