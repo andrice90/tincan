@@ -20,12 +20,13 @@
 
 mod commands;
 mod events;
+mod exit;
 mod gate;
 mod profile;
 mod protocol;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tauri::webview::PageLoadEvent;
@@ -34,6 +35,7 @@ use tauri::{AppHandle, Manager, RunEvent, Runtime, WebviewUrl, WebviewWindowBuil
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tincan_app::{App, AppConfig, TestOptions};
 
+use crate::exit::ExitState;
 use crate::gate::{Gate, GateSender, Phase};
 
 /// Label of the one window.
@@ -44,6 +46,10 @@ const BACKGROUND: Color = Color(0x14, 0x16, 0x19, 0xff);
 const SHUTDOWN_CAP: Duration = Duration::from_secs(5);
 /// Last resort if the event loop does not end after `exit`.
 const EXIT_GRACE: Duration = Duration::from_secs(3);
+/// Upper bound for the shutdown when Windows ends the session (logoff, shutdown, Restart
+/// Manager). Windows waits about 5 s for an app to return from `WM_ENDSESSION` before it
+/// offers to close it anyway.
+pub(crate) const END_SESSION_CAP: Duration = Duration::from_secs(4);
 
 /// Shell state shared by commands, the file scheme and the exit sequence.
 pub struct Shell {
@@ -51,8 +57,8 @@ pub struct Shell {
     pub gate: Gate<Arc<App>>,
     /// Counts page loads of the main window; a video sink created by an older page stops.
     pub page_loads: Arc<AtomicU64>,
-    /// Set once the exit sequence started (or start-up failed).
-    closing: AtomicBool,
+    /// Where the exit sequence stands.
+    exit: ExitState,
 }
 
 fn main() {
@@ -93,13 +99,15 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to build the Tauri app");
 
-    app.run(|handle, event| {
+    app.run(|handle, event| match event {
         // The window never closes by itself (close requests are intercepted), so an exit
         // without a code means something else closed it: run the normal exit sequence.
-        if let RunEvent::ExitRequested { code: None, api, .. } = event {
+        RunEvent::ExitRequested { code: None, api, .. } => {
             api.prevent_exit();
             begin_close(handle);
         }
+        RunEvent::Exit => end_session(handle),
+        _ => {}
     });
     drop(runtime);
 }
@@ -124,7 +132,7 @@ fn init_logging() {
 /// Creates the window at once and starts the App in the background.
 fn setup(app: &mut tauri::App, profile: Result<String, String>) {
     let (tx, gate) = Gate::new();
-    app.manage(Shell { gate, page_loads: Arc::new(AtomicU64::new(0)), closing: AtomicBool::new(false) });
+    app.manage(Shell { gate, page_loads: Arc::new(AtomicU64::new(0)), exit: ExitState::default() });
     let handle = app.handle().clone();
 
     let name = match profile {
@@ -193,7 +201,7 @@ async fn start<R: Runtime>(handle: AppHandle<R>, tx: GateSender<Arc<App>>, cfg: 
 fn fatal<R: Runtime>(handle: &AppHandle<R>, message: String) {
     eprintln!("tincan: {message}");
     let shell = handle.state::<Shell>();
-    if shell.closing.swap(true, Ordering::AcqRel) {
+    if !shell.exit.begin() {
         // the user is already closing the app: no dialog
         return;
     }
@@ -210,13 +218,17 @@ fn fatal<R: Runtime>(handle: &AppHandle<R>, message: String) {
         .show(move |_| exit_now(&exit, 1));
 }
 
+async fn shutdown_app(app: Arc<App>) {
+    app.shutdown().await;
+}
+
 /// The exit sequence for every way of closing (title bar, `window_close`, Alt+F4): hide the
 /// window at once, await `App::shutdown` (host handoff) for at most 5 s, then exit.
 pub fn begin_close<R: Runtime>(handle: &AppHandle<R>) {
     let Some(shell) = handle.try_state::<Shell>() else {
         return exit_now(handle, 0);
     };
-    if shell.closing.swap(true, Ordering::AcqRel) {
+    if !shell.exit.begin() {
         return;
     }
     if let Some(window) = handle.get_webview_window(MAIN_WINDOW) {
@@ -225,21 +237,38 @@ pub fn begin_close<R: Runtime>(handle: &AppHandle<R>) {
     let gate = shell.gate.clone();
     let handle = handle.clone();
     tauri::async_runtime::spawn(async move {
-        let shutdown = async {
-            // a close during start-up waits for the start (inside the same cap)
-            if let Ok(app) = gate.get().await {
-                app.shutdown().await;
-            }
-        };
-        if tokio::time::timeout(SHUTDOWN_CAP, shutdown).await.is_err() {
+        // a close during start-up waits for the start (inside the same cap)
+        if !exit::shutdown_within(&gate, SHUTDOWN_CAP, shutdown_app).await {
             eprintln!("tincan: shutdown took longer than {SHUTDOWN_CAP:?}, exiting anyway");
         }
         exit_now(&handle, 0);
     });
 }
 
+/// `RunEvent::Exit`: the event loop is being destroyed. After `exit_now` there is nothing
+/// left to do. Otherwise Windows is ending the session (logoff, shutdown, Restart Manager):
+/// tao turns `WM_ENDSESSION` into this event, with no close request before it, and exits the
+/// process as soon as it returns. So the shutdown (host handoff, store flush) runs here,
+/// blocking, for at most [`END_SESSION_CAP`]; a close already in progress is joined.
+fn end_session<R: Runtime>(handle: &AppHandle<R>) {
+    let Some(shell) = handle.try_state::<Shell>() else {
+        return;
+    };
+    if !shell.exit.loop_destroyed() {
+        return;
+    }
+    eprintln!("tincan: the session is ending, shutting down");
+    let gate = shell.gate.clone();
+    if !tauri::async_runtime::block_on(exit::shutdown_within(&gate, END_SESSION_CAP, shutdown_app)) {
+        eprintln!("tincan: shutdown took longer than {END_SESSION_CAP:?}, exiting anyway");
+    }
+}
+
 /// Ends the event loop; kills the process if that does not happen within [`EXIT_GRACE`].
 fn exit_now<R: Runtime>(handle: &AppHandle<R>, code: i32) {
+    if let Some(shell) = handle.try_state::<Shell>() {
+        shell.exit.mark_exiting();
+    }
     std::thread::spawn(move || {
         std::thread::sleep(EXIT_GRACE);
         std::process::exit(code);
