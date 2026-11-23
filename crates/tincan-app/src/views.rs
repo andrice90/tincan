@@ -296,9 +296,9 @@ impl Core {
         })
     }
 
-    /// Is any text channel of the server unread?
+    /// Is this channel (text, or a voice room's chat) unread?
     fn channel_unread(&self, conv: &ConvId, ch: &ChannelInfo) -> bool {
-        ch.kind == CoreKind::Text && self.storage.unread(conv, Some(&ch.id), &self.me).unwrap_or(false)
+        self.storage.unread(conv, Some(&ch.id), &self.me).unwrap_or(false)
     }
 
     /// `ServerSummary` of a joined server.

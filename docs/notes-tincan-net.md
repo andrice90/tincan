@@ -108,7 +108,7 @@ Crate: `crates/tincan-net`. Rustdoc: `cargo doc -p tincan-net --no-deps`. This p
 Members hold `server_secret` but are not trusted. Every limit below is far above what an honest client sends. Budgets are keyed by user id, so reconnecting does not reset them.
 
 **Host side, per member**
-- Typing: relayed at most once per 2 s per (member, channel), and only for a text channel the member may post in (so the budget's keys stay bounded).
+- Typing: relayed at most once per 2 s per (member, channel), and only for a channel (text or voice room) the member may post in (so the budget's keys stay bounded).
 - Publish: 5/s with a burst of 20, then `PublishAck{ok: false, reason: "busy"}`.
 - WhoHas: 20/s.
 - `Have`: at most 1024 hashes per frame each way; larger frames are dropped. At most 20 000 hashes per member. Senders split larger deltas (`wire::have_frames`).

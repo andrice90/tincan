@@ -177,17 +177,15 @@ impl Core {
 
     // ------------------------------------------------------------------ messages
 
-    /// The channel a message command targets: the DM channel, or a live text channel.
+    /// The channel a message command targets: the DM channel, or a live channel of either
+    /// kind (a voice room's chat works like a text channel; joining voice is not needed).
     fn target_channel(&self, view: &ConvView, channel: Option<&str>) -> Result<ChannelId, String> {
         if view.is_dm {
             return Ok(dm_channel(&view.conv));
         }
         let raw = channel.ok_or_else(|| "Pick a channel first.".to_string())?;
         let id = parse_channel(raw)?;
-        let ch = live_channel(view, &id)?;
-        if ch.kind != CoreKind::Text {
-            return Err("Voice rooms have no messages.".into());
-        }
+        live_channel(view, &id)?;
         Ok(id)
     }
 

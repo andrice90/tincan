@@ -329,6 +329,89 @@ async fn create_join_chat_and_page() {
     b.app.shutdown().await;
 }
 
+/// A voice room has its own chat, sent and synced like a text channel's, without joining voice:
+/// unread, mark_read, typing, an attachment, deletes, and refusal once the room is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_room_chat_works_like_a_text_channel() {
+    let _g = serial().await;
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let files = tempfile::tempdir().unwrap();
+    let mut a = node(da.path(), "Alice").await;
+    let mut b = node(db.path(), "Bob").await;
+    let server = server_id(&call(&a.app, "create_server", json!({ "name": "Rooms" })).await);
+    let invite = call(&a.app, "create_invite", json!({ "serverId": server })).await;
+    call(&b.app, "join_server", json!({ "invite": invite })).await;
+    all_online(&[&a, &b], &server).await;
+    settle_after_join().await;
+    let general = text_channel(&b.app, &server).await;
+    let chans = call(&b.app, "channels", json!({ "serverId": server })).await;
+    let lounge = chans.as_array().unwrap().iter().find(|c| c["kind"] == "voice").expect("a voice room")["id"].as_str().unwrap().to_string();
+
+    // Neither side is in voice.
+    assert!(call(&a.app, "app_snapshot", json!({})).await["voice"].is_null());
+    let path = files.path().join("notes.bin");
+    std::fs::write(&path, data(40_000, 51)).unwrap();
+    let sent = call(
+        &a.app,
+        "send_message",
+        json!({ "convId": server, "channelId": lounge, "text": "in the lounge", "attachments": [path.to_string_lossy()] }),
+    )
+    .await;
+    assert_keys(&sent, MESSAGE_KEYS);
+    assert_eq!(sent["channelId"], lounge.as_str());
+    let got = wait_for(&mut b.rx, "message-added", 20, |m| m["text"] == "in the lounge").await;
+    assert_eq!(got["channelId"], lounge.as_str());
+    assert_eq!(got["id"], sent["id"]);
+    let hash = sent["attachments"][0]["hash"].as_str().unwrap().to_string();
+    // (polled: the transfer and unread events race each other)
+    eventually("the attachment auto-fetched", 30, || async {
+        (call(&b.app, "transfer", json!({ "hash": hash })).await["state"] == "complete").then_some(())
+    })
+    .await;
+
+    // Unread on the room and the server, cleared by mark_read; the text channel stays read.
+    let chans = eventually("the room unread", 10, || async {
+        let c = call(&b.app, "channels", json!({ "serverId": server })).await;
+        c.as_array().unwrap().iter().any(|x| x["id"] == lounge.as_str() && x["unread"] == true).then_some(c)
+    })
+    .await;
+    let general_row = chans.as_array().unwrap().iter().find(|c| c["id"] == general.as_str()).unwrap().clone();
+    assert_eq!(general_row["unread"], false);
+    let snap = call(&b.app, "app_snapshot", json!({})).await;
+    assert_eq!(snap["servers"][0]["unread"], true);
+    call(&b.app, "mark_read", json!({ "convId": server, "channelId": lounge })).await;
+    let chans = call(&b.app, "channels", json!({ "serverId": server })).await;
+    assert!(chans.as_array().unwrap().iter().all(|c| c["unread"] == false));
+    assert_eq!(call(&b.app, "app_snapshot", json!({})).await["servers"][0]["unread"], false);
+
+    // Typing, a reply, and a delete.
+    call(&b.app, "typing", json!({ "convId": server, "channelId": lounge })).await;
+    let t = wait_for(&mut a.rx, "typing", 10, |_| true).await;
+    assert_eq!(t, json!({ "convId": server, "channelId": lounge, "userId": b.user, "name": "Bob" }));
+    let reply = call(&b.app, "send_message", json!({ "convId": server, "channelId": lounge, "text": "oops", "attachments": [] })).await;
+    wait_for(&mut a.rx, "message-added", 20, |m| m["id"] == reply["id"]).await;
+    call(&b.app, "delete_message", json!({ "convId": server, "messageId": reply["id"] })).await;
+    let upd = wait_for(&mut a.rx, "message-updated", 20, |m| m["id"] == reply["id"]).await;
+    assert_eq!(upd["deleted"], true);
+
+    // Each history is its own: the room's page has the room's messages only.
+    // (the deleted reply stays in the page with its text blanked)
+    assert_eq!(all_texts(&a.app, &server, Some(&lounge), 10).await.0, vec!["in the lounge".to_string(), String::new()]);
+    assert!(all_texts(&a.app, &server, Some(&general), 10).await.0.is_empty());
+
+    // A deleted voice room refuses new messages like a deleted text channel.
+    call(&a.app, "delete_channel", json!({ "serverId": server, "channelId": lounge })).await;
+    wait_for(&mut b.rx, "channels-updated", 20, |c| {
+        c["serverId"] == server.as_str() && !c["channels"].as_array().unwrap().iter().any(|x| x["id"] == lounge.as_str())
+    })
+    .await;
+    let err = call_err(&b.app, "send_message", json!({ "convId": server, "channelId": lounge, "text": "late", "attachments": [] })).await;
+    assert_eq!(err, "That channel doesn't exist anymore.");
+
+    a.app.shutdown().await;
+    b.app.shutdown().await;
+}
+
 /// (b) the host shuts down; the other two keep chatting and see the new host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_leaves_and_the_rest_continue() {

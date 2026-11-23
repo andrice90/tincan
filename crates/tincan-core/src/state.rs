@@ -38,8 +38,9 @@
 //!    a re-admit can arrive after the member's next events).
 //! 7. References:
 //!    - ChannelUpdate: target must exist (owner's own chain, so unknown -> `Reject`).
-//!    - Message: channel exists (unknown -> `Gap`, or `Reject` when the author is the owner)
-//!      and is a Text channel (`Reject` otherwise).
+//!    - Message: channel exists (unknown -> `Gap`, or `Reject` when the author is the owner).
+//!      Text channels and voice rooms both carry messages (a voice room's chat); the kind is
+//!      fixed at ChannelCreate, so this stays order-independent.
 //!    - Delete: target is a known Message whose author is `ev.author`, or `ev.author` is the
 //!      owner. Unknown target: `Gap` for the owner, `Reject` for anyone else (their own
 //!      messages are always known first). Only messages can be deleted.
@@ -378,12 +379,13 @@ impl ConvState {
     pub fn channel(&self, id: &ChannelId) -> Option<&Channel> { self.channels.get(id) }
 
     /// May `author` post a new message to `channel` right now? (Member, existing non-deleted
-    /// text channel; in a DM: a party, and the DM channel.) Check this before authoring.
+    /// channel of either kind, since voice rooms have a chat too; in a DM: a party, and the DM
+    /// channel.) Check this before authoring.
     pub fn can_post(&self, author: &UserId, channel: &ChannelId) -> bool {
         if self.is_dm {
             return self.dm_parties.contains(author) && *channel == self.dm_channel();
         }
-        self.is_member(author) && self.channels.get(channel).is_some_and(|c| c.kind == ChannelKind::Text && !c.deleted)
+        self.is_member(author) && self.channels.get(channel).is_some_and(|c| !c.deleted)
     }
 
     /// Can the invite admit a joiner at `now_ms`? Hosts check this before authoring a
@@ -619,7 +621,6 @@ impl ConvState {
                 }
             }
             Body::Message { channel, .. } => match self.channels.get(channel) {
-                Some(c) if c.kind != ChannelKind::Text => reject("messages can only go in text channels"),
                 Some(_) => Verdict::Accept,
                 None => missing(mode, by_owner, "channel"),
             },

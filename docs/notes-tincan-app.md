@@ -84,9 +84,10 @@ Rules from api.md and the task:
   - `channelId` is null in every DTO. Internally the channel is `dm_channel(conv)`, and storage pages DMs with `channel = None`.
   - `pending` is `seq > net.dm_delivered(conv)` for my own DM messages.
 - `sentAt` is `hlc_ms(hlc)`. A deleted message keeps its row with an empty `text` and `attachments`.
+- Voice room chat: `target_channel` (send, typing) accepts any live channel; a voice room no longer answers "Voice rooms have no messages." Pages, deletes, attachments (auto-fetch and blob access follow the conversation, not the channel) and unread work the same for both kinds. Core validation decides it (`notes-tincan-core.md`).
 - Unread:
   - From the store's read markers.
-  - A server is unread when any visible text channel is.
+  - A server is unread when any visible channel is. A voice room's chat counts like a text channel.
   - `mark_read` sets the marker to the newest message's hlc.
 - `Member`:
   - Built from the view, plus the roster when the connection is `member`, `hosting` or `solo`; otherwise only I am online.
@@ -383,6 +384,7 @@ Joins need no hook, because invites carry the inviter's loopback address.
   - create, invite and join; members online; `server-updated` with the host.
   - Messages both ways as `message-added`; unread and `mark_read`; `typing`.
   - 9 messages paged 3 at a time (3 pages, oldest first).
+- `voice_room_chat_works_like_a_text_channel`: neither side in voice; a message with an attachment to the default voice room arrives and auto-fetches; the room and the server turn unread and `mark_read` clears them while the text channel stays read; `typing`, a reply and its delete; the room's page holds only its own messages; after `delete_channel` a send is refused.
 - `host_leaves_and_the_rest_continue` (b): the host shuts down; both others report the same new host and keep chatting.
 - `attachment_outlives_its_uploader` (c):
   - Attachment errors; A sends 300 kB and B auto-fetches it.

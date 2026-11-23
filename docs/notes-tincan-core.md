@@ -13,6 +13,8 @@ What the other crates need to know beyond the doc comments. Rustdoc: `cargo doc 
   - Admitting someone who is already a member is accepted as a no-op.
   - Proof that every rule is order-independent: `state::tests::shuffled_delivery_converges` (40 random delivery orders plus worst cases give identical state).
 - Invite fields: `max_uses == 0` means unlimited; `expires_ms == u64::MAX` means it never expires. Expiry is judged at the admit's hlc, so it is deterministic.
+- Voice room chat: a `Message` may target a voice room as well as a text channel. The only reference rule is "the channel exists" (the kind is fixed at ChannelCreate, so this stays order-independent); `can_post` allows any non-deleted channel. A message racing the room's deletion is accepted like one in a deleted text channel (`state::tests::voice_room_chat_follows_the_text_channel_rules`, and the shuffled-delivery scenario includes a voice room).
+  - Contract change: builds from before this rule reject such a message, and then that author's later events stay `Gap` on that replica. `PROTOCOL_VERSION` was not bumped (rule 1 would reject every stored event), so every member must run a build with voice room chat before anyone posts there.
 - DMs: `ConvState::new_dm(a, b)`. `Message.channel` must be `state::dm_channel(&conv)` (use `build::dm_message`). Only Message and Delete bodies; you can only delete your own messages.
 
 ## Startup rebuild (store + net)
