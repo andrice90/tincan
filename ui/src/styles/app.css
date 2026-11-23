@@ -765,6 +765,19 @@
   padding: 0 var(--sp-4);
 }
 
+.removed-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-3);
+  border-radius: var(--r-card);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+}
+
 .composer-error {
   padding-bottom: var(--sp-2);
   font-size: var(--fs-13);

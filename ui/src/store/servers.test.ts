@@ -11,6 +11,7 @@ function server(id: string, hostName: string | null): ServerSummary {
     connection: { state: "member", hostId: "alice", hostName, path: "direct", rttMs: 1 },
     unread: false,
     onlineCount: 2,
+    removed: false,
   };
 }
 
@@ -19,6 +20,14 @@ test("join_server's result never replaces a server-updated that came while it ra
   const fromEvent = server("s1", "Alice");
   const list = withCreatedServer([fromEvent], server("s1", "w67ra3gh"));
   eq(list, [fromEvent]);
+});
+
+test("joining again replaces the copy of a server I was removed from", () => {
+  const gone = { ...server("s1", null), removed: true };
+  const back = server("s1", "Alice");
+  eq(withCreatedServer([gone], back), [back]);
+  // a removed copy never replaces a live entry
+  eq(withCreatedServer([back], gone), [back]);
 });
 
 test("join_server's result adds a server the list does not hold yet", () => {

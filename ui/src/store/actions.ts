@@ -602,6 +602,15 @@ export async function leaveServer(serverId: ServerId): Promise<void> {
   afterViewChange();
 }
 
+/** Removes a member (owner only). Rejects with error text. */
+export async function kickMember(serverId: ServerId, userId: UserId): Promise<void> {
+  await invoke("kick_member", { serverId, userId });
+  update((s) => ({
+    ...s,
+    members: { ...s.members, [serverId]: (s.members[serverId] ?? []).filter((m) => m.userId !== userId) },
+  }));
+}
+
 /** Renames a server. Rejects with error text. */
 export async function renameServer(serverId: ServerId, name: string): Promise<void> {
   await invoke("rename_server", { serverId, name });

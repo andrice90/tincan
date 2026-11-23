@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 import { Hash, Phone, Users } from "lucide-react";
 import type { Channel, DmSummary, ServerSummary } from "../api/types";
-import { startCall, toggleMembers, watchDm } from "../store/actions";
+import { openDialog, startCall, toggleMembers, watchDm } from "../store/actions";
 import { convKey, useStore, type TypingEntry } from "../store/store";
 import { Avatar, ICON, IconButton, PersonName } from "./common";
 import { Composer, TypingLine } from "./Composer";
@@ -39,9 +39,29 @@ export function ChannelChat({ server, channel }: { server: ServerSummary; channe
         pendingName={null}
         startText={`Start of #${channel.name}`}
       />
-      <Composer convId={server.id} channelId={channel.id} placeholder={`Message #${channel.name}`} />
-      <TypingLine names={typing.map((t) => t.name)} />
+      {server.removed ? (
+        <RemovedNote />
+      ) : (
+        <>
+          <Composer convId={server.id} channelId={channel.id} placeholder={`Message #${channel.name}`} />
+          <TypingLine names={typing.map((t) => t.name)} />
+        </>
+      )}
     </>
+  );
+}
+
+/** In place of the composer once the owner removed me: the history stays readable. */
+function RemovedNote() {
+  return (
+    <div className="composer-wrap">
+      <div className="removed-note" role="status">
+        <span>You were removed from this server.</span>
+        <button type="button" className="btn btn-ghost" onClick={() => openDialog({ kind: "join-server" })}>
+          Join again
+        </button>
+      </div>
+    </div>
   );
 }
 

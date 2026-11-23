@@ -4,7 +4,8 @@
 //
 // URL flags: `?fresh` starts at the name picker with no servers, `?noenc`
 // makes screen sharing fail with "no-hardware-encoder", `?ring` rings an
-// incoming call shortly after start, `?noanswer` leaves outgoing calls ringing.
+// incoming call shortly after start, `?noanswer` leaves outgoing calls ringing,
+// `?removed` starts with Sam removed from Book club.
 // `window.tincanMock` has helpers for the console: ring(), online(name),
 // offline(name), migrate(), toast(text), state().
 
@@ -76,6 +77,7 @@ const FLAG_FRESH = params.has("fresh");
 const FLAG_NOENC = params.has("noenc");
 const FLAG_RING = params.has("ring");
 const FLAG_NOANSWER = params.has("noanswer");
+const FLAG_REMOVED = params.has("removed");
 
 // ------------------------------------------------------------------ people
 
@@ -329,6 +331,7 @@ function seed(): void {
       connection: { state: "member", hostId: people.jordan.id, hostName: "Jordan", path: "direct", rttMs: 24 },
       unread: true,
       onlineCount: 5,
+      removed: false,
     },
     channels: [gnGeneral, gnClips, gnLounge, gnSquad],
     members: [
@@ -439,13 +442,16 @@ function seed(): void {
       name: "Book club",
       ownerId: people.riley.id,
       isOwner: false,
-      connection: { state: "hosting", hostId: people.sam.id, hostName: "Sam", path: "none", rttMs: null },
+      connection: FLAG_REMOVED
+        ? { state: "offline", hostId: null, hostName: null, path: "none", rttMs: null }
+        : { state: "hosting", hostId: people.sam.id, hostName: "Sam", path: "none", rttMs: null },
       unread: true,
-      onlineCount: 2,
+      onlineCount: FLAG_REMOVED ? 1 : 2,
+      removed: FLAG_REMOVED,
     },
     channels: [bcGeneral, bcList, bcRoom],
     members: [
-      member(people.sam, { isHost: true }),
+      ...(FLAG_REMOVED ? [] : [member(people.sam, { isHost: true })]),
       member(people.riley, { isOwner: true }),
       member(people.taylor),
       member(people.casey),
@@ -944,6 +950,7 @@ const handlers: Handlers = {
         connection: { state: "solo", hostId: me.userId, hostName: me.name, path: "none", rttMs: null },
         unread: false,
         onlineCount: 1,
+        removed: false,
       },
       channels: [channel(id, "general", "text", 0), channel(id, "Lounge", "voice", 1)],
       members: [member({ id: me.userId, name: me.name, online: true }, { isHost: true, isOwner: true })],
@@ -967,6 +974,17 @@ const handlers: Handlers = {
     await sleep(1200);
     if (code.includes("offline")) fail("Couldn't reach anyone in that server. Check the invite or try again later.");
     const me = st.me ?? fail("Pick a display name first.");
+    // Any invite takes a removed member back into the server it was removed from.
+    const removed = st.servers.find((s) => s.summary.removed);
+    if (removed) {
+      const host = removed.members.find((m) => m.online) ?? removed.members[0];
+      removed.summary.removed = false;
+      removed.summary.connection = { state: "member", hostId: host?.userId ?? null, hostName: host?.name ?? null, path: "direct", rttMs: 31 };
+      removed.members = [member({ id: me.userId, name: me.name, online: true }), ...removed.members];
+      refreshOnline(removed);
+      emit("snapshot", snapshot());
+      return removed.summary;
+    }
     const existing = st.servers.find((s) => s.summary.name === "Movie night");
     if (existing) fail("You're already in Movie night.");
     const id = hexId(`server:movie-night:${code}`);
@@ -979,6 +997,7 @@ const handlers: Handlers = {
         connection: { state: "member", hostId: people.morgan.id, hostName: "Morgan", path: "relay", rttMs: 92 },
         unread: false,
         onlineCount: 3,
+        removed: false,
       },
       channels: [channel(id, "general", "text", 0), channel(id, "Theater", "voice", 1)],
       members: [
@@ -1001,6 +1020,23 @@ const handlers: Handlers = {
     if (st.voice?.kind === "room" && st.voice.convId === serverId) leaveRoom();
     st.servers = st.servers.filter((s) => s.summary.id !== serverId);
     emit("snapshot", snapshot());
+    return null;
+  },
+
+  kick_member: ({ serverId, userId }) => {
+    const s = server(serverId);
+    if (!s.summary.isOwner) fail("Only the server owner can do that.");
+    if (userId === meId()) fail("You can't remove yourself. Leave the server instead.");
+    const m = s.members.find((x) => x.userId === userId) ?? fail("They're not in this server anymore.");
+    s.members = s.members.filter((x) => x.userId !== userId);
+    refreshOnline(s);
+    emitMembers(s);
+    emit("server-updated", s.summary);
+    if (st.voice?.kind === "room" && st.voice.convId === serverId) {
+      rebuildVoice();
+      emit("voice-updated", st.voice);
+    }
+    toast("info", `${m.name} was removed from ${s.summary.name}.`);
     return null;
   },
 
@@ -1076,6 +1112,7 @@ const handlers: Handlers = {
     let s: MockServer | undefined;
     if (channelId !== null) {
       s = server(convId);
+      if (s.summary.removed) fail("You were removed from this server.");
       if (!s.channels.some((c) => c.id === channelId)) fail("That channel was deleted.");
     } else if (!dm) {
       fail("That conversation isn't on this PC anymore.");
@@ -1226,6 +1263,7 @@ const handlers: Handlers = {
 
   voice_join: async ({ serverId, channelId }) => {
     const s = server(serverId);
+    if (s.summary.removed) fail("You were removed from this server.");
     const c = s.channels.find((x) => x.id === channelId && x.kind === "voice") ?? fail("That voice room was deleted.");
     if (st.call) endCall();
     await sleep(150);

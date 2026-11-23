@@ -44,6 +44,11 @@ export interface ServerSummary {
   unread: boolean;
   /** Members currently online (including me). */
   onlineCount: number;
+  /**
+   * The owner removed me. The server stays readable up to the removal, offline and
+   * read-only, until I join again with a current invite (or leave it).
+   */
+  removed: boolean;
 }
 
 export type ChannelKind = "text" | "voice";
@@ -225,6 +230,11 @@ export interface Commands {
   create_invite: { args: { serverId: ServerId }; result: string };
   join_server: { args: { invite: string }; result: ServerSummary };
   leave_server: { args: { serverId: ServerId }; result: null };
+  /**
+   * Owner only: remove a member. They are disconnected at once and can come back only
+   * with an invite code that still works (removal revokes no invite).
+   */
+  kick_member: { args: { serverId: ServerId; userId: UserId }; result: null };
   rename_server: { args: { serverId: ServerId; name: string }; result: null };
 
   channels: { args: { serverId: ServerId }; result: Channel[] };
