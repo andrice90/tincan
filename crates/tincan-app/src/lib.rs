@@ -22,10 +22,28 @@
 //! - [`App::shutdown`] performs the clean host handoff and closes stores (call on window
 //!   close, await it before exiting the process).
 //!
-//! Everything below the public surface is owned by the tincan-app build agents.
+//! Everything below the public surface is owned by the tincan-app build agents. The module
+//! map, the event mapping and the media boundary are described in `docs/notes-tincan-app.md`.
+#![warn(missing_docs)]
 
+mod commands;
+mod app;
+mod dispatch;
+pub mod dto;
+mod emit;
+mod media;
+mod profile;
+mod pump;
+mod settings;
+mod shell;
+mod transfers;
+mod views;
+
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use crate::app::Core;
 
 /// How to open a profile.
 #[derive(Clone, Debug)]
@@ -67,7 +85,11 @@ pub type VideoSink = Box<dyn FnMut(Vec<u8>) -> bool + Send + 'static>;
 
 /// A running profile. Cheap to share (`Arc<App>`); all methods take `&self`.
 pub struct App {
-    _private: (),
+    core: Arc<Core>,
+}
+
+impl std::fmt::Debug for App {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "App({:?})", self.core) }
 }
 
 impl App {
@@ -75,29 +97,28 @@ impl App {
     /// Errors (user-facing string) if the profile is already open in another process
     /// (lock file) or the directory is unusable.
     pub async fn start(cfg: AppConfig) -> Result<Arc<App>, String> {
-        let _ = cfg;
-        todo!("tincan-app agent")
+        let core = Core::start(cfg).await?;
+        Ok(Arc::new(App { core }))
     }
 
     /// Run the UI command `cmd` (a `types.ts` `Commands` key) with camelCase JSON `args`.
     /// Unknown command names return an error string.
     pub async fn call(&self, cmd: &str, args: serde_json::Value) -> Result<serde_json::Value, String> {
-        let _ = (cmd, args);
-        todo!("tincan-app agent")
+        dispatch::call(&self.core, cmd, args).await
     }
 
     /// Subscribe to UI events. A lagging receiver skips events; the UI recovers via
     /// `app_snapshot` on `snapshot` events, so the shell just forwards what it gets.
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<UiEvent> {
-        todo!("tincan-app agent")
-    }
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<UiEvent> { self.core.events.subscribe() }
 
     /// Start delivering frames of screen-share `track` to `sink` (`screen_watch`).
     /// Replaces an existing sink for the same track. Stops on `screen_unwatch`, when the
     /// share ends, when leaving voice, or when `sink` returns false.
     pub async fn screen_watch(&self, track: u16, sink: VideoSink) -> Result<(), String> {
-        let _ = (track, sink);
-        todo!("tincan-app agent")
+        if self.core.is_closed() {
+            return Err("Tincan is shutting down.".into());
+        }
+        self.core.media.screen_watch(&self.core, track, sink).await
     }
 
     /// The bytes and MIME type behind `{file_url_base}{hash_hex}`, if that blob is complete
@@ -105,12 +126,58 @@ impl App {
     /// from an asynchronous URI scheme handler with
     /// `Cross-Origin-Resource-Policy: cross-origin` (the page runs with COEP require-corp).
     pub async fn file_for_url(&self, hash_hex: &str) -> Option<(Vec<u8>, String)> {
-        let _ = hash_hex;
-        todo!("tincan-app agent")
+        if self.core.is_closed() {
+            return None;
+        }
+        self.core.file_for_url(hash_hex).await
     }
 
     /// Clean shutdown: hand off hosted servers, stop media, close stores. Idempotent.
-    pub async fn shutdown(&self) {
-        todo!("tincan-app agent")
+    pub async fn shutdown(&self) { self.core.shutdown().await }
+
+    // ------------------------------------------------------------------ test hooks
+
+    /// Test hook: every command name `call` handles (`types.ts` keys).
+    #[doc(hidden)]
+    pub fn handled_commands() -> Vec<&'static str> {
+        dispatch::CORE_COMMANDS.iter().chain(media::COMMANDS.iter()).copied().collect()
     }
+
+    /// Test hook: every event name the app can emit.
+    #[doc(hidden)]
+    pub fn event_names() -> &'static [&'static str] { &emit::EVENT_NAMES }
+
+    /// Test hook: loopback socket addresses of this instance (relays and discovery are off
+    /// with `TestOptions::offline_network`).
+    #[doc(hidden)]
+    pub fn test_addrs(&self) -> Vec<SocketAddr> { self.core.loopback_addrs() }
+
+    /// Test hook: tell this instance where `user_id` (z-base-32) can be reached, and retry
+    /// anything waiting for that user (DM outbox, cold open).
+    #[doc(hidden)]
+    pub fn test_add_addr(&self, user_id: &str, addrs: &[SocketAddr]) -> Result<(), String> {
+        let user = commands::parse_user(user_id)?;
+        let hint = tincan_core::wire::AddrHint { relay: None, direct: addrs.to_vec() };
+        self.core.net.add_addr_hint(user, hint);
+        Ok(())
+    }
+
+    /// Test hook (`TestOptions::no_devices`): the synthetic microphone sends speech-like
+    /// bursts (`true`) or silence (`false`, the default).
+    #[doc(hidden)]
+    pub fn test_synthetic_voice(&self, on: bool) { self.core.media.test_synthetic_voice(on) }
+
+    /// Test hook (`TestOptions::no_devices`): the synthetic microphone panics on its next
+    /// read, which kills the audio engine thread (the app must restart it).
+    #[doc(hidden)]
+    pub fn test_crash_audio_engine(&self) { self.core.media.test_crash_audio() }
+
+    /// Test hook: allow real screen capture although `TestOptions::no_devices` is set
+    /// (audio stays synthetic). For the hardware screen-share test only.
+    #[doc(hidden)]
+    pub fn test_allow_screen_capture(&self) { self.core.media.test_allow_capture() }
+
+    /// Test hook: media counters, `{ audioIn, videoOut, engineRestarts, engineRunning }`.
+    #[doc(hidden)]
+    pub fn test_media_counters(&self) -> serde_json::Value { self.core.media.test_counters() }
 }

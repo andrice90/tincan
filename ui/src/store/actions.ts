@@ -197,7 +197,10 @@ function putMessage(m: Message): void {
     let list: Message[];
     if (i >= 0) {
       list = c.list.slice();
-      list[i] = m;
+      // Delivery and deletion only move one way. A command result can arrive after the
+      // event that already moved them (a DM acked within milliseconds), so never undo them.
+      const prev = c.list[i];
+      list[i] = { ...m, pending: m.pending && prev.pending, deleted: m.deleted || prev.deleted };
     } else {
       list = [...c.list, m];
       // keep display order when a late event arrives out of order
@@ -233,6 +236,43 @@ function markCurrentRead(): void {
       run(invoke("mark_read", { convId, channelId: null }));
     }
   }
+}
+
+/** At most one `mark_read` per conversation in this window while messages keep arriving. */
+const READ_EVERY_MS = 1000;
+const seenMarks = new Map<string, { last: number; timer: ReturnType<typeof setTimeout> | null }>();
+
+/**
+ * Someone else's message was put on screen: mark that conversation read right away
+ * (leading edge, then once more at the end of a burst). Waiting for the backend's unread
+ * flag instead would leave the conversation unread when the view changes within its debounce.
+ */
+function markSeen(m: Message): void {
+  if (m.authorId === getState().me?.userId) return;
+  const shown = (): boolean => {
+    const v = getState().view;
+    return v.kind === "server" ? v.serverId === m.convId && v.channelId === m.channelId : v.kind === "dms" && v.convId === m.convId;
+  };
+  if (!shown()) return;
+  const key = convKey(m.convId, m.channelId);
+  let mark = seenMarks.get(key);
+  if (!mark) {
+    mark = { last: 0, timer: null };
+    seenMarks.set(key, mark);
+  }
+  if (mark.timer) return;
+  const entry = mark;
+  const fire = () => {
+    entry.timer = null;
+    // mark_read covers everything stored so far: skip it once the conversation left the
+    // screen, or a message that arrived after that would count as read unseen
+    if (!shown()) return;
+    entry.last = Date.now();
+    run(invoke("mark_read", { convId: m.convId, channelId: m.channelId }));
+  };
+  const wait = entry.last + READ_EVERY_MS - Date.now();
+  if (wait <= 0) fire();
+  else entry.timer = setTimeout(fire, wait);
 }
 
 /** Loads what the current view needs and marks it read. */
@@ -335,6 +375,7 @@ export function init(): () => void {
     }),
     listen("message-added", (m) => {
       putMessage(m);
+      markSeen(m);
     }),
     listen("message-updated", putMessage),
     listen("typing", onTyping),

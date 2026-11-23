@@ -7124,13 +7124,18 @@ dependencies = [
  "tincan-app",
  "tincan-core",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "tincan-app"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "parking_lot",
+ "serde",
  "serde_json",
+ "tempfile",
  "tincan-audio",
  "tincan-core",
  "tincan-files",
@@ -7138,6 +7143,7 @@ dependencies = [
  "tincan-screen",
  "tincan-store",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
