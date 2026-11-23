@@ -221,6 +221,8 @@ pub struct InviteState {
     pub uses: u32,
     /// Revoked by its creator or the owner.
     pub revoked: bool,
+    /// hlc of the `InviteCreate`.
+    pub created_hlc: u64,
 }
 
 /// Why an invite cannot be used to admit someone now.
@@ -399,6 +401,21 @@ impl ConvState {
         } else {
             Ok(inv)
         }
+    }
+
+    /// Short invite codes the owner created that are still usable, newest first, as
+    /// `(code, invite_pk)` (`code::open_code` with the server's `code_key`). The caller must
+    /// still check each `invite_pk` against the code (`CodeKeys::invite_pk`): only a match is
+    /// the server's code.
+    pub fn short_code_invites(&self, code_key: &[u8; 32]) -> Vec<(crate::code::ShortCode, [u8; 32])> {
+        let mut v: Vec<(u64, [u8; 32], crate::code::ShortCode)> = self
+            .invites
+            .values()
+            .filter(|i| !i.revoked && i.expires_ms == u64::MAX && self.is_owner(&i.creator))
+            .filter_map(|i| crate::code::open_code(code_key, &i.invite_pk, i.max_uses).map(|c| (i.created_hlc, i.invite_pk, c)))
+            .collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        v.into_iter().map(|(_, pk, c)| (c, pk)).collect()
     }
 
     /// Heads for `Ctl::SyncHave` (sorted by author).
@@ -757,6 +774,7 @@ impl ConvState {
                     max_uses: *max_uses,
                     uses: 0,
                     revoked: false,
+                    created_hlc: ev.hlc,
                 });
                 Change::Invites
             }

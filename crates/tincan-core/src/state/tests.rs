@@ -980,3 +980,27 @@ fn verdict_helpers() {
     assert!(Verdict::Gap.should_buffer() && Verdict::Future.should_buffer());
     assert!(!Verdict::Stale.should_buffer() && !Verdict::Reject(String::new()).should_buffer());
 }
+
+#[test]
+fn short_code_invites_owner_only_newest_first() {
+    use crate::code::{ShortCode, seal_code};
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let a = fx.member("a");
+    let key = [9u8; 32];
+    let (c1, c2, c3) = (ShortCode::random(), ShortCode::random(), ShortCode::random());
+    let (p1, p2, p3) = ([61u8; 32], [62u8; 32], [63u8; 32]);
+    fx.ok(&o, Body::InviteCreate { invite_pk: p1, expires_ms: NEVER, max_uses: seal_code(&key, &p1, c1) });
+    fx.ok(&o, Body::InviteCreate { invite_pk: p2, expires_ms: NEVER, max_uses: seal_code(&key, &p2, c2) });
+    // A member's flagged invite and an expiring one never count as the server's code.
+    fx.ok(&a, Body::InviteCreate { invite_pk: p3, expires_ms: NEVER, max_uses: seal_code(&key, &p3, c3) });
+    fx.ok(&o, Body::InviteCreate { invite_pk: [64; 32], expires_ms: NOW + 1000, max_uses: seal_code(&key, &[64; 32], c3) });
+    // Plain invites carry no code.
+    fx.ok(&o, Body::InviteCreate { invite_pk: [65; 32], expires_ms: NEVER, max_uses: 0 });
+    assert_eq!(fx.state.short_code_invites(&key), vec![(c2, p2), (c1, p1)]);
+    // Rotation: the revoked one drops out.
+    fx.ok(&o, Body::InviteRevoke { invite_pk: p2 });
+    assert_eq!(fx.state.short_code_invites(&key), vec![(c1, p1)]);
+    // A flagged invite never caps uses in practice.
+    assert!(fx.state.invite_status(&p1, NOW).is_ok());
+}
