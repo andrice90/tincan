@@ -6,6 +6,7 @@
 #![warn(missing_docs)]
 
 pub mod build;
+pub mod code;
 pub mod election;
 pub mod error;
 pub mod event;

@@ -13,7 +13,7 @@ export type ConvId = string;
 
 export interface Me {
   userId: UserId;
-  /** "tincan1u" + userId, for "Copy my ID". */
+  /** "tincan1u" + userId: the full ID, behind "Copy full ID" (people normally share the friend code). */
   userCode: string;
   name: string;
   /** My avatar (an `http://tincan.localhost/file/<hash>` URL), null when I have none. */
@@ -238,8 +238,17 @@ export interface Commands {
   set_avatar: { args: { bytes: number[] | null }; result: Me };
 
   create_server: { args: { name: string }; result: ServerSummary };
-  /** Invite code ("tincan1...") valid for 7 days, unlimited uses. */
+  /** Full invite ("tincan1...") valid for 7 days, unlimited uses: the fallback to the short code. */
   create_invite: { args: { serverId: ServerId }; result: string };
+  /**
+   * The server's short invite code ("ABC-DEF"), valid until the owner rotates it. For the
+   * owner it is made first when there is none yet (can take a moment). Other members get null
+   * until the owner has made one.
+   */
+  get_invite_code: { args: { serverId: ServerId }; result: string | null };
+  /** Owner only: a new invite code. The old one stops working for new joins at once. */
+  rotate_invite_code: { args: { serverId: ServerId }; result: string };
+  /** Accepts the 6-character code (any case, dash and spaces optional) or a full invite or link. */
   join_server: { args: { invite: string }; result: ServerSummary };
   leave_server: { args: { serverId: ServerId }; result: null };
   rename_server: { args: { serverId: ServerId; name: string }; result: null };
@@ -274,8 +283,12 @@ export interface Commands {
    * (presence, calls) until another DM or null replaces it.
    */
   dm_watch: { args: { convId: ConvId | null }; result: null };
-  /** Accepts "tincan1u..." or a bare user id. */
+  /** Accepts a friend code ("ABC-DEF", any case, dash optional), "tincan1u..." or a bare user id. */
   add_contact: { args: { code: string }; result: DmSummary };
+  /** My friend code ("ABC-DEF"); made on first call. */
+  get_friend_code: { args: {}; result: string };
+  /** A new friend code; the old one stops resolving. */
+  rotate_friend_code: { args: {}; result: string };
 
   voice_join: { args: { serverId: ServerId; channelId: ChannelId }; result: VoiceSession };
   voice_leave: { args: {}; result: null };

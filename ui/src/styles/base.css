@@ -237,6 +237,11 @@ button:disabled {
   color: var(--text-2);
 }
 
+/* a field whose control is a button: keep it at its own width */
+.field-start {
+  justify-items: start;
+}
+
 .field-note {
   font-size: var(--fs-12);
   color: var(--text-3);

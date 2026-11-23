@@ -80,3 +80,14 @@ None of these changes a signature.
 - Index 11 is `Body::ReservedMemberRemove`, a placeholder every replica rejects. It only keeps the image bodies at 12 and 13 while `MemberRemove` is built on another branch; drop it at that merge. A build without these variants cannot decode events 12 and 13 (postcard), so it treats them as unverifiable: an older host refuses such a publish (the author's chain then waits at that host) and drops a member whose `Events` carry one ("sent an event with a bad signature"); an older member never applies them. Every member of a server needs this build before anyone sets an avatar or icon.
 - `image::inspect(bytes)` is what an app runs before publishing: magic bytes (PNG or WebP only), size, and width and height from the PNG IHDR or the WebP VP8, VP8L or VP8X header (1 to 256 pixels). Nothing is decoded.
 - `Ctl::DmAvatar { image }` is appended as variant 40 (`within_limits`: MIME at most 32 bytes). Other branches that append `Ctl` variants may collide at 40; the wire test pins it.
+
+## Short codes (`code.rs`)
+
+- `ShortCode`: 30 bits over `CODE_ALPHABET` (32 symbols). `parse` takes 6 alphabet characters in any case and skips whitespace and dashes; `Display` is `ABC-DEF`, `compact()` is the KDF input.
+- Codes commit to their target: `friend_commit(user, nonce)`, `invite_commit(server, invite_pk, nonce)` (argon2id, about 200 ms in release). `verify_friend` / `verify_invite` recompute them; `FriendRecord::open` / `InviteRecord::open` only decrypt and do the cheap checks.
+- `CodeKeys::derive(kind, code)`: the record slot (pkarr key and read key), argon2id with a salt per `CodeKind`. Holding it is not authority. A test pins outputs: changing parameters or salts breaks every published code.
+- `FriendCode { code, nonce }` (`generate`, `to_stored` / `from_stored` for the profile).
+- Invite codes ride in `InviteCreate.max_uses` as `SHORT_CODE_FLAG | r` (`marker_max_uses`, `open_marker`); `invite_material(code_key, r)` gives the seed and nonce from `ServerKeys::code_key`, a new sub-key. `ConvState::short_code_invites` lists the owner's unrevoked, never-expiring flagged invites newest first as `(r, invite_pk)`.
+- `InviteState` gained `created_hlc`.
+- `InviteRecord::new` cuts an `Invite` down to fit a pkarr packet (name 24 chars, 2 peers, relay URLs up to 96 chars, 2 direct addresses each).
+- New dependency: `argon2` 0.5 (pure Rust, `alloc` only).

@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use tincan_core::event::{Body, ChannelKind as CoreKind};
-use tincan_core::invite::{Invite, parse_user_code};
+use tincan_core::code::{FriendCode, ShortCode};
+use tincan_core::invite::parse_user_code;
 use tincan_core::state::{MAX_TEXT_CHARS, dm_channel};
 use tincan_core::storage::Storage;
 use tincan_core::{ChannelId, ConvId, EventId, UserId, now_ms};
@@ -15,6 +16,24 @@ use crate::dto::{self, ToastKind};
 use crate::emit::Ev;
 use crate::settings;
 use crate::views::{ChannelInfo, ConvView, Refresh, short_name};
+
+/// kv key of my friend code (`ABCDEF:<nonce hex>`, see `FriendCode::to_stored`).
+const FRIEND_CODE_KEY: &str = "app/friend_code";
+
+/// The stored friend code, if one was made.
+fn load_friend_code(storage: &dyn Storage) -> Option<FriendCode> {
+    match storage.get_kv(FRIEND_CODE_KEY) {
+        Ok(Some(v)) => String::from_utf8(v).ok().and_then(|s| FriendCode::from_stored(&s)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "reading the friend code failed");
+            None
+        }
+    }
+}
+
+/// Serializes making and rotating my friend code.
+static FRIEND_CODE_OPS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Most messages per page.
 const MAX_PAGE: u32 = 200;
@@ -78,15 +97,63 @@ impl Core {
         self.net.create_invite(server).await.map_err(net_err)
     }
 
-    /// `join_server`.
+    /// `get_invite_code`: the server's short code (`ABC-DEF`), made first when the owner
+    /// asks and there is none; null for other members until the owner made one.
+    pub(crate) async fn cmd_get_invite_code(&self, server: ConvId) -> Result<Option<String>, String> {
+        self.server_view(&server)?;
+        Ok(self.net.ensure_invite_code(server).await.map_err(net_err)?.map(|c| c.to_string()))
+    }
+
+    /// `rotate_invite_code`: owner only; the old code stops working for new joins at once.
+    pub(crate) async fn cmd_rotate_invite_code(&self, server: ConvId) -> Result<String, String> {
+        self.server_view(&server)?;
+        Ok(self.net.rotate_invite_code(server).await.map_err(net_err)?.to_string())
+    }
+
+    /// `get_friend_code`: my friend code (`ABC-DEF`), made and published on first use.
+    pub(crate) async fn cmd_get_friend_code(&self) -> Result<String, String> {
+        let _one = FRIEND_CODE_OPS.lock().await;
+        if let Some(fc) = load_friend_code(self.storage.as_ref()) {
+            return Ok(fc.code.to_string());
+        }
+        self.new_friend_code().await
+    }
+
+    /// `rotate_friend_code`: a new friend code; the old one stops resolving.
+    pub(crate) async fn cmd_rotate_friend_code(&self) -> Result<String, String> {
+        let _one = FRIEND_CODE_OPS.lock().await;
+        self.new_friend_code().await
+    }
+
+    /// A new nonce, so a new code committing to my user id (the KDF runs off the executor).
+    async fn new_friend_code(&self) -> Result<String, String> {
+        let me = self.me;
+        let fc = tokio::task::spawn_blocking(move || FriendCode::generate(&me)).await.map_err(|_| "Couldn't make a friend code. Try again.".to_string())?;
+        self.storage.set_kv(FRIEND_CODE_KEY, fc.to_stored().as_bytes()).map_err(|e| {
+            tracing::error!(error = %e, "saving the friend code failed");
+            "Couldn't save your friend code. Try again.".to_string()
+        })?;
+        self.net.set_friend_code(Some(fc));
+        Ok(fc.code.to_string())
+    }
+
+    /// Publish the stored friend code, if one was made (startup).
+    pub(crate) fn start_friend_code(&self) {
+        if let Some(code) = load_friend_code(self.storage.as_ref()) {
+            self.net.set_friend_code(Some(code));
+        }
+    }
+
+    /// `join_server`: a short invite code or a full invite.
     pub(crate) async fn cmd_join_server(&self, invite: &str) -> Result<dto::ServerSummary, String> {
         self.require_name()?;
-        let fresh = Invite::decode(invite).ok().filter(|inv| self.view(&inv.server).is_none()).map(|inv| inv.server);
+        let invite = self.net.resolve_invite(invite).await.map_err(net_err)?;
+        let fresh = self.view(&invite.server).is_none().then_some(invite.server);
         if let Some(server) = fresh {
             // The history sync follows the join at once: no per-message events for it.
             self.arm_bulk(server);
         }
-        let server = self.net.join(invite).await.map_err(net_err)?;
+        let server = self.net.join_invite(invite).await.map_err(net_err)?;
         if fresh == Some(server) {
             self.arm_bulk(server);
         }
@@ -347,11 +414,15 @@ impl Core {
         Ok(())
     }
 
-    /// `add_contact`: a `tincan1u...` code or a bare user id.
+    /// `add_contact`: a friend code, or a full `tincan1u...` ID or bare user id.
     pub(crate) async fn cmd_add_contact(&self, code: &str) -> Result<dto::DmSummary, String> {
-        let user = parse_user_code(code).ok_or_else(|| "That isn't a Tincan ID. Paste the code that starts with tincan1u.".to_string())?;
+        let user = match ShortCode::parse(code) {
+            Some(short) => self.net.resolve_friend_code(short).await.map_err(net_err)?,
+            None => parse_user_code(code)
+                .ok_or_else(|| "That isn't a friend code or a Tincan ID. A friend code has 6 characters, like K7Q-M2X.".to_string())?,
+        };
         if user == self.me {
-            return Err("That's your own ID. Paste the ID of the person you want to message.".into());
+            return Err("That's your own code. Enter the code of the person you want to message.".into());
         }
         let summary = self.cmd_open_dm(user).await?;
         if let Ok(Some(c)) = self.storage.get_contact(&user)

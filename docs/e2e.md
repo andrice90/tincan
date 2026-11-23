@@ -50,16 +50,16 @@ The script checks that each instance serves the current `ui/dist` bundle (script
 The script drives each flow by clicking and typing in the two webviews, with these exceptions:
 
 1. **Native Open dialog** (attachment, "Add sound"): CDP cannot reach it. `pick.ps1` finds the dialog window of that process, sets the file name box with `WM_SETTEXT` and presses Open with `WM_COMMAND IDOK`. It sends no keyboard or mouse input, so it works without focus. This still exercises the real `plugin:dialog|open` path and its capability. (UI Automation sees these classic controls only as panes, so the script uses plain Win32 calls.)
-2. **"Copy my ID"**: the button is clicked, but `navigator.clipboard.writeText` is replaced in the page beforehand. The code is captured there and the user's real clipboard is left alone. The captured code is cross-checked against one `app_snapshot` call, which is read-only.
+2. **"Copy my friend code"**: the button is clicked, but `navigator.clipboard.writeText` is replaced in the page beforehand. The code is captured there and the user's real clipboard is left alone. The captured code is cross-checked against one `get_friend_code` call, which returns the code already made.
 3. Process statistics come from PowerShell (`Get-Process`, `Win32_Process`).
 
 ## Flows and checks
 
 | Flow | Driven through the UI | Checked |
 |---|---|---|
-| a | Both pick a name on the Welcome screen. A creates "E2E Server", opens Invite people and reads the code from the dialog. B joins it with "Join with invite". | A 284-char `tincan1...` code. Both member lists show Alice and Bob under Online. B's header says "Hosted by Alice". No error toasts. |
+| a | Both pick a name on the Welcome screen. A creates "E2E Server", opens Invite people and reads the short code from the dialog. B joins it with "Join with invite", typed in lowercase without the dash. | A 6-character `ABC-DEF` code (made on first open; offline it resolves through `profiles/.offline-codes`). Both member lists show Alice and Bob under Online. B's header says "Hosted by Alice". No error toasts. |
 | b | A types slowly, B types slowly, then 10 timed messages each way. A attaches `e2e-attach.png` (96x64, four stripes) through the paperclip and the native dialog, then sends. | "Alice is typing" on B and "Bob is typing" on A. The typing line clears after the message. Every message arrives. B shows an inline `img` with naturalWidth 96 and naturalHeight 64, loaded from `http://tincan.localhost/file/<hash>`. |
-| c | B: Direct messages, Add contact, "Copy my ID". A: Add contact, pastes the code, sends a DM. B opens the new conversation row and types and sends a reply. | The code equals `me.userCode` and starts with `tincan1u`. A's message is no longer pending once delivered. DM typing line. Messages both ways. |
+| c | B: Direct messages, Add contact, "Copy my friend code". A: Add contact, pastes the code (resubmitted while B's record is not written yet), sends a DM. B opens the new conversation row and types and sends a reply. | The code equals `get_friend_code` and has the `ABC-DEF` form. A's message is no longer pending once delivered. DM typing line. Messages both ways. |
 | d | Both open the Lounge voice room (opening it joins) and press Mute. A opens Soundboard, then Add sound with `e2e-chime.wav`. A plays it. B opens Soundboard and presses Save on the heard tile, then plays the saved clip. | Both are listed under Lounge on both sides. The voice panel shows "Direct". The Add sound dialog proposes "e2e-chime" and the tile shows "2.0 s". B sees "Heard in this call" with "e2e-chime, From Alice". After Save, B's tile is a playable owned clip. B's play lights A's tile (A got `sound-played`). |
 | e | The pattern window opens. A: Share screen, picks the `tincan-e2e-pattern` card, Share. B clicks "Watch Alice's screen". | Exactly one card with that title. It is the only selected card (the picker preselects a display). The dialog closes and "Stop sharing" appears. B's canvas gets frames. In a CDP screenshot of B, the four quadrant centres of the drawn video are (255,1,0), (0,255,1), (0,0,255) and (255,255,0), each within 60 of red, green, blue and yellow. The canvas has the window's aspect (642x512). Stop sharing removes it on B. |
 | f | Both leave voice and open #general. The host (read from the header, "Hosted by you") presses the title bar Close (`window_close`). The survivor sends two messages. The closed profile is started again with the same port and arguments. | The host exits with code 0. The survivor's header becomes "Only you are online". The restarted instance shows "Hosted by Bob" and both messages sent while it was closed. Bob's member list shows Alice online again. A message after the rejoin arrives. The DM that was read before closing is still read (read markers survive a restart). |
@@ -152,7 +152,7 @@ The app and the shell met for the first time in this run. They needed no glue ch
   - Echo cancellation with two instances on one set of speakers was not tested.
 - **Calls:** the 1:1 call flow (ring, accept, hang up) and screen sharing inside a call were not part of this run.
 - **Host migration:** only the clean handoff via `window_close` was tested. A host crash (killed process), migration while in voice or while sharing, and proactive migration were not.
-- **"Copy invite" and "Copy my ID":** the real clipboard write was not tested; the in-page write was captured instead.
+- **"Copy" and "Copy my friend code":** the real clipboard write was not tested; the in-page write was captured instead.
 - **Window and build:**
   - Window dragging, minimize and maximize were not exercised.
   - No release or NSIS build was run.

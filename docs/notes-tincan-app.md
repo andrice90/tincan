@@ -497,3 +497,9 @@ Unit tests in `media/`:
 - `ui/src/store/actions.ts` `putMessage`: `pending` and `deleted` only move one way. On loopback the DM ack (`message-updated`, `pending: false`) arrives before the `send_message` result, which used to bring "Waiting for ..." back.
 - `ui/src/store/actions.ts` `markSeen`: another member's message that lands in the conversation on screen is marked read at once, then once more at the end of a burst if it is still on screen (at most once per second per conversation). Before this, leaving the view within the 100 ms unread debounce left the conversation unread for good.
 - `src-tauri`: `TINCAN_LOG=<EnvFilter>` sends tracing output from every crate to stderr. With it unset, no subscriber is installed. The e2e run uses `warn,tincan_audio=info`, which logs device open and close.
+
+## Short codes
+
+- Commands: `get_invite_code`, `rotate_invite_code`, `get_friend_code`, `rotate_friend_code`; `join_server` resolves a short code before joining (so `arm_bulk` still sees the server id), `add_contact` resolves a friend code.
+- My friend code is kv `app/friend_code` (`ABCDEF:<nonce hex>`), made on the first `get_friend_code` (the commitment runs on a blocking thread) and published from then on at every start (`Core::start_friend_code`). Profiles that never asked for one publish nothing.
+- Offline mode sets `NetConfig::code_dir` to `<data_dir>/../.offline-codes`, shared by every profile under the same parent (the e2e profiles; `tests/e2e.rs` `short_invite_and_friend_codes` puts its three profiles under one temp folder for the same reason).

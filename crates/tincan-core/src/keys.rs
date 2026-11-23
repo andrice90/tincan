@@ -97,6 +97,9 @@ pub struct ServerKeys {
     pub rdv_read_key: [u8; 32],
     /// MAC key that proves membership in `Hello`. Never in invites.
     pub hello_key: [u8; 32],
+    /// Derives the seed and nonce of the short-code invite (`code::invite_material`). Never
+    /// in invites.
+    pub code_key: [u8; 32],
 }
 
 impl std::fmt::Debug for ServerKeys {
@@ -116,6 +119,7 @@ impl ServerKeys {
             rdv_sk: SecretKey::from_bytes(&rdv_seed),
             rdv_read_key: blake3::derive_key("tincan v1 rendezvous record encryption key", &material),
             hello_key: blake3::derive_key("tincan v1 hello mac key", &material),
+            code_key: blake3::derive_key("tincan v1 invite code material key", &material),
         }
     }
     /// Public key of the rendezvous record (what invites carry as `rdv_pk`).

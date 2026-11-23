@@ -41,7 +41,7 @@ use crate::inner::Inner;
 use crate::session::{SessionCmd, SessionShared};
 
 /// TTL of the TXT records in the packet.
-const RECORD_TTL_S: u32 = 30;
+pub(crate) const RECORD_TTL_S: u32 = 30;
 /// A foreign host's record younger than this wins over publishing (clobber rule).
 const FOREIGN_FRESH_MS: u64 = 15 * 60 * 1000;
 /// A packet whose timestamp (seq) is further ahead of the clock than this is ignored: any
@@ -51,7 +51,7 @@ const MAX_PACKET_AHEAD_US: u64 = 10 * 60 * 1_000_000;
 const MAX_RECORD_AHEAD_MS: u64 = 5 * 60 * 1000;
 
 /// Is a packet's timestamp plausible (not far in the future)?
-fn packet_time_ok(seq_us: u64, now_us: u64) -> bool { seq_us <= now_us.saturating_add(MAX_PACKET_AHEAD_US) }
+pub(crate) fn packet_time_ok(seq_us: u64, now_us: u64) -> bool { seq_us <= now_us.saturating_add(MAX_PACKET_AHEAD_US) }
 
 /// Is a record plausible (published at most a little in the future)?
 fn record_time_ok(rec: &RdvRecord, now_ms: u64) -> bool { rec.published_ms <= now_ms.saturating_add(MAX_RECORD_AHEAD_MS) }
@@ -75,9 +75,9 @@ const PUBLISH_DEBOUNCE: Duration = Duration::from_secs(30);
 /// Minimum spacing between publishes of one server.
 const PUBLISH_MIN_GAP: Duration = Duration::from_secs(10);
 /// Relay copy refresh.
-const RELAY_REFRESH: Duration = Duration::from_secs(5 * 60);
+pub(crate) const RELAY_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// DHT copy refresh.
-const DHT_REFRESH: Duration = Duration::from_secs(30 * 60);
+pub(crate) const DHT_REFRESH: Duration = Duration::from_secs(30 * 60);
 /// Re-resolve interval while hosting with members (foreign host detection).
 const RESOLVE_HOSTING: Duration = Duration::from_secs(5 * 60);
 /// Re-resolve interval while solo.
@@ -287,6 +287,12 @@ impl Rendezvous {
 
     /// Valid packets from the DHT. `first_only`: stop at the first item that decrypts.
     async fn dht_get(rdv_pk: &PublicKey, read_key: &[u8; 32], first_only: bool) -> Vec<SignedPacket> {
+        Self::dht_get_with(rdv_pk, &|sp| open_packet(sp, rdv_pk, read_key).is_ok(), first_only).await
+    }
+
+    /// Valid packets from the DHT. After the first `readable` one, stop (`first_only`) or
+    /// drain a little longer for a higher seq.
+    async fn dht_get_with(pk: &PublicKey, readable: &(dyn Fn(&SignedPacket) -> bool + Sync), first_only: bool) -> Vec<SignedPacket> {
         let mut out = Vec::new();
         let dht = match Dht::client() {
             Ok(d) => d,
@@ -296,7 +302,7 @@ impl Rendezvous {
             }
         };
         let deadline = Instant::now() + DHT_BUDGET;
-        let mut stream = match tokio::time::timeout_at(deadline, dht.get_mutable(rdv_pk.as_bytes(), None, None)).await {
+        let mut stream = match tokio::time::timeout_at(deadline, dht.get_mutable(pk.as_bytes(), None, None)).await {
             Ok(Ok(s)) => s,
             _ => return out,
         };
@@ -313,7 +319,10 @@ impl Rendezvous {
                     continue;
                 }
             };
-            let readable = open_packet(&sp, rdv_pk, read_key).is_ok();
+            if sp.public_key() != *pk {
+                continue;
+            }
+            let readable = readable(&sp);
             out.push(sp);
             if readable {
                 if first_only {
@@ -372,6 +381,22 @@ impl Rendezvous {
 
     /// True if the n0 pkarr relay is used.
     pub fn has_relay(&self) -> bool { self.relay.is_some() }
+
+    /// Every packet under `pk` the relay and the DHT return (signatures verified), each
+    /// with whether it came from the DHT. The DHT query drains a little after the first
+    /// `readable` packet.
+    pub(crate) async fn get_all(&self, pk: &PublicKey, readable: &(dyn Fn(&SignedPacket) -> bool + Sync)) -> Vec<(SignedPacket, bool)> {
+        let (relay, dht) = tokio::join!(self.relay_get(pk), Self::dht_get_with(pk, readable, false));
+        relay.filter(|sp| sp.public_key() == *pk).map(|sp| (sp, false)).into_iter().chain(dht.into_iter().map(|sp| (sp, true))).collect()
+    }
+
+    /// Write a ready packet to the relay (if used) and, when `to_dht`, to the DHT with
+    /// `cas` (the highest seq the DHT returned). Returns (relay, dht) success.
+    pub(crate) async fn put(&self, sp: &SignedPacket, cas: Option<u64>, to_dht: bool) -> (bool, bool) {
+        let relay = self.relay_put(sp).await;
+        let dht = to_dht && Self::dht_put(sp, cas).await;
+        (relay, dht)
+    }
 
     /// Resolve, apply the clobber rule (unless `force`), then write `rec` to the relay (if
     /// configured) and, when `to_dht`, to the DHT.
@@ -485,10 +510,29 @@ pub(crate) fn spawn_cold_resolve(net: &Arc<Inner>, server: ServerId, keys: Serve
 
 /// The host role's publisher: publish on becoming host and on roster changes, refresh, and
 /// re-resolve to find a foreign host. Runs until aborted (the host role ends).
+/// The same task also keeps the server's invite code record fresh when short codes are on
+/// (`codes::host_invite_runner`).
 pub(crate) fn spawn_host_runner(net: &Arc<Inner>, server: ServerId, keys: ServerKeys, shared: Arc<SessionShared>) -> Option<tokio::task::AbortHandle> {
-    let rdv = net.rdv.clone()?;
+    if net.rdv.is_none() && net.codes.is_none() {
+        return None;
+    }
     let me = net.me;
-    Some(net.tasks.spawn(host_runner(Arc::downgrade(net), rdv, server, me, keys, shared)))
+    let weak = Arc::downgrade(net);
+    let records = net.rdv.clone().map(|rdv| host_runner(weak.clone(), rdv, server, me, keys.clone(), shared.clone()));
+    let codes = net.codes.is_some().then(|| crate::codes::host_invite_runner(weak, server, keys, shared));
+    Some(net.tasks.spawn(async move {
+        let records = async move {
+            if let Some(f) = records {
+                f.await;
+            }
+        };
+        let codes = async move {
+            if let Some(f) = codes {
+                f.await;
+            }
+        };
+        tokio::join!(records, codes);
+    }))
 }
 
 /// What a publish carries apart from the timestamp (republish only when it changed).

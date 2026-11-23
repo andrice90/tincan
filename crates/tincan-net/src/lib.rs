@@ -17,6 +17,7 @@
 #![warn(missing_docs)]
 
 mod addr;
+mod codes;
 mod config;
 mod dm;
 mod error;
@@ -44,6 +45,8 @@ mod tests_security;
 mod tests_store;
 #[cfg(test)]
 mod tests_dm;
+#[cfg(test)]
+mod tests_codes;
 
 pub use config::{MDNS_CADENCE, MDNS_SERVICE_NAME, NetConfig, RelayChoice, build_endpoint, transport_config};
 pub use dm::{DmHold, DmWatch};

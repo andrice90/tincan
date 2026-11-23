@@ -1,7 +1,7 @@
 // Dialogs for servers, channels, messages and contacts.
 
-import { useEffect, useState, type ReactNode } from "react";
-import { copyText, errorText, invoke } from "../api/client";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { errorText, invoke } from "../api/client";
 import type { ChannelId, ChannelKind, Message, ServerId } from "../api/types";
 import {
   addContact,
@@ -16,6 +16,7 @@ import {
   renameServer,
 } from "../store/actions";
 import { useStore } from "../store/store";
+import { CopyButton } from "../components/CopyButton";
 import { Modal } from "../components/Modal";
 import { useSubmit } from "./useSubmit";
 
@@ -119,7 +120,7 @@ export function JoinServerDialog() {
           id="invite-input"
           className="textarea mono"
           value={code}
-          placeholder="tincan1..."
+          placeholder="ABC-DEF"
           autoFocus
           spellCheck={false}
           onChange={(e) => {
@@ -133,6 +134,7 @@ export function JoinServerDialog() {
             }
           }}
         />
+        <p className="field-note">The 6-character code, or a full invite.</p>
       </div>
       <ErrorLine error={s.error} />
     </Modal>
@@ -141,69 +143,133 @@ export function JoinServerDialog() {
 
 export function InviteDialog({ serverId }: { serverId: ServerId }) {
   const server = useStore((s) => s.servers.find((x) => x.id === serverId));
-  const [code, setCode] = useState<string | null>(null);
+  const isOwner = server?.isOwner ?? false;
+  /** undefined while loading; null when the owner hasn't made a code yet. */
+  const [code, setCode] = useState<string | null | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  const [confirming, setConfirming] = useState(false);
+  const [rotating, setRotating] = useState(false);
+  const live = useRef(true);
 
   useEffect(() => {
-    let live = true;
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let current = true;
     setError(null);
-    invoke("create_invite", { serverId }).then(
-      (c) => live && setCode(c),
-      (err: unknown) => live && setError(errorText(err)),
+    invoke("get_invite_code", { serverId }).then(
+      (c) => current && setCode(c),
+      (err: unknown) => current && setError(errorText(err)),
     );
     return () => {
-      live = false;
+      current = false;
     };
   }, [serverId, attempt]);
 
-  useEffect(() => {
-    if (!copied) return;
-    const t = setTimeout(() => setCopied(false), 2000);
-    return () => clearTimeout(t);
-  }, [copied]);
+  const rotate = async () => {
+    setRotating(true);
+    setError(null);
+    try {
+      const c = await invoke("rotate_invite_code", { serverId });
+      if (live.current) setCode(c);
+    } catch (err) {
+      if (live.current) setError(errorText(err));
+    } finally {
+      if (live.current) {
+        setRotating(false);
+        setConfirming(false);
+      }
+    }
+  };
+
+  const fullInvite = () => invoke("create_invite", { serverId });
+  const noCode = code === null;
+
+  let footer: ReactNode;
+  if (confirming) {
+    footer = (
+      <>
+        <button type="button" className="btn btn-ghost" disabled={rotating} onClick={() => setConfirming(false)}>
+          Cancel
+        </button>
+        <button type="button" className="btn btn-danger" disabled={rotating} onClick={() => void rotate()}>
+          {rotating ? "Rotating" : "Rotate code"}
+        </button>
+      </>
+    );
+  } else if (noCode) {
+    footer = (
+      <>
+        <button type="button" className="btn btn-ghost" onClick={closeDialog}>
+          Done
+        </button>
+        <CopyButton className="btn btn-primary" text={fullInvite} label="Copy full invite" onError={setError} />
+      </>
+    );
+  } else {
+    footer = (
+      <>
+        <CopyButton className="btn btn-ghost foot-start" text={fullInvite} label="Copy full invite" onError={setError} />
+        {isOwner && code && (
+          <button type="button" className="btn" onClick={() => setConfirming(true)}>
+            Rotate code
+          </button>
+        )}
+        {error && code === undefined ? (
+          <button type="button" className="btn btn-primary" onClick={() => setAttempt((a) => a + 1)}>
+            Try again
+          </button>
+        ) : (
+          <button type="button" className="btn btn-primary" onClick={closeDialog}>
+            Done
+          </button>
+        )}
+      </>
+    );
+  }
 
   return (
     <Modal
-      title={`Invite people to ${server?.name ?? "this server"}`}
-      onClose={closeDialog}
-      footer={
+      title={
         <>
-          <button type="button" className="btn btn-ghost" onClick={closeDialog}>
-            Done
-          </button>
-          {error ? (
-            <button type="button" className="btn btn-primary" onClick={() => setAttempt((a) => a + 1)}>
-              Try again
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={!code}
-              onClick={() => code && void copyText(code).then(setCopied)}
-            >
-              {copied ? "Copied" : "Copy invite"}
-            </button>
-          )}
+          Invite people to <bdi>{server?.name ?? "this server"}</bdi>
         </>
       }
+      onClose={closeDialog}
+      footer={footer}
     >
-      <div className="field">
-        <label className="field-label" htmlFor="invite-code">
-          Invite code
-        </label>
-        <input
-          id="invite-code"
-          className="input mono"
-          readOnly
-          value={code ?? ""}
-          placeholder={error ? "" : "Creating invite"}
-          onFocus={(e) => e.currentTarget.select()}
-        />
-        <p className="field-note">Anyone with this invite can join for 7 days.</p>
-      </div>
+      {noCode ? (
+        <p className="muted">The owner hasn't made an invite code yet. Send the full invite instead. It works for 7 days.</p>
+      ) : (
+        <div className="field">
+          <label className="field-label" htmlFor="invite-code">
+            Invite code
+          </label>
+          <div className="input-row">
+            <input
+              id="invite-code"
+              className="input mono"
+              readOnly
+              value={code ?? ""}
+              placeholder={error ? "" : "Making a code"}
+              onFocus={(e) => e.currentTarget.select()}
+            />
+            <CopyButton text={code ?? null} label="Copy" />
+          </div>
+          <p className="field-note">
+            {confirming
+              ? "The current code stops working for new joins. People already in the server stay."
+              : isOwner
+                ? "Works until you rotate it."
+                : "Works until the owner rotates it."}
+          </p>
+        </div>
+      )}
       <ErrorLine error={error} />
     </Modal>
   );
@@ -357,16 +423,21 @@ export function ConfirmDeleteMessage({ message }: { message: Message }) {
 }
 
 export function AddContactDialog() {
-  const me = useStore((s) => s.me);
   const [code, setCode] = useState("");
-  const [copied, setCopied] = useState(false);
+  const [myCode, setMyCode] = useState<string | null>(null);
   const s = useSubmit(() => addContact(code.trim()), closeDialog);
+  const setError = s.setError;
 
   useEffect(() => {
-    if (!copied) return;
-    const t = setTimeout(() => setCopied(false), 2000);
-    return () => clearTimeout(t);
-  }, [copied]);
+    let live = true;
+    invoke("get_friend_code", {}).then(
+      (c) => live && setMyCode(c),
+      (err: unknown) => live && setError(errorText(err)),
+    );
+    return () => {
+      live = false;
+    };
+  }, [setError]);
 
   return (
     <Modal
@@ -375,24 +446,20 @@ export function AddContactDialog() {
       onSubmit={s.submit}
       footer={
         <>
-          {me && (
-            <button type="button" className="btn btn-ghost foot-start" onClick={() => void copyText(me.userCode).then(setCopied)}>
-              {copied ? "Copied" : "Copy my ID"}
-            </button>
-          )}
+          <CopyButton className="btn btn-ghost foot-start" text={myCode} label="Copy my friend code" />
           <Footer busy={s.busy} label="Add contact" disabled={!code.trim()} />
         </>
       }
     >
       <div className="field">
         <label className="field-label" htmlFor="contact-code">
-          Their Tincan ID
+          Their friend code
         </label>
         <input
           id="contact-code"
           className="input mono"
           value={code}
-          placeholder="tincan1u..."
+          placeholder="ABC-DEF"
           autoFocus
           spellCheck={false}
           onChange={(e) => {
@@ -400,6 +467,7 @@ export function AddContactDialog() {
             s.setError(null);
           }}
         />
+        <p className="field-note">A full Tincan ID works too.</p>
       </div>
       <ErrorLine error={s.error} />
     </Modal>

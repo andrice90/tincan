@@ -223,18 +223,23 @@ async function flowA(a, b) {
   await waitText(a, ".side-header .side-sub", "Only you are online");
   timing("create_server_ui", now() - t);
 
-  // invite dialog: read the code
+  // invite dialog: read the short code (the owner's first one is made on open: KDF + publish)
   await a.page.locator("button.side-header-btn").click();
   await a.page.getByRole("menuitem", { name: "Invite people" }).click();
-  await waitPage(a, () => document.querySelector("#invite-code")?.value.startsWith("tincan1"), null, { what: "invite code" });
+  t = now();
+  await waitPage(a, () => /^[2-9A-HJ-NP-Z]{3}-[2-9A-HJ-NP-Z]{3}$/.test(document.querySelector("#invite-code")?.value ?? ""), null, {
+    timeout: 30000,
+    what: "short invite code",
+  });
+  timing("invite_code_shown", now() - t);
   const invite = await a.page.inputValue("#invite-code");
-  check("invite code shown", invite.startsWith("tincan1") && invite.length > 40, `${invite.length} chars`);
+  check("short invite code shown", /^[2-9A-HJ-NP-Z]{3}-[2-9A-HJ-NP-Z]{3}$/.test(invite), invite);
   await shot(a, "a2-invite");
   await clickButton(a, "Done", dlg(a));
 
-  // B joins with it
+  // B joins with it (typed in lowercase without the dash: input is forgiving)
   await clickButton(b, "Join with invite");
-  await dlg(b).locator("#invite-input").fill(invite);
+  await dlg(b).locator("#invite-input").fill(invite.replace("-", "").toLowerCase());
   t = now();
   await dlg(b).locator("button[type=submit]").click();
   await waitText(b, ".side-header .side-title", SERVER, { timeout: 30000 });
@@ -322,8 +327,8 @@ async function flowB(a, b, files) {
 }
 
 async function flowC(a, b) {
-  // B copies its ID with the UI's "Copy my ID" (clipboard write captured in the page so
-  // the real clipboard is left alone), cross-checked against app_snapshot.
+  // B copies its friend code with the UI's "Copy my friend code" (clipboard write captured in
+  // the page so the real clipboard is left alone), cross-checked against get_friend_code.
   await b.page.getByRole("button", { name: /^Direct messages/ }).click();
   await b.page.locator(".side-header").getByRole("button", { name: "Add contact" }).click();
   await b.page.evaluate(() => {
@@ -332,23 +337,39 @@ async function flowC(a, b) {
       window.__e2eCopied.push(t);
     };
   });
-  await clickButton(b, "Copy my ID", dlg(b));
+  // enabled once the dialog has the code (made and published on first use)
+  await clickButton(b, "Copy my friend code", dlg(b));
   await waitText(b, "dialog[open] button", "Copied");
   const code = await b.page.evaluate(() => window.__e2eCopied[0]);
-  const snapCode = await b.page.evaluate(async () => (await window.__TAURI_INTERNALS__.invoke("api", { cmd: "app_snapshot", args: {} })).me.userCode);
-  check("Copy my ID gives B's user code", code === snapCode && code.startsWith("tincan1u"), code);
+  const apiCode = await b.page.evaluate(async () => window.__TAURI_INTERNALS__.invoke("api", { cmd: "get_friend_code", args: {} }));
+  check("Copy my friend code gives B's friend code", code === apiCode && /^[2-9A-HJ-NP-Z]{3}-[2-9A-HJ-NP-Z]{3}$/.test(code), code);
   await clickButton(b, "Cancel", dlg(b));
 
-  // A adds B by that code
+  // A adds B by that code. B's record is published in the background right after the code
+  // is made, so a lookup that comes first can miss it: resubmit on that error for a while.
   await a.page.getByRole("button", { name: /^Direct messages/ }).click();
   await a.page.locator(".side-header").getByRole("button", { name: "Add contact" }).click();
   await dlg(a).locator("#contact-code").fill(code);
-  await dlg(a).locator("button[type=submit]").click();
+  let t = now();
+  for (let tries = 0; ; tries++) {
+    await dlg(a).locator("button[type=submit]").click();
+    await waitPage(
+      a,
+      () => document.querySelector(".main-header .main-title")?.textContent?.includes("Bob") || !!document.querySelector("dialog[open] .dialog-error"),
+      null,
+      { timeout: 30000, what: "A's add-contact result" },
+    );
+    const err = await a.page.$eval("dialog[open] .dialog-error", (e) => e.textContent).catch(() => null);
+    if (!err) break;
+    if (tries >= 10) check("A adds Bob by friend code", false, err);
+    await sleep(1500);
+  }
+  timing("add_contact_by_friend_code", now() - t);
   await waitText(a, ".main-header .main-title", "Bob");
   check("A's DM with Bob is open", true, await a.page.$eval(".main-header .main-title", (e) => e.textContent));
 
   await typeInComposer(a, "DM hello from Alice", 5);
-  let t = now();
+  t = now();
   await a.page.locator("textarea.composer-input").press("Enter");
   await waitText(b, "button.dm-row", "Alice", { timeout: 15000 });
   await b.page.locator("button.dm-row", { hasText: "Alice" }).click();

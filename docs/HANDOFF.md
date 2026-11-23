@@ -79,6 +79,7 @@ Profiles: `--profile <name>` or `TINCAN_PROFILE`, data in `%APPDATA%\Tincan\prof
 
 ## Since the last handoff
 
+- Short codes: each server has a 6-character invite code (owner rotates it) and each user a 6-character friend code, resolved through argon2id-derived pkarr records (a shared folder offline). Four new commands; see api.md and architecture.md "Short codes". The long forms still work.
 - Round 2 fixes merged, then round 3: a review of those fixes found 17 more issues, and all are fixed. The main ones were sybil admissions growing a server without bound, an attestation merge takeover, Events and DM floods, pre-auth and stranger-slot lockouts, and unproven blob sizes.
 - Avatars and server icons (branch `worktree-agent-a7bdc89dd249e4e55`): `Body` 12 and 13, `Ctl::DmAvatar` (40), `BlobKind::Image`, commands `set_avatar` and `set_server_icon`, avatar and icon fields in the DTOs, a crop dialog. `Body` 11 is a placeholder to drop when `MemberRemove` merges. Every member needs this build before anyone sets an image (see `notes-tincan-core.md`).
 - The contract gained one command: `dm_watch` (hold a DM connection open while it is on screen). See `api.md`.

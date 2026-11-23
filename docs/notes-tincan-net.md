@@ -280,3 +280,13 @@ Idle cost:
 ## Avatars on DM connections
 
 `NetConfig.avatar` and `Net::set_avatar(Option<ImageRef>)`: the avatar goes out as `Ctl::DmAvatar` right after `DmProfile` when a DM connection opens (only when I have one) and on every open connection when it changes (a clear included). Received ones are validated (`image::validate_image_ref`), budgeted per contact by their own bucket (3, then one per 5 s), persisted in kv `net/dm_avatar/<conv>` (postcard `Option<ImageRef>`) and announced as `NetEvent::DmAvatarChanged`; read them with `Net::dm_peer_avatar(conv)`. A stranger's avatar stays in memory until their first message opens the conversation, like their name. Test: `tests_dm::dm_avatars_are_announced_checked_and_kept`.
+
+## Short codes (`codes.rs`)
+
+- `NetConfig::code_dir`: a folder that stands in for the DHT when the rendezvous layer is off. With rendezvous on, records go through `Rendezvous::get_all` / `put` (relay plus DHT, same write rule as the rendezvous record). With neither, short code calls fail with "Short codes need an internet connection. Use the full invite or ID instead."
+- API: `invite_code`, `ensure_invite_code` (the owner makes one when none exists), `rotate_invite_code` (owner only: new `InviteCreate`, then `InviteRevoke` for older codes, record written at once, tombstone over the old one in the background), `resolve_invite` (short or full), `join_invite`, `join` (both), `set_friend_code` (a `FriendCode`), `resolve_friend_code` (learns the address).
+- The host role's runner task (`rdv::spawn_host_runner`) also runs `codes::host_invite_runner` when short codes are on, even with rendezvous off: first write 2 s after becoming host, then a check every 30 s.
+- The friend runner is a Net-level task, replaced on `set_friend_code`.
+- Reads try the plausible packets newest first and return the first that opens and passes the commitment check (`verify_invite` / `verify_friend`, on a blocking thread). Junk or forged records are skipped.
+- A write that finds a fresh (under 2 h) record under the same slot that verifies for another server or user returns `Written::Foreign` and leaves it alone (the check runs on a blocking thread through `Veto`). Anything that does not verify is overwritten.
+- Not covered by tests: the host runner's refresh after a migration (the in-process tests use the owner's immediate write) and the pkarr/DHT path (only the local folder is exercised; the live rendezvous tests stay `#[ignore]`).
