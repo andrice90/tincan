@@ -253,11 +253,12 @@ The owner signs `MemberRemove { user, last_seq }` (`kick_member`). `last_seq` is
 - **The cut is in the user's seq space, not in time.** An author's hlc only has to grow past their own previous one, so a time cut could not stop a removed member who keeps signing events with old timestamps. Events up to `last_seq` stay valid whenever they arrive. Later events are void until a re-admit.
 - **Validation stays monotonic.** The seq-chain rules ignore removals, so no replica ever retracts an accepted event and the chain stays contiguous for a re-join. What a removal changes is derived from the applied set, the same way on every replica (`state::refresh_removals`):
   - A re-admit clears a removal only if it is a `MemberAdmit` that comes after the removal by (hlc, id), has `from_seq > last_seq`, and was signed at a valid seq.
-  - The user's old admission does not clear it, nor any admit signed before the removal (a concurrent re-join included). Neither does an admit the removed user signs for itself or another removed user (a least fixpoint).
+  - The user's old admission does not clear it, nor any admit signed before the removal (a concurrent re-join included).
+  - Only trusted admits count: signed by the owner, or by someone holding a trusted admit, at a valid seq (a least fixpoint). So a removed user cannot re-admit itself, another removed user, or itself through a fresh key it admitted at a void seq. Such a key is unrooted: no member, every event void.
   - While a removal is uncleared the user is not a member (`is_member`).
-  - Void messages are hidden, a void Profile names nobody, and an invite created at a void seq admits nobody.
-  - Still applied from void events: deleting one's own message, revoking an invite, leaving, and admitting someone else. Only a colluding member can relay these, and that member could do the same with its own events.
-- **Race.** Events the user published just before the removal reached the host are void too (seq past the cut), even on replicas that showed them first. `shuffled_delivery_converges` covers a removal with concurrent events, a void self-admit and a re-admit.
+  - Void messages are hidden from every message list and live event, and are not auto-fetched. A void Profile names nobody, and an invite created at a void seq admits nobody.
+  - Still applied from void events: deleting one's own message, revoking an invite, leaving, and admitting someone else (who stays unrooted). Honest hosts refuse a removed user's events, so these reach replicas only through a member that relays them on purpose or that had not seen the removal yet.
+- **Race.** Events the user published just before the removal reached the host are void too (seq past the cut), even on replicas that showed them first. Such a message already on screen stays there until the channel is loaded again. `shuffled_delivery_converges` covers a removal with concurrent events, a void self-admit and a re-admit.
 - **Host enforcement.** After every membership change and on becoming host, a host drops the link of anyone no longer a member. This takes them out of the roster, voice and screen share. Before dropping a removed member, it sends the owner-signed removal.
   - A host refuses their Hello and their publishes. To a removed member's Hello it answers with that owner-signed removal, so a member who was offline learns of it.
   - The member believes only an owner-signed removal naming it that nothing it holds has cleared (`ConvState::removal_of`), never a host's word.
@@ -271,7 +272,7 @@ The owner signs `MemberRemove { user, last_seq }` (`kick_member`). `last_seq` is
   - Any member can mint an invite and re-admit a removed user, the same trust as any admission.
   - A malicious host can withhold a removal from its members until they sync with someone else.
   - If a host stored a removed member's last publish but its ack was lost, the re-join profile reuses that seq. This is detected as equivocation, not resolved.
-  - A void message relayed by a malicious host still marks a channel unread.
+  - The unread query reads storage, so a void message can still mark a channel unread, although it is never shown.
 
 ### Files and peer text (tincan-app)
 

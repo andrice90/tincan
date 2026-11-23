@@ -243,3 +243,44 @@ async fn r5_new_host_enforces_a_removal_made_while_offline() {
         n.net.shutdown().await;
     }
 }
+
+/// The owner is a member, not the host: its removal goes through the host, which enforces
+/// it. Then the owner removes the host itself, which hands the server over and stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r6_removal_through_a_host_and_of_the_host() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    let c = node("carol", fast()).await;
+    let m = node("mallory", fast()).await;
+    wire(&[&a, &b, &c, &m]);
+    let server = cluster(&a, &[&b, &c, &m]).await;
+    // Alice restarts: someone else hosts, Alice comes back as a member.
+    let (a_id, a_store) = (a.identity.clone(), a.storage.clone());
+    a.net.shutdown().await;
+    until("a new host", Duration::from_secs(10), || host_of(&b, &server).is_some_and(|h| h != a_id.user())).await;
+    let a = start(a_id, a_store, "alice", fast()).await;
+    wire(&[&a, &b, &c, &m]);
+    let host = host_of(&b, &server).unwrap();
+    until("alice is a member", Duration::from_secs(15), || host_of(&a, &server) == Some(host)).await;
+    until("alice synced", Duration::from_secs(10), || a.net.conv_state(&server).is_some_and(|s| !s.sorted_channels().is_empty())).await;
+    let mid = m.net.me();
+    let host_node = [&b, &c, &m].into_iter().find(|n| n.net.me() == host).expect("host node");
+    if host != mid {
+        let mut rx = m.net.subscribe();
+        within("remove", Duration::from_secs(10), a.net.remove_member(server, mid)).await.expect("remove through the host");
+        removed_event(&mut rx, server).await;
+        until("the host dropped mallory", Duration::from_secs(5), || !online(host_node, &server, &mid)).await;
+    }
+    // Now the host itself.
+    let mut rx = host_node.net.subscribe();
+    within("remove the host", Duration::from_secs(10), a.net.remove_member(server, host)).await.expect("remove the host");
+    removed_event(&mut rx, server).await;
+    until("someone else hosts", Duration::from_secs(15), || host_of(&a, &server).is_some_and(|h| h != host)).await;
+    until("the old host is out", Duration::from_secs(10), || !online(&a, &server, &host)).await;
+    let ok = say(&a, server, "after").await.expect("owner still publishes");
+    assert!(valid(&a, &server, &ok));
+    assert!(host_node.net.is_removed(&server));
+    for n in [a, b, c, m] {
+        n.net.shutdown().await;
+    }
+}

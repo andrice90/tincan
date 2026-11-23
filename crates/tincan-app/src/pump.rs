@@ -474,6 +474,11 @@ impl Pump {
         match ev {
             NetEvent::EventAdded { conv, event, change } => match change {
                 Change::Message { .. } => {
+                    // A void message (signed by a removed member after the removal) is
+                    // stored for seq continuity only: not shown, not fetched.
+                    if core.view(&conv).is_some_and(|v| !v.event_valid(&event.event.author, event.event.seq)) {
+                        return;
+                    }
                     let n = self.batch_counts.get(&conv).copied().unwrap_or(1);
                     if !self.bulks.on_message(conv, n, Instant::now()) {
                         core.emit_message(Ev::MessageAdded, &conv, &event);

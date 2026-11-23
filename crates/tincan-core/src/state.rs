@@ -63,18 +63,22 @@
 //! the seqs in between). Instead, validity is derived from the applied set:
 //! - `MemberRemove { user, last_seq }` makes `user`'s events with seq > `last_seq` void until
 //!   a re-admit clears it: a `MemberAdmit` naming `user` that comes after the removal by
-//!   (hlc, id), has `from_seq > last_seq` and was signed at a valid seq (the owner's always
-//!   are). Admits that came before the removal, such as the user's old admission, never clear
-//!   it. Signer validity depends on other removals, so the cleared set is a least fixpoint
-//!   (`refresh_removals`), which also stops two removed users from re-admitting each other.
+//!   (hlc, id), has `from_seq > last_seq` and is trusted: signed by the owner, or by someone
+//!   holding a trusted admit, at a valid seq. Admits that came before the removal, such as
+//!   the user's old admission, never clear it. Trust and clearing depend on each other, so
+//!   they are a least fixpoint (`refresh_removals`). That stops two removed users from
+//!   re-admitting each other, and a removed user from coming back through a fresh key it
+//!   admitted at a void seq (a puppet): such a key is `unrooted`, no member, all its events
+//!   void.
 //! - A void event is stored and synced, with no effect: void messages are hidden
 //!   ([`ConvState::event_valid`]), a void Profile does not name anyone, an invite created at
 //!   a void seq admits nobody ([`ConvState::invite_status`]), and a void admit does not clear
 //!   a removal. `is_member` is false while a removal is uncleared.
 //! - Still applied from void events: a Delete of the author's own message, InviteRevoke,
-//!   MemberLeave, and a MemberAdmit of someone else. They only reach replicas through a
-//!   member that relays a removed user's events (honest hosts refuse them), and that member
-//!   could do the same with its own events.
+//!   MemberLeave, and a MemberAdmit of someone else (whose admittee stays unrooted unless a
+//!   trusted admit follows). Honest hosts refuse a removed user's events, so they reach
+//!   replicas only through a member that relays them on purpose or that had not seen the
+//!   removal yet.
 //! - Events up to `last_seq` stay valid whenever they arrive.
 //!
 //! # Convergence (deviations from the literal architecture rules)
@@ -189,6 +193,10 @@ pub struct Member {
     pub removals: Vec<RemovalRecord>,
     /// Every Profile the user signed, by (hlc, seq). `name` is the latest valid one.
     pub profiles: Vec<ProfileRecord>,
+    /// Derived, once anyone was ever removed: no admit of this user chains back to the
+    /// owner (they were admitted only by removed members at void seqs). Not a member, and
+    /// their events are void.
+    pub unrooted: bool,
 }
 
 /// One `MemberAdmit` naming a member.
@@ -251,6 +259,7 @@ impl Member {
             admit_log: Vec::new(),
             removals: Vec::new(),
             profiles: Vec::new(),
+            unrooted: false,
         }
     }
 
@@ -260,7 +269,7 @@ impl Member {
     pub fn seq_valid(&self, seq: u64) -> bool { valid_under(&self.removals, seq) }
 
     /// Removed by the owner and not re-admitted since.
-    pub fn removed(&self) -> bool { self.removals.iter().any(|r| r.cleared_from.is_none()) }
+    pub fn removed(&self) -> bool { self.removals.iter().any(|r| r.cleared_from.is_none()) || self.unrooted }
 
     /// `name` is the latest Profile (by hlc) signed at a valid seq.
     fn refresh_name(&mut self) {
@@ -479,7 +488,7 @@ impl ConvState {
     /// author before it (see [`Member::seq_valid`])? Display code hides void messages.
     /// Always true in DMs and for authors who were never removed.
     pub fn event_valid(&self, author: &UserId, seq: u64) -> bool {
-        self.is_dm || self.members.get(author).is_none_or(|m| m.seq_valid(seq))
+        self.is_dm || self.members.get(author).is_none_or(|m| !m.unrooted && m.seq_valid(seq))
     }
 
     /// The removal of `user` in effect now (the latest uncleared one), if any.
@@ -944,43 +953,70 @@ impl ConvState {
         }
     }
 
-    /// Recompute which removals are cleared, and with them which seqs are void, who is
-    /// removed and the affected display names. A re-admit clears a removal only if it comes
-    /// after it by (hlc, id), has `from_seq > last_seq`, and its signer was valid at the
-    /// admit's seq (the owner always is). Signer validity depends on other removals, so this
-    /// is a least fixpoint: start with nothing cleared and widen until stable. It is a pure
-    /// function of the applied admits and removals, so every delivery order ends the same.
+    /// Recompute which admits are trusted and which removals are cleared, and with them which
+    /// seqs are void, who is removed or unrooted, and the affected display names.
+    ///
+    /// An admit is trusted when its signer is the owner, or holds a trusted admit from at or
+    /// before the admit's seq and was valid at that seq. So trust chains back to the owner,
+    /// and nobody admitted by a removed member at a void seq (a puppet) can vouch for anyone.
+    /// A re-admit clears a removal only if it is trusted, comes after the removal by
+    /// (hlc, id) and has `from_seq > last_seq`. Trust and clearing depend on each other, so
+    /// this is a least fixpoint: start with nothing trusted or cleared and widen until
+    /// stable. It is a pure function of the applied admits and removals, so every delivery
+    /// order ends the same. Nothing is computed while nobody was ever removed: then every
+    /// admit chains back to the owner anyway (rule 6).
     fn refresh_removals(&mut self) {
-        let mut removed: Vec<UserId> = self.members.iter().filter(|(_, m)| !m.removals.is_empty()).map(|(u, _)| *u).collect();
-        if removed.is_empty() {
+        if !self.members.values().any(|m| !m.removals.is_empty()) {
             return;
         }
-        removed.sort();
-        for u in &removed {
-            if let Some(m) = self.members.get_mut(u) {
-                for r in &mut m.removals {
-                    r.cleared_from = None;
-                }
+        let mut users: Vec<UserId> = self.members.keys().copied().collect();
+        users.sort();
+        for m in self.members.values_mut() {
+            for r in &mut m.removals {
+                r.cleared_from = None;
             }
         }
         let owner = self.owner;
+        let mut trusted: HashSet<EventId> = HashSet::new();
         loop {
             let mut changed = false;
-            for u in &removed {
+            // Admits whose signer is rooted and valid at the admit's seq.
+            for u in &users {
                 let Some(m) = self.members.get(u) else { continue };
-                let mut updates = Vec::new();
-                for (i, r) in m.removals.iter().enumerate() {
-                    let best = m
-                        .admit_log
-                        .iter()
-                        .filter(|a| (a.hlc, a.id) > (r.hlc, r.id) && a.from_seq > r.last_seq)
-                        .filter(|a| Some(a.by) == owner || self.members.get(&a.by).is_none_or(|s| s.seq_valid(a.by_seq)))
-                        .map(|a| a.from_seq)
-                        .min();
-                    if best != r.cleared_from {
-                        updates.push((i, best));
+                for a in &m.admit_log {
+                    if trusted.contains(&a.id) {
+                        continue;
+                    }
+                    let ok = Some(a.by) == owner
+                        || self.members.get(&a.by).is_some_and(|s| {
+                            s.seq_valid(a.by_seq) && s.admit_log.iter().any(|b| b.from_seq <= a.by_seq && trusted.contains(&b.id))
+                        });
+                    if ok {
+                        trusted.insert(a.id);
+                        changed = true;
                     }
                 }
+            }
+            // Removals cleared by a trusted re-admit.
+            for u in &users {
+                let Some(m) = self.members.get(u) else { continue };
+                if m.removals.is_empty() {
+                    continue;
+                }
+                let updates: Vec<(usize, Option<u64>)> = m
+                    .removals
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| {
+                        let best = m
+                            .admit_log
+                            .iter()
+                            .filter(|a| trusted.contains(&a.id) && (a.hlc, a.id) > (r.hlc, r.id) && a.from_seq > r.last_seq)
+                            .map(|a| a.from_seq)
+                            .min();
+                        (best != r.cleared_from).then_some((i, best))
+                    })
+                    .collect();
                 if !updates.is_empty() {
                     changed = true;
                     if let Some(m) = self.members.get_mut(u) {
@@ -994,8 +1030,9 @@ impl ConvState {
                 break;
             }
         }
-        for u in &removed {
-            if let Some(m) = self.members.get_mut(u) {
+        for (u, m) in self.members.iter_mut() {
+            m.unrooted = Some(*u) != owner && !m.admit_log.iter().any(|a| trusted.contains(&a.id));
+            if !m.removals.is_empty() {
                 m.refresh_name();
             }
         }

@@ -32,7 +32,7 @@ Crate: `crates/tincan-net`. Rustdoc: `cargo doc -p tincan-net --no-deps`. This p
   - When my replica says I was removed, the session emits `NetEvent::Removed` and stops. A host hands off first. Queued and in-flight publishes fail with "You were removed from this server.", and the own-seq floor drops to max(applied head, cut).
   - `Net::start` spawns no session for a removed server, and `connection()` reports `Offline` for it.
   - **Re-join.** `join` re-joins a removed server. Only after a host accepted does it drop the local copy (`forget`: storage and notice). The floor is kept, so seqs continue. A refused attempt keeps the read-only copy. `leave` on a removed server only forgets it.
-  - Tests: `tests_removal.rs` (r1 to r5): the honest path and restart, a forged removal, a host replaying void events, an old admission and a self-admit, re-join with a current and a revoked invite, and enforcement by a new host for a member removed while offline.
+  - Tests: `tests_removal.rs` (r1 to r6): the honest path and restart, a forged removal, a host replaying void events, an old admission and a self-admit, re-join with a current and a revoked invite, enforcement by a new host for a member removed while offline, and a removal published through a non-owner host followed by the removal of that host (handoff, then stop).
 - `publish(dm, body)`: stored and `EventAdded` emitted at once. Only `Message` and `Delete`; the channel is forced to `dm_channel(conv)`.
   - `dm_delivered(conv)` is the highest confirmed seq; messages with a higher seq are pending.
   - `dm_pending(conv)` is the highest unconfirmed seq (0 when all are delivered). `DmDelivered` fires when the ack advances.

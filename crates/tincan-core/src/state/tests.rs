@@ -484,6 +484,28 @@ fn removed_members_cannot_readmit_each_other() {
 }
 
 #[test]
+fn a_removed_member_cannot_come_back_through_a_puppet() {
+    // m, removed, admits a fresh key s at a void seq; s then re-admits m. s's admission does
+    // not chain back to the owner, so s vouches for nobody and is no member itself.
+    let mut fx = Fx::new();
+    let m = fx.member("m");
+    remove(&mut fx, &m);
+    let s = Identity::generate();
+    fx.ok(&m, Body::MemberAdmit { user: s.user(), invite_pk: fx.invite, from_seq: 1 });
+    let posted = fx.ok(&s, text(fx.general, "puppet"));
+    let back = fx.next_seq(&m);
+    fx.ok(&s, Body::MemberAdmit { user: m.user(), invite_pk: fx.invite, from_seq: back });
+    assert!(fx.state.is_removed(&m.user()), "the puppet's admit does not clear the removal");
+    assert!(!fx.state.is_member(&s.user()));
+    assert!(!fx.state.event_valid(&s.user(), posted.event.seq), "the puppet's messages are void");
+    // a member admitted through the owner's chain still vouches
+    let h = fx.member("h");
+    fx.ok(&h, Body::MemberAdmit { user: s.user(), invite_pk: fx.invite, from_seq: fx.next_seq(&s) });
+    assert!(fx.state.is_member(&s.user()), "admitted by a rooted member");
+    assert!(fx.state.is_removed(&m.user()), "s's earlier admit of m was signed before s was rooted");
+}
+
+#[test]
 fn removal_notice_check() {
     let mut fx = Fx::new();
     let o = fx.owner.clone();

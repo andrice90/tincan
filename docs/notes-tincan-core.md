@@ -19,6 +19,7 @@ What the other crates need to know beyond the doc comments. Rustdoc: `cargo doc 
 
 - Owner only, never naming the owner. The cut is `last_seq` in the removed user's seq space. `build::remove_member` and `Session::sign_own` fill it with the owner's head for that user.
 - Rule 6 (membership for the seq chain) ignores removals, so validation stays monotonic. What removals change is derived in `refresh_removals`, a least fixpoint over `Member::admit_log` and `Member::removals`. It is recomputed after every admit or removal, and only when some removal exists.
+  - Only trusted admits clear a removal: signed by the owner, or by a member holding a trusted admit, at a valid seq. A member with no trusted admit is `unrooted` (a puppet admitted by a removed user): `removed()` is true and its events are void.
 - Read it through `is_member` (false while a removal is uncleared), `is_removed`, `event_valid(author, seq)` (void events are hidden), `active_removal`, `invite_status` (an invite created at a void seq is Revoked), `Member::name` (latest valid Profile) and `state::valid_under` (for code that keeps a copy of the removals).
 - `removal_of(ev, me)` checks a removal heard straight from a host: owner-signed, names me, not cleared by an admit I hold.
 - `verify_join_request` refuses (Busy) a removed joiner whose profile seq is not past the cut, when the host is behind on their events.
