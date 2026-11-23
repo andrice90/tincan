@@ -1,0 +1,36 @@
+[package]
+name = "tincan-net"
+description = "Tincan networking: iroh endpoint, server sessions, election, rendezvous, DMs, media forwarding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tincan-core = { workspace = true }
+iroh = { workspace = true }
+iroh-base = { workspace = true, features = ["key"] }
+iroh-dns = { workspace = true }
+iroh-mdns-address-lookup = { workspace = true }
+n0-mainline = { workspace = true }
+tokio = { workspace = true }
+n0-future = { workspace = true }
+futures-lite = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+blake3 = { workspace = true }
+data-encoding = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

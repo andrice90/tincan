@@ -1,0 +1,23 @@
+[package]
+name = "tincan-files"
+description = "Tincan file swarm: attachments and soundboard clips over iroh-blobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tincan-core = { workspace = true }
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+tokio = { workspace = true }
+n0-future = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = "3"

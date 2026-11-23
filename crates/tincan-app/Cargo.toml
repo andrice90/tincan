@@ -1,0 +1,17 @@
+[package]
+name = "tincan-app"
+description = "Tincan app orchestrator: wires store, net, files, audio and screen; exposes the UI API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tincan-core = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tincan-store = { workspace = true }
+tincan-net = { workspace = true }
+tincan-files = { workspace = true }
+tincan-audio = { workspace = true }
+tincan-screen = { workspace = true }

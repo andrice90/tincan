@@ -1,0 +1,22 @@
+[package]
+name = "rdv-probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iroh = { version = "=1.5.0", features = ["unstable-net-report"] }
+iroh-dns = "=1.5.0"
+n0-mainline = "=0.8.0"
+negentropy = "=0.5.3"
+chacha20poly1305 = "=0.11.0"
+blake3 = "1.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+url = "2"
+rand = "0.10"
+data-encoding = "2"
+iroh-gossip = "=0.103.0"
+iroh-mdns-address-lookup = "=0.6.1"
+iroh-mainline-address-lookup = "=0.6.1"
+futures-lite = "2"
+bytes = "1"
+x25519-dalek = { version = "=3.0.0", features = ["static_secrets"] }

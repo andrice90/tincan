@@ -1,0 +1,134 @@
+<!doctype html><html><head><meta charset="utf-8"><title>probe</title></head><body><pre id="log">running...</pre>
+<script>
+const out = { ua: navigator.userAgent, encoders: {}, decoders: {}, audio: {}, channel: {}, misc: {} };
+const V = [
+  ["avc1.640028","prefer-hardware"],["avc1.640028","prefer-software"],["avc1.42E01F","prefer-hardware"],["avc1.42E028","prefer-hardware"],["avc1.42E028","prefer-software"],["avc1.4D4028","prefer-hardware"],
+  ["vp8","no-preference"],["vp09.00.10.08","prefer-hardware"],["vp09.00.10.08","prefer-software"],
+  ["av01.0.08M.08","prefer-hardware"],["av01.0.08M.08","prefer-software"],["hev1.1.6.L120.B0","prefer-hardware"]];
+async function enc() {
+  for (const [codec, hw] of V) {
+    const cfg = { codec, width:1920, height:1080, framerate:30, bitrate:2500000, bitrateMode:"constant", latencyMode:"realtime",
+      hardwareAcceleration: hw, contentHint: "detail", scalabilityMode: "L1T2" };
+    if (codec.startsWith("avc1")) cfg.avc = { format: "annexb" };
+    try {
+      const r = await VideoEncoder.isConfigSupported(cfg);
+      const rec = { supported: r.supported, echoedKeys: Object.keys(r.config||{}).sort().join(","), contentHint: r.config && r.config.contentHint, scalabilityMode: r.config && r.config.scalabilityMode };
+      const q = await VideoEncoder.isConfigSupported(Object.assign({}, cfg, { bitrateMode: "quantizer" })).catch(e => ({supported:"throw:"+e.name}));
+      rec.quantizer = q.supported;
+      const noSvc = Object.assign({}, cfg); delete noSvc.scalabilityMode;
+      rec.withoutL1T2 = (await VideoEncoder.isConfigSupported(noSvc)).supported;
+      out.encoders[codec+"|"+hw] = rec;
+    } catch (e) { out.encoders[codec+"|"+hw] = "throw:" + e.name + ":" + e.message; }
+  }
+  for (const [codec, hw] of V) {
+    try { const r = await VideoDecoder.isConfigSupported({ codec, hardwareAcceleration: hw, optimizeForLatency: true, codedWidth:1920, codedHeight:1080 });
+      out.decoders[codec+"|"+hw] = r.supported; } catch (e) { out.decoders[codec+"|"+hw] = "throw:"+e.name; }
+  }
+  try { const r = await AudioEncoder.isConfigSupported({ codec:"opus", sampleRate:48000, numberOfChannels:1, bitrate:32000,
+      opus: { frameDuration: 20000, complexity: 9, useinbandfec: true, usedtx: true, packetlossperc: 10, format: "opus" } });
+    out.audio.opusEncoder = { supported: r.supported, opus: r.config && r.config.opus }; } catch (e) { out.audio.opusEncoder = "throw:"+e.message; }
+  try { out.audio.opusDecoder = (await AudioDecoder.isConfigSupported({ codec:"opus", sampleRate:48000, numberOfChannels:1 })).supported; } catch (e) { out.audio.opusDecoder = "throw"; }
+  out.misc.MediaStreamTrackProcessor = typeof MediaStreamTrackProcessor; out.misc.MediaStreamTrackGenerator = typeof MediaStreamTrackGenerator;
+  out.misc.RTCRtpScriptTransform = typeof RTCRtpScriptTransform;
+  out.misc.getDisplayMedia = typeof (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+  const sc = (navigator.mediaDevices && navigator.mediaDevices.getSupportedConstraints) ? navigator.mediaDevices.getSupportedConstraints() : {};
+  out.misc.supportedConstraints = Object.keys(sc).filter(k => /echo|noise|gain|voice|restrict|suppressLocal/i.test(k));
+  out.misc.webtransport = typeof WebTransport;
+  out.misc.RTCRtpEncodedSource = typeof RTCRtpEncodedSource;
+  try { const r = await AudioEncoder.isConfigSupported({ codec:"opus", sampleRate:48000, numberOfChannels:1, bitrate:32000, opus: { frameDuration: 20000, application: "voip", signal: "voice", useinbandfec: true, usedtx: true, packetlossperc: 10 } });
+    out.audio.opusVoip = { supported: r.supported, opus: r.config && r.config.opus }; } catch (e) { out.audio.opusVoip = "throw:" + e.message; }
+  try {
+    const cfg = { codec:"avc1.640028", width:1920, height:1080, framerate:30, bitrate:2500000, bitrateMode:"constant", latencyMode:"realtime", hardwareAcceleration:"prefer-hardware", avc:{format:"annexb"} };
+    const lat = []; const sent = new Map(); let bytes = 0, keys = 0;
+    const e = new VideoEncoder({ output: (c) => { lat.push(performance.now() - sent.get(c.timestamp)); bytes += c.byteLength; if (c.type === "key") keys++; }, error: (x) => { out.misc.encErr = x.message; } });
+    e.configure(cfg);
+    const cv = new OffscreenCanvas(1920,1080); const g = cv.getContext("2d");
+    for (let i = 0; i < 60; i++) {
+      g.fillStyle = "hsl(" + (i*6) + ",70%,50%)"; g.fillRect(0,0,1920,1080); g.fillStyle="#fff"; g.font="48px sans-serif"; g.fillText("frame "+i, 100+i*10, 300);
+      const f = new VideoFrame(cv, { timestamp: i*33333 }); sent.set(i*33333, performance.now()); e.encode(f, { keyFrame: i === 0 || i === 30 }); f.close();
+      await new Promise(r => setTimeout(r, 33));
+    }
+    await e.flush(); lat.sort((a,b)=>a-b);
+    out.misc.h264hwEncode = { frames: lat.length, keys, p50ms: lat[lat.length>>1] && lat[lat.length>>1].toFixed(2), p95ms: lat[Math.floor(lat.length*0.95)] && lat[Math.floor(lat.length*0.95)].toFixed(2), kbps: Math.round(bytes*8/2/1000) };
+  } catch (x) { out.misc.h264hwEncode = "throw:" + x.message; }
+}
+function chan(count, interval_us, size) {
+  return new Promise((resolve) => {
+    const ch = new window.__TAURI__.core.Channel();
+    const lat = [], gaps = []; let last = null, n = 0, lost = 0, prevSeq = -1, finished = false;
+    ch.onmessage = (buf) => {
+      const now = performance.timeOrigin + performance.now();
+      const ab = buf instanceof ArrayBuffer ? buf : buf.buffer;
+      const dv = new DataView(ab);
+      const sentUs = Number(dv.getBigUint64(0, true)); const seq = dv.getUint32(8, true);
+      if (seq !== prevSeq + 1) lost++; prevSeq = seq;
+      lat.push(now - sentUs/1000); if (last !== null) gaps.push(now - last); last = now; n++;
+      if (n === count) done();
+    };
+    const t = setTimeout(done, (count*interval_us)/1000 + 3000);
+    function done() {
+      if (finished) return; finished = true; clearTimeout(t);
+      const s = a => a.slice().sort((x,y)=>x-y); const L = s(lat), G = s(gaps);
+      const q = (a,p) => a.length ? a[Math.min(a.length-1, Math.floor(a.length*p))].toFixed(2) : null;
+      resolve({ received: n, of: count, outOfOrderOrGaps: lost, latency_ms: { p50: q(L,.5), p95: q(L,.95), p99: q(L,.99), max: q(L,1) },
+        interarrival_ms: { p50: q(G,.5), p95: q(G,.95), p99: q(G,.99), max: q(G,1) }, expected_interval_ms: interval_us/1000 });
+    }
+    window.__TAURI__.core.invoke("stream", { count, intervalUs: interval_us, size, onData: ch });
+  });
+}
+function codecFromSps(d) {
+  for (let i = 0; i + 4 < d.length; i++) {
+    if (d[i] === 0 && d[i+1] === 0 && d[i+2] === 1 && (d[i+3] & 0x1f) === 7) {
+      const hx = v => v.toString(16).padStart(2, "0").toUpperCase();
+      return "avc1." + hx(d[i+4]) + hx(d[i+5]) + hx(d[i+6]);
+    }
+  }
+  return null;
+}
+function decodeTest(path) {
+  return new Promise((resolve) => {
+    const res = { out: 0, errors: [], maxQ: 0, chunks: 0, keyChunks: 0, lat: [] };
+    const sentAt = new Map(); let configured = false;
+    const dec = new VideoDecoder({
+      output: (f) => { res.out++; const t0 = sentAt.get(f.timestamp); if (t0 !== undefined) res.lat.push(performance.now() - t0); res.size = f.displayWidth + "x" + f.displayHeight; res.format = f.format; f.close(); },
+      error: (e) => { res.errors.push(e.name + ":" + e.message); } });
+    const ch = new window.__TAURI__.core.Channel();
+    ch.onmessage = (buf) => {
+      const ab = buf instanceof ArrayBuffer ? buf : buf.buffer; const u8 = new Uint8Array(ab);
+      if (u8.length === 1 && u8[0] === 0xFF) {
+        dec.flush().catch(e => res.errors.push("flush:" + e.message)).then(() => {
+        const L = res.lat.slice().sort((a,b)=>a-b);
+        res.decode_ms = { p50: L[L.length>>1] && L[L.length>>1].toFixed(2), p95: L[Math.floor(L.length*0.95)] && L[Math.floor(L.length*0.95)].toFixed(2), max: L.length && L[L.length-1].toFixed(2) };
+        delete res.lat; resolve(res); }); return;
+      }
+      const key = u8[0] === 1; const ts = Number(new DataView(ab).getBigUint64(1, true)); const data = u8.subarray(9);
+      if (!configured) {
+        res.codec = codecFromSps(data);
+        const cfg = { codec: res.codec, hardwareAcceleration: "prefer-hardware", optimizeForLatency: true };
+        if (!res.codec) { res.firstNotKey = (res.firstNotKey || 0) + 1; return; }
+        dec.configure(cfg); configured = true;
+      }
+      res.chunks++; if (key) res.keyChunks++; res.idx = res.idx || []; if (res.idx.length < 3) res.idx.push(ts);
+      sentAt.set(ts, performance.now());
+      try { dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: ts, data })); } catch (e) { res.errors.push("decode:" + e.message); }
+      res.maxQ = Math.max(res.maxQ, dec.decodeQueueSize);
+    };
+    window.__TAURI__.core.invoke("replay", { path, onData: ch });
+  });
+}
+(async () => {
+  const rp = await window.__TAURI__.core.invoke("replay_path");
+  if (rp) { out.nativeDecode = await decodeTest(rp); await window.__TAURI__.core.invoke("report", { data: JSON.stringify(out.nativeDecode, null, 1) }); return; }
+  try { await enc(); } catch (e) { out.misc.encFatal = String(e); }
+  try {
+    out.channel = {}; if (location.search.includes("nochan")) {} else
+    out.channel["250x100B"] = await chan(750, 4000, 100);
+    out.channel["50x1000B"] = await chan(150, 20000, 1000);
+    out.channel["30x20KB"] = await chan(90, 33333, 20000);
+    out.channel["30x100KB"] = await chan(90, 33333, 100000);
+    out.channel["60x200KB"] = await chan(120, 16667, 200000);
+  } catch (e) { out.channel.fatal = String(e); }
+  document.getElementById("log").textContent = JSON.stringify(out, null, 1);
+  await window.__TAURI__.core.invoke("report", { data: JSON.stringify(out, null, 1) });
+})();
+</script></body></html>

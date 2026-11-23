@@ -1,0 +1,107 @@
+/* Design tokens (docs/design.md). Dark is the default; light follows the OS
+   unless the user picks a theme, which sets data-theme on <html>. */
+
+:root {
+  --bg-rail: #141619;
+  --bg-side: #1a1d21;
+  --bg-main: #202328;
+  --bg-raised: #282c32;
+  --bg-hover: rgb(255 255 255 / 0.05);
+  --bg-selected: rgb(255 255 255 / 0.09);
+  --border: rgb(255 255 255 / 0.08);
+  --text-1: #e9eaec;
+  --text-2: #a4a9b0;
+  --text-3: #6e747c;
+  --accent: #e0784f;
+  --accent-fg: #1a1c1f;
+  --speaking: #3fb37f;
+  --warn: #e2a336;
+  --danger: #e5484d;
+  --danger-fg: #ffffff;
+  --scrim: rgb(0 0 0 / 0.55);
+  --shadow: 0 1px 2px rgb(0 0 0 / 0.05);
+  --stage-bg: #000000;
+
+  /* Avatar fills, picked from the user id. Muted so white initials stay readable. */
+  --avatar-0: #8a5a44;
+  --avatar-1: #4f6d8f;
+  --avatar-2: #5b7a52;
+  --avatar-3: #7a5a86;
+  --avatar-4: #8f6b3a;
+  --avatar-5: #3f7a7a;
+  --avatar-6: #8a4f62;
+  --avatar-7: #5f6470;
+  --avatar-fg: #ffffff;
+
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-20: 20px;
+
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  --r-control: 6px;
+  --r-card: 8px;
+  --r-server: 12px;
+
+  --titlebar-h: 32px;
+  --rail-w: 64px;
+  --side-w: 240px;
+  --members-w: 220px;
+
+  --ease: 120ms ease-out;
+
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg-rail: #e4e6e9;
+    --bg-side: #eef0f2;
+    --bg-main: #ffffff;
+    --bg-raised: #ffffff;
+    --bg-hover: rgb(0 0 0 / 0.04);
+    --bg-selected: rgb(0 0 0 / 0.07);
+    --border: rgb(0 0 0 / 0.09);
+    --text-1: #1a1c1f;
+    --text-2: #5b6068;
+    --text-3: #8a9098;
+    --accent: #c95f37;
+    --accent-fg: #ffffff;
+    --speaking: #2b9466;
+    --warn: #b07a14;
+    --danger: #cd2b31;
+    --scrim: rgb(0 0 0 / 0.35);
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.05);
+    color-scheme: light;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg-rail: #e4e6e9;
+  --bg-side: #eef0f2;
+  --bg-main: #ffffff;
+  --bg-raised: #ffffff;
+  --bg-hover: rgb(0 0 0 / 0.04);
+  --bg-selected: rgb(0 0 0 / 0.07);
+  --border: rgb(0 0 0 / 0.09);
+  --text-1: #1a1c1f;
+  --text-2: #5b6068;
+  --text-3: #8a9098;
+  --accent: #c95f37;
+  --accent-fg: #ffffff;
+  --speaking: #2b9466;
+  --warn: #b07a14;
+  --danger: #cd2b31;
+  --scrim: rgb(0 0 0 / 0.35);
+  --shadow: 0 1px 2px rgb(0 0 0 / 0.05);
+  color-scheme: light;
+}

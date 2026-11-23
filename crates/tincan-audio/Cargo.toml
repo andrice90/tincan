@@ -1,0 +1,32 @@
+[package]
+name = "tincan-audio"
+description = "Tincan native audio engine: capture, echo cancel, Opus, jitter buffer, mixer, soundboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tincan-core = { workspace = true }
+cpal = { workspace = true }
+sonora = { workspace = true }
+unsafe-libopus = { workspace = true }
+symphonia = { version = "0.6", features = ["mp3", "aac", "isomp4"] }
+rubato = "5"
+crossbeam-channel = "0.5"
+tokio = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+# Same version and features cpal already uses, so this adds nothing to the build.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+hound = "3"
+tempfile = "3"
+tracing-subscriber = { workspace = true }

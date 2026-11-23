@@ -1,0 +1,9 @@
+[package]
+name = "aec-native"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sonora = "0.3"
+unsafe-libopus = "0.2"
+cpal = "0.18"

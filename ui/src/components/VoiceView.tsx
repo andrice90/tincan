@@ -1,0 +1,256 @@
+// Voice room view and the shared call stage: participant tiles, and while
+// someone shares a screen, that share on the stage with tiles in a strip.
+
+import { HeadphoneOff, Maximize2, MessageSquare, MicOff, Minimize2, Monitor, Volume2 } from "lucide-react";
+import { memo, useEffect, useState, type MouseEvent } from "react";
+import type { Channel, Member, ServerSummary, UserId, VoiceParticipant, VoiceSession } from "../api/types";
+import { ScreenView } from "../media/ScreenView";
+import { joinVoice, messageUser, setFullStage, setUserVolume, stopShare } from "../store/actions";
+import { useStore } from "../store/store";
+import { ICON, ICON_SM, IconButton, SpeakingAvatar } from "./common";
+import { Popover, useMenu } from "./Menu";
+
+/** Per-user playback volume picked in this session (0..2). */
+const volumes = new Map<UserId, number>();
+
+function VolumePopover({ p, anchor, onClose }: { p: VoiceParticipant; anchor: NonNullable<ReturnType<typeof useMenu>["anchor"]>; onClose: () => void }) {
+  const [v, setV] = useState(() => volumes.get(p.userId) ?? 1);
+  const id = `vol-${p.userId}`;
+  return (
+    <Popover anchor={anchor} onClose={onClose} label={`${p.name} options`} className="volume-pop">
+      <label className="field-label" htmlFor={id}>
+        Volume for {p.name}
+      </label>
+      <div className="volume-row">
+        <input
+          id={id}
+          type="range"
+          min={0}
+          max={200}
+          step={5}
+          value={Math.round(v * 100)}
+          onChange={(e) => {
+            const next = Number(e.target.value) / 100;
+            setV(next);
+            volumes.set(p.userId, next);
+          }}
+          onPointerUp={() => setUserVolume(p.userId, v)}
+          onKeyUp={() => setUserVolume(p.userId, v)}
+        />
+        <span className="volume-value">{Math.round(v * 100)}%</span>
+      </div>
+      <button
+        type="button"
+        className="menu-item"
+        onClick={() => {
+          onClose();
+          messageUser(p.userId);
+        }}
+      >
+        <MessageSquare size={ICON_SM} />
+        <span>Message</span>
+      </button>
+    </Popover>
+  );
+}
+
+const Tile = memo(function Tile({
+  p,
+  isMe,
+  small,
+  onPick,
+  picked,
+  sharing = p.screenTrack !== null,
+}: {
+  p: VoiceParticipant;
+  isMe: boolean;
+  small?: boolean;
+  onPick?: (track: number) => void;
+  picked?: boolean;
+  /** Overrides the share marker when the track is not known (rooms you are not in). */
+  sharing?: boolean;
+}) {
+  const menu = useMenu();
+  const pickable = sharing && onPick !== undefined && !isMe;
+  const onContextMenu = (e: MouseEvent) => {
+    if (!isMe) menu.openAt(e);
+  };
+  const cls = ["tile", small ? "tile-sm" : "", picked ? "is-picked" : "", pickable ? "is-pickable" : ""].filter(Boolean).join(" ");
+  const body = (
+    <>
+      <SpeakingAvatar userId={p.userId} name={p.name} size={small ? 40 : 64} />
+      <span className="tile-name truncate">{isMe ? `${p.name} (you)` : p.name}</span>
+      <span className="tile-icons">
+        {sharing && <Monitor size={ICON_SM} role="img" aria-label="Sharing screen" />}
+        {p.deafened ? (
+          <HeadphoneOff size={ICON_SM} role="img" aria-label="Deafened" />
+        ) : (
+          p.muted && <MicOff size={ICON_SM} role="img" aria-label="Muted" />
+        )}
+      </span>
+    </>
+  );
+  return (
+    <>
+      {pickable ? (
+        <button
+          type="button"
+          className={cls}
+          aria-pressed={picked}
+          aria-label={`Watch ${p.name}'s screen`}
+          title={`Watch ${p.name}'s screen`}
+          onClick={() => p.screenTrack !== null && onPick?.(p.screenTrack)}
+          onContextMenu={onContextMenu}
+        >
+          {body}
+        </button>
+      ) : (
+        <div className={cls} onContextMenu={onContextMenu}>
+          {body}
+        </div>
+      )}
+      {menu.anchor && <VolumePopover p={p} anchor={menu.anchor} onClose={menu.close} />}
+    </>
+  );
+});
+
+/** Tiles and the screen share stage for a joined room or call. */
+export function VoiceStage({ voice }: { voice: VoiceSession }) {
+  const me = useStore((s) => s.me);
+  const meId = me?.userId;
+  const full = useStore((s) => s.fullStage);
+  const [picked, setPicked] = useState<number | null>(null);
+
+  const participants: VoiceParticipant[] =
+    me && !voice.participants.some((p) => p.userId === me.userId)
+      ? [
+          {
+            userId: me.userId,
+            name: me.name,
+            muted: voice.muted,
+            deafened: voice.deafened,
+            speaking: false,
+            screenTrack: null,
+          },
+          ...voice.participants,
+        ]
+      : voice.participants;
+
+  const sharers = participants.filter((p) => p.screenTrack !== null);
+  const others = sharers.filter((p) => p.userId !== meId);
+  const stagePerson =
+    sharers.find((p) => p.screenTrack === picked) ?? others[0] ?? sharers.find((p) => p.userId === meId) ?? null;
+  const iShare = voice.sharing && !sharers.some((p) => p.userId === meId);
+
+  useEffect(() => {
+    if (!full) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFullStage(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [full]);
+
+  useEffect(() => {
+    if (!stagePerson && full) setFullStage(false);
+  }, [stagePerson, full]);
+
+  if (!stagePerson && !iShare) {
+    return (
+      <div className="tiles">
+        {participants.map((p) => (
+          <Tile key={p.userId} p={p} isMe={p.userId === meId} />
+        ))}
+      </div>
+    );
+  }
+
+  const mine = !stagePerson || stagePerson.userId === meId;
+  const label = mine ? "Your screen" : `${stagePerson.name}'s screen`;
+  return (
+    <div className="stage-layout">
+      <div
+        className={full ? "stage is-full" : "stage"}
+        onDoubleClick={() => !mine && setFullStage(!full)}
+      >
+        {mine ? (
+          <div className="stage-self">
+            <p>You're sharing your screen</p>
+            <button type="button" className="btn" onClick={stopShare}>
+              Stop sharing
+            </button>
+          </div>
+        ) : (
+          stagePerson.screenTrack !== null && <ScreenView key={stagePerson.screenTrack} track={stagePerson.screenTrack} label={label} />
+        )}
+        <span className="stage-label">{label}</span>
+        {!mine && (
+          <IconButton
+            className="stage-full-btn"
+            label={full ? "Exit full window" : "Full window"}
+            onClick={() => setFullStage(!full)}
+          >
+            {full ? <Minimize2 size={ICON} /> : <Maximize2 size={ICON} />}
+          </IconButton>
+        )}
+      </div>
+      <div className="strip">
+        {participants.map((p) => (
+          <Tile
+            key={p.userId}
+            p={p}
+            isMe={p.userId === meId}
+            small
+            onPick={setPicked}
+            picked={p.screenTrack !== null && p.screenTrack === stagePerson?.screenTrack}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const EMPTY_MEMBERS: Member[] = [];
+
+/** The main area for a voice room: live stage when joined, who is inside otherwise. */
+export function VoiceRoomView({ server, channel }: { server: ServerSummary; channel: Channel }) {
+  const voice = useStore((s) => s.voice);
+  const call = useStore((s) => s.call);
+  const members = useStore((s) => s.members[server.id] ?? EMPTY_MEMBERS);
+  const joined = voice?.kind === "room" && voice.channelId === channel.id;
+  const inside = members.filter((m) => m.online && m.voiceChannelId === channel.id);
+
+  return (
+    <>
+      <header className="main-header">
+        <h1 className="main-title">
+          <Volume2 size={ICON} aria-hidden="true" className="faint" />
+          <span className="truncate">{channel.name}</span>
+        </h1>
+        {!joined && (
+          <button type="button" className="btn btn-primary btn-sm" disabled={call !== null} onClick={() => joinVoice(server.id, channel.id)}>
+            Join voice
+          </button>
+        )}
+      </header>
+      <div className="voice-body">
+        {joined && voice ? (
+          <VoiceStage voice={voice} />
+        ) : inside.length === 0 ? (
+          <p className="voice-empty">No one is here yet.</p>
+        ) : (
+          <div className="tiles">
+            {inside.map((m) => (
+              <Tile
+                key={m.userId}
+                p={{ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, speaking: m.speaking, screenTrack: null }}
+                isMe={false}
+                sharing={m.sharing}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}

@@ -1,0 +1,20 @@
+[package]
+name = "tincan-core"
+description = "Tincan shared types, wire format, signing, validation and pure protocol logic (no IO)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iroh-base = { workspace = true, features = ["key"] }
+serde = { workspace = true }
+postcard = { workspace = true }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+data-encoding = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }

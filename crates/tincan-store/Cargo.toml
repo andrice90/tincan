@@ -1,0 +1,21 @@
+[package]
+name = "tincan-store"
+description = "SQLite persistence for Tincan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tincan-core = { workspace = true }
+rusqlite = { version = "0.43", features = ["bundled", "fallible_uint"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

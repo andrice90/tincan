@@ -1,0 +1,31 @@
+// Shown while someone is ringing me.
+
+import type { CallInfo } from "../api/types";
+import { Avatar } from "../components/common";
+import { Modal } from "../components/Modal";
+import { acceptCall, declineCall } from "../store/actions";
+
+export function IncomingCallDialog({ call }: { call: CallInfo }) {
+  return (
+    <Modal
+      title={`${call.name} is calling`}
+      // Escape or a stray click outside must not decline: only the Decline button does
+      onClose={() => {}}
+      className="modal-call"
+      footer={
+        <>
+          <button type="button" className="btn btn-danger" onClick={() => declineCall(call.callId)}>
+            Decline
+          </button>
+          <button type="button" className="btn btn-primary" data-autofocus onClick={() => acceptCall(call.callId)}>
+            Accept
+          </button>
+        </>
+      }
+    >
+      <div className="call-ringing">
+        <Avatar userId={call.userId} name={call.name} size={64} />
+      </div>
+    </Modal>
+  );
+}

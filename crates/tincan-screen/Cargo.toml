@@ -1,0 +1,21 @@
+[package]
+name = "tincan-screen"
+description = "Tincan screen capture and H.264 encode (Windows.Graphics.Capture + Media Foundation)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tincan-core = { workspace = true }
+moq-video = { workspace = true }
+moq-net = "=0.3.23"
+tokio = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
