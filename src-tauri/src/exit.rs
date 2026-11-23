@@ -28,6 +28,11 @@ impl ExitState {
         !self.closing.swap(true, Ordering::AcqRel)
     }
 
+    /// True once the exit sequence started.
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
     /// From here on the event loop ends because Tincan asked it to.
     pub fn mark_exiting(&self) {
         self.exiting.store(true, Ordering::Release);
@@ -85,6 +90,7 @@ mod tests {
         // nothing started: Windows ended the session
         let s = ExitState::default();
         assert!(s.loop_destroyed());
+        assert!(s.is_closing());
         assert!(!s.begin(), "a start-up failure after this shows no dialog");
 
         // a close was in progress but had not finished: join it
@@ -96,8 +102,10 @@ mod tests {
     #[test]
     fn begin_runs_once() {
         let s = ExitState::default();
+        assert!(!s.is_closing());
         assert!(s.begin());
         assert!(!s.begin());
+        assert!(s.is_closing());
     }
 
     fn counting() -> (Arc<AtomicUsize>, impl Fn() -> Arc<AtomicUsize>) {
