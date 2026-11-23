@@ -687,7 +687,7 @@ async fn direct_messages_and_offline_delivery() {
     b.app.test_add_addr(&a.user, &a.app.test_addrs()).unwrap();
 
     let code = call(&b.app, "app_snapshot", json!({})).await["me"]["userCode"].as_str().unwrap().to_string();
-    assert_eq!(call_err(&a.app, "add_contact", json!({ "code": "hello" })).await, "That isn't a Tincan ID. Paste the code that starts with tincan1u.");
+    assert_eq!(call_err(&a.app, "add_contact", json!({ "code": "hello" })).await, "That isn't a friend code or a Tincan ID. A friend code has 6 characters, like K7Q-M2X.");
     let dm = call(&a.app, "add_contact", json!({ "code": code })).await;
     assert_keys(&dm, DM_KEYS);
     assert_eq!(dm["userId"], b.user.as_str());

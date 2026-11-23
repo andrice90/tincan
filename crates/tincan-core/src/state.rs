@@ -403,19 +403,19 @@ impl ConvState {
         }
     }
 
-    /// Short invite codes the owner created that are still usable, newest first, as
-    /// `(code, invite_pk)` (`code::open_code` with the server's `code_key`). The caller must
-    /// still check each `invite_pk` against the code (`CodeKeys::invite_pk`): only a match is
-    /// the server's code.
-    pub fn short_code_invites(&self, code_key: &[u8; 32]) -> Vec<(crate::code::ShortCode, [u8; 32])> {
-        let mut v: Vec<(u64, [u8; 32], crate::code::ShortCode)> = self
+    /// Short-code invites the owner created that are still usable, newest first, as
+    /// `(marker, invite_pk)` (`code::open_marker`). The caller must still check each
+    /// `invite_pk` against the marker's seed (`code::invite_material`): only a match is the
+    /// server's code.
+    pub fn short_code_invites(&self) -> Vec<(u32, [u8; 32])> {
+        let mut v: Vec<(u64, [u8; 32], u32)> = self
             .invites
             .values()
             .filter(|i| !i.revoked && i.expires_ms == u64::MAX && self.is_owner(&i.creator))
-            .filter_map(|i| crate::code::open_code(code_key, &i.invite_pk, i.max_uses).map(|c| (i.created_hlc, i.invite_pk, c)))
+            .filter_map(|i| crate::code::open_marker(i.max_uses).map(|r| (i.created_hlc, i.invite_pk, r)))
             .collect();
         v.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-        v.into_iter().map(|(_, pk, c)| (c, pk)).collect()
+        v.into_iter().map(|(_, pk, r)| (r, pk)).collect()
     }
 
     /// Heads for `Ctl::SyncHave` (sorted by author).

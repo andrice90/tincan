@@ -142,8 +142,10 @@ pub(crate) struct Inner {
     pub codes: Option<Arc<crate::codes::CodeDir>>,
     /// Keys derived from short codes (bounded).
     pub code_keys: Mutex<crate::codes::KeyCache>,
+    /// Codes of short-code invites by invite key (the commitment runs the KDF; bounded).
+    pub invite_codes: Mutex<HashMap<[u8; 32], tincan_core::code::ShortCode>>,
     /// My friend code and its publisher.
-    pub friend: Mutex<Option<(tincan_core::code::ShortCode, tokio::task::AbortHandle)>>,
+    pub friend: Mutex<Option<(tincan_core::code::FriendCode, tokio::task::AbortHandle)>>,
     /// Serializes invite code creation and rotation.
     pub code_ops: tokio::sync::Mutex<()>,
     /// Every spawned task.

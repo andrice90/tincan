@@ -280,9 +280,9 @@ Idle cost:
 ## Short codes (`codes.rs`)
 
 - `NetConfig::code_dir`: a folder that stands in for the DHT when the rendezvous layer is off. With rendezvous on, records go through `Rendezvous::get_all` / `put` (relay plus DHT, same write rule as the rendezvous record). With neither, short code calls fail with "Short codes need an internet connection. Use the full invite or ID instead."
-- API: `invite_code`, `ensure_invite_code` (the owner makes one when none exists), `rotate_invite_code` (owner only: new `InviteCreate`, then `InviteRevoke` for older codes, record written at once, tombstone over the old one in the background), `resolve_invite` (short or full), `join_invite`, `join` (both), `set_friend_code`, `resolve_friend_code` (learns the address).
+- API: `invite_code`, `ensure_invite_code` (the owner makes one when none exists), `rotate_invite_code` (owner only: new `InviteCreate`, then `InviteRevoke` for older codes, record written at once, tombstone over the old one in the background), `resolve_invite` (short or full), `join_invite`, `join` (both), `set_friend_code` (a `FriendCode`), `resolve_friend_code` (learns the address).
 - The host role's runner task (`rdv::spawn_host_runner`) also runs `codes::host_invite_runner` when short codes are on, even with rendezvous off: first write 2 s after becoming host, then a check every 30 s.
 - The friend runner is a Net-level task, replaced on `set_friend_code`.
-- Reads take the newest plausible packet only; a tombstone or a record the code cannot open means "not found".
-- A write that finds a fresh (under 2 h) readable record of another server or user under the same key returns `Written::Foreign` and leaves it alone.
+- Reads try the plausible packets newest first and return the first that opens and passes the commitment check (`verify_invite` / `verify_friend`, on a blocking thread). Junk or forged records are skipped.
+- A write that finds a fresh (under 2 h) record under the same slot that verifies for another server or user returns `Written::Foreign` and leaves it alone (the check runs on a blocking thread through `Veto`). Anything that does not verify is overwritten.
 - Not covered by tests: the host runner's refresh after a migration (the in-process tests use the owner's immediate write) and the pkarr/DHT path (only the local folder is exercised; the live rendezvous tests stay `#[ignore]`).

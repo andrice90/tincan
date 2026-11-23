@@ -74,8 +74,10 @@ None of these changes a signature.
 ## Short codes (`code.rs`)
 
 - `ShortCode`: 30 bits over `CODE_ALPHABET` (32 symbols). `parse` takes 6 alphabet characters in any case and skips whitespace and dashes; `Display` is `ABC-DEF`, `compact()` is the KDF input.
-- `CodeKeys::derive(kind, code)`: argon2id (`KDF_MEMORY_KIB` 64 MiB, `KDF_PASSES` 5, 1 lane), salt per `CodeKind`. About 200 ms in release; call it off async executors (tincan-net uses `spawn_blocking` and a cache). A test pins one output: changing parameters or salts breaks every published code.
-- `seal_code` / `open_code`: the invite code inside `InviteCreate.max_uses` (flag bit 31, code XOR a mask keyed by `ServerKeys::code_key`, a new sub-key). `ConvState::short_code_invites` lists the owner's unrevoked, never-expiring flagged invites newest first; callers must still check each `invite_pk` against `CodeKeys::invite_pk` (the net layer does).
+- Codes commit to their target: `friend_commit(user, nonce)`, `invite_commit(server, invite_pk, nonce)` (argon2id, about 200 ms in release). `verify_friend` / `verify_invite` recompute them; `FriendRecord::open` / `InviteRecord::open` only decrypt and do the cheap checks.
+- `CodeKeys::derive(kind, code)`: the record slot (pkarr key and read key), argon2id with a salt per `CodeKind`. Holding it is not authority. A test pins outputs: changing parameters or salts breaks every published code.
+- `FriendCode { code, nonce }` (`generate`, `to_stored` / `from_stored` for the profile).
+- Invite codes ride in `InviteCreate.max_uses` as `SHORT_CODE_FLAG | r` (`marker_max_uses`, `open_marker`); `invite_material(code_key, r)` gives the seed and nonce from `ServerKeys::code_key`, a new sub-key. `ConvState::short_code_invites` lists the owner's unrevoked, never-expiring flagged invites newest first as `(r, invite_pk)`.
 - `InviteState` gained `created_hlc`.
-- Records: `code_invite` cuts an `Invite` down to fit a pkarr packet (name 32 chars, 2 peers, relay URLs up to 96 chars, 2 direct addresses each); `seal_invite` / `open_invite`; `FriendRecord::new/seal/open` (the signature covers the record key).
+- `InviteRecord::new` cuts an `Invite` down to fit a pkarr packet (name 24 chars, 2 peers, relay URLs up to 96 chars, 2 direct addresses each).
 - New dependency: `argon2` 0.5 (pure Rust, `alloc` only).

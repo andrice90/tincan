@@ -487,5 +487,5 @@ Unit tests in `media/`:
 ## Short codes
 
 - Commands: `get_invite_code`, `rotate_invite_code`, `get_friend_code`, `rotate_friend_code`; `join_server` resolves a short code before joining (so `arm_bulk` still sees the server id), `add_contact` resolves a friend code.
-- My friend code is kv `app/friend_code`, made on the first `get_friend_code` and published from then on at every start (`Core::start_friend_code`). Profiles that never asked for one publish nothing.
+- My friend code is kv `app/friend_code` (`ABCDEF:<nonce hex>`), made on the first `get_friend_code` (the commitment runs on a blocking thread) and published from then on at every start (`Core::start_friend_code`). Profiles that never asked for one publish nothing.
 - Offline mode sets `NetConfig::code_dir` to `<data_dir>/../.offline-codes`, shared by every profile under the same parent (the e2e profiles; `tests/e2e.rs` `short_invite_and_friend_codes` puts its three profiles under one temp folder for the same reason).

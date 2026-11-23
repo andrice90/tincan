@@ -12,7 +12,7 @@ use iroh::protocol::{Router, RouterBuilder};
 use n0_future::StreamExt;
 use parking_lot::{Mutex, RwLock};
 use tincan_core::build::{self, HelloInfo};
-use tincan_core::code::{CodeKind, ShortCode, seal_code};
+use tincan_core::code::{CodeKind, FriendCode, ShortCode, invite_material, marker_max_uses, random_marker};
 use tincan_core::election::Status;
 use tincan_core::event::{Body, StoredEvent};
 use tincan_core::hlc::Hlc;
@@ -126,6 +126,7 @@ impl Net {
             rdv: rdv_client,
             codes,
             code_keys: Mutex::new(HashMap::new()),
+            invite_codes: Mutex::new(HashMap::new()),
             friend: Mutex::new(None),
             code_ops: tokio::sync::Mutex::new(()),
             tasks: Arc::new(Tasks::default()),
@@ -300,7 +301,7 @@ impl Net {
         if self.inner.replica(&server).is_none() {
             return Err(NetError::UnknownConv);
         }
-        Ok(codes::active_invite_code(&self.inner, &server).await.map(|(c, _)| c))
+        Ok(codes::active_invite_code(&self.inner, &server).await.map(|a| a.code))
     }
 
     /// `server`'s short invite code; when it has none and I am the owner, make one first.
@@ -339,27 +340,43 @@ impl Net {
             return Err(NetError::Invalid(codes::CODES_OFF.into()));
         }
         let rep = inner.replica(&server).ok_or(NetError::UnknownConv)?;
-        let (skeys, old) = {
+        let (code_key, old) = {
             let r = rep.lock();
             let k = r.keys.clone().ok_or(NetError::UnknownConv)?;
-            let old = r.state.short_code_invites(&k.code_key);
-            (k, old)
+            (k.code_key, r.state.short_code_invites())
         };
-        let code = ShortCode::random();
-        let keys = codes::code_keys(inner, CodeKind::Invite, code).await;
-        let invite_pk = keys.invite_pk(&server);
-        let max_uses = seal_code(&skeys.code_key, &invite_pk, code);
-        self.publish(server, Body::InviteCreate { invite_pk, expires_ms: u64::MAX, max_uses }).await?;
-        for (_, pk) in &old {
+        // A random marker gives the invite seed and the commitment nonce; the code commits
+        // to the server, the invite key and the nonce.
+        let marker = random_marker();
+        let (seed, nonce) = invite_material(&code_key, marker);
+        let invite_pk = *invite_secret(&seed, &server).public().as_bytes();
+        let code = codes::commit_code(inner, server, invite_pk, nonce).await;
+        let active = codes::ActiveCode { code, invite_pk, seed, nonce };
+        self.publish(server, Body::InviteCreate { invite_pk, expires_ms: u64::MAX, max_uses: marker_max_uses(marker) }).await?;
+        let mut old_codes: Vec<ShortCode> = Vec::new();
+        for (m, pk) in &old {
             if let Err(e) = self.publish(server, Body::InviteRevoke { invite_pk: *pk }).await {
                 tracing::warn!(error = %e, "revoking the old invite code failed");
             }
+            let (_, n) = invite_material(&code_key, *m);
+            old_codes.push(codes::commit_code(inner, server, *pk, n).await);
         }
         let shared = inner.sessions.lock().get(&server).map(|s| s.shared.clone());
-        let out = codes::publish_invite_record(inner, &server, code, shared.as_deref(), true).await;
-        tracing::debug!(server = %server.short(), ?out, "new invite code record written");
+        // The local folder takes a moment: write before returning, so the code works at
+        // once. The relay and DHT take seconds: write in the background.
+        if inner.codes.as_deref().is_some_and(codes::CodeDir::is_local) {
+            let out = codes::publish_invite_record(inner, &server, &active, shared.as_deref(), true).await;
+            tracing::debug!(server = %server.short(), ?out, "new invite code record written");
+        } else {
+            let weak = Arc::downgrade(inner);
+            inner.tasks.spawn(async move {
+                let Some(inner) = weak.upgrade() else { return };
+                let out = codes::publish_invite_record(&inner, &server, &active, shared.as_deref(), true).await;
+                tracing::debug!(server = %server.short(), ?out, "new invite code record written");
+            });
+        }
         let weak = Arc::downgrade(inner);
-        let old_codes: Vec<ShortCode> = old.into_iter().map(|(c, _)| c).collect();
+        old_codes.retain(|c| *c != code);
         if !old_codes.is_empty() {
             inner.tasks.spawn(async move {
                 for c in old_codes {
@@ -374,7 +391,7 @@ impl Net {
 
     /// Publish `code` as my friend code (replacing and clearing the previous one), or stop
     /// publishing with `None`. The record is refreshed while the network runs.
-    pub fn set_friend_code(&self, code: Option<ShortCode>) {
+    pub fn set_friend_code(&self, code: Option<FriendCode>) {
         let inner = &self.inner;
         let mut slot = inner.friend.lock();
         if slot.as_ref().map(|(c, _)| *c) == code {
@@ -385,7 +402,7 @@ impl Net {
             let weak = Arc::downgrade(inner);
             inner.tasks.spawn(async move {
                 if let Some(inner) = weak.upgrade() {
-                    let out = codes::clear_record(&inner, CodeKind::Friend, old).await;
+                    let out = codes::clear_record(&inner, CodeKind::Friend, old.code).await;
                     tracing::debug!(?out, "old friend code record cleared");
                 }
             });

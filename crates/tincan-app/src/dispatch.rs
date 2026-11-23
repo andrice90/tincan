@@ -213,8 +213,8 @@ pub(crate) async fn call(core: &Arc<Core>, cmd: &str, a: Value) -> Result<Value,
             let a: args::Server = parse_args(cmd, a)?;
             ok(core.cmd_rotate_invite_code(parse_conv(&a.server_id)?).await?)
         }
-        "get_friend_code" => ok(core.cmd_get_friend_code()?),
-        "rotate_friend_code" => ok(core.cmd_rotate_friend_code()?),
+        "get_friend_code" => ok(core.cmd_get_friend_code().await?),
+        "rotate_friend_code" => ok(core.cmd_rotate_friend_code().await?),
         "join_server" => {
             let a: args::Join = parse_args(cmd, a)?;
             ok(core.cmd_join_server(&a.invite).await?)

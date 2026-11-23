@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use tincan_core::event::{Body, ChannelKind as CoreKind};
-use tincan_core::code::ShortCode;
+use tincan_core::code::{FriendCode, ShortCode};
 use tincan_core::invite::parse_user_code;
 use tincan_core::state::{MAX_TEXT_CHARS, dm_channel};
 use tincan_core::storage::Storage;
@@ -17,13 +17,13 @@ use crate::emit::Ev;
 use crate::settings;
 use crate::views::{ChannelInfo, ConvView, Refresh, short_name};
 
-/// kv key of my friend code (its 6 characters).
+/// kv key of my friend code (`ABCDEF:<nonce hex>`, see `FriendCode::to_stored`).
 const FRIEND_CODE_KEY: &str = "app/friend_code";
 
 /// The stored friend code, if one was made.
-fn load_friend_code(storage: &dyn Storage) -> Option<ShortCode> {
+fn load_friend_code(storage: &dyn Storage) -> Option<FriendCode> {
     match storage.get_kv(FRIEND_CODE_KEY) {
-        Ok(Some(v)) => String::from_utf8(v).ok().and_then(|s| ShortCode::parse(&s)),
+        Ok(Some(v)) => String::from_utf8(v).ok().and_then(|s| FriendCode::from_stored(&s)),
         Ok(None) => None,
         Err(e) => {
             tracing::warn!(error = %e, "reading the friend code failed");
@@ -31,6 +31,9 @@ fn load_friend_code(storage: &dyn Storage) -> Option<ShortCode> {
         }
     }
 }
+
+/// Serializes making and rotating my friend code.
+static FRIEND_CODE_OPS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Most messages per page.
 const MAX_PAGE: u32 = 200;
@@ -108,22 +111,30 @@ impl Core {
     }
 
     /// `get_friend_code`: my friend code (`ABC-DEF`), made and published on first use.
-    pub(crate) fn cmd_get_friend_code(&self) -> Result<String, String> {
-        if let Some(code) = load_friend_code(self.storage.as_ref()) {
-            return Ok(code.to_string());
+    pub(crate) async fn cmd_get_friend_code(&self) -> Result<String, String> {
+        let _one = FRIEND_CODE_OPS.lock().await;
+        if let Some(fc) = load_friend_code(self.storage.as_ref()) {
+            return Ok(fc.code.to_string());
         }
-        self.cmd_rotate_friend_code()
+        self.new_friend_code().await
     }
 
     /// `rotate_friend_code`: a new friend code; the old one stops resolving.
-    pub(crate) fn cmd_rotate_friend_code(&self) -> Result<String, String> {
-        let code = ShortCode::random();
-        self.storage.set_kv(FRIEND_CODE_KEY, code.compact().as_bytes()).map_err(|e| {
+    pub(crate) async fn cmd_rotate_friend_code(&self) -> Result<String, String> {
+        let _one = FRIEND_CODE_OPS.lock().await;
+        self.new_friend_code().await
+    }
+
+    /// A new nonce, so a new code committing to my user id (the KDF runs off the executor).
+    async fn new_friend_code(&self) -> Result<String, String> {
+        let me = self.me;
+        let fc = tokio::task::spawn_blocking(move || FriendCode::generate(&me)).await.map_err(|_| "Couldn't make a friend code. Try again.".to_string())?;
+        self.storage.set_kv(FRIEND_CODE_KEY, fc.to_stored().as_bytes()).map_err(|e| {
             tracing::error!(error = %e, "saving the friend code failed");
             "Couldn't save your friend code. Try again.".to_string()
         })?;
-        self.net.set_friend_code(Some(code));
-        Ok(code.to_string())
+        self.net.set_friend_code(Some(fc));
+        Ok(fc.code.to_string())
     }
 
     /// Publish the stored friend code, if one was made (startup).
