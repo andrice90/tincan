@@ -31,6 +31,7 @@ mod app;
 mod dispatch;
 pub mod dto;
 mod emit;
+mod images;
 mod index;
 mod media;
 mod profile;
@@ -221,5 +222,16 @@ impl App {
     #[doc(hidden)]
     pub async fn test_post_attachment_ref(&self, conv_id: &str, channel_id: Option<&str>, hash_hex: &str, name: &str, size: u64) -> Result<(), String> {
         self.core.test_post_attachment_ref(conv_id, channel_id, hash_hex, name, size).await
+    }
+
+    /// Test hook: publish a `ProfileImage` in `server_id` naming `hash_hex` (declared PNG of
+    /// `size` bytes) without holding it, the way a modified client could.
+    #[doc(hidden)]
+    pub async fn test_post_profile_image(&self, server_id: &str, hash_hex: &str, size: u64) -> Result<(), String> {
+        let server = commands::parse_conv(server_id)?;
+        let hash = transfers::parse_hash(hash_hex)?;
+        let image = tincan_core::event::ImageRef { hash, size, mime: "image/png".into() };
+        self.core.net.publish(server, tincan_core::event::Body::ProfileImage { image: Some(image) }).await.map_err(app::net_err)?;
+        Ok(())
     }
 }

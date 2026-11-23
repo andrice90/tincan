@@ -59,7 +59,8 @@ Motion: `transition: background-color 120ms ease-out, color 120ms ease-out`. No 
 
 - Custom title bar (decorations off) 32px tall, draggable, with min/max/close on the right. Keeps the window one continuous surface.
 - Channel list and member list widths: a grab bar on the edge that faces the content resizes them (channel list 200 to 420 px, default 240; member list 220 to 360 px, default 220). Drag or use the arrow keys, Home and End; double-click resets. The bar shows a `--border` line on hover and an `--accent` line while dragging or focused. In a narrow window both give way to their minimum before the content goes below 276 px (the room left in the 800 px minimum window at default widths).
-- Rail: DM button, divider, servers (initials on a rounded square, selected = accent fill), add-server button. Unread = small dot under the icon.
+- Rail: DM button, divider, servers (the server icon, or initials on a rounded square; selected = accent fill, or an accent ring around an icon), add-server button. Unread = small dot under the icon.
+- Avatars everywhere (member list, message authors, DM list and header, voice tiles, call panel rows of a call, user panel) show the person's picture over the coloured initial. The initial stays underneath as the fallback while the picture loads, when there is none, or if it fails to load. Pictures load lazily at the avatar's size.
 - Unread text channel: name in `--text-1` at weight 600, and a badge at the row's end (a 6 px `--text-1` dot; a count capped at "99+" once the app sends one). The channel on screen never shows one.
 - Channel list header: server name, "Hosted by <name>" (real state from the session), menu: invite people, rename server (owner only), leave server.
 - Voice rooms list who is inside. Avatar ring turns `--speaking` while that person talks. Mic-off and screen icons appear only when true.
@@ -78,7 +79,8 @@ Motion: `transition: background-color 120ms ease-out, color 120ms ease-out`. No 
 6b. **Share screen picker.** Opened from the call panel's share button. Two groups, Displays and Windows, each a grid of tiles (name, size). A Text / Motion toggle (sharp text at up to 15 fps, or smooth motion at up to 30 fps). "Share" starts it; the button becomes "Stop sharing". A machine with no hardware H.264 encoder shows that in place of the grid.
 7. **Invite dialog.** The invite code in a read-only field and "Copy invite".
 8. **Join dialog.** Paste field, "Join server". Error states say what failed and what to do.
-9. **Settings.** Profile (name), Voice (input, output, input level meter, noise suppression, echo cancellation), Files (download folder), Network (connection status, custom relay URL).
+8b. **Crop image.** Opened after picking an image for "Change avatar" (Settings, Profile) or "Change icon" (the owner's server menu, which also has "Remove icon"). A 280px square viewport with the final shape outlined and everything outside it dimmed: a circle for avatars, the rail's rounded square (12/44 of the side) for server icons. Drag (pointer or touch) or the arrow keys move the image (Shift moves further); the "Zoom" slider, the wheel and +/- zoom from 1x (the shape just covered) to 4x. The image always covers the shape. Cancel and Save; Save renders the visible crop to 128x128 and encodes WebP under 64 KB (PNG at falling sizes when WebP is unavailable). Escape cancels and returns to where the picker was opened.
+9. **Settings.** Profile (avatar with "Change avatar" and "Remove", name), Voice (input, output, input level meter, noise suppression, echo cancellation), Files (download folder), Network (connection status, custom relay URL).
 
 ## Icons
 

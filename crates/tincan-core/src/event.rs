@@ -46,6 +46,19 @@ pub struct Attachment {
     pub mime: String,
 }
 
+/// A small square image (an avatar or a server icon) held as an iroh blob. Like
+/// [`Attachment`] without a name. The checks are in [`crate::image`]: at most
+/// `image::MAX_IMAGE_BYTES`, MIME `image/webp` or `image/png`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ImageRef {
+    /// BLAKE3 hash of the image file.
+    pub hash: BlobHash,
+    /// Size in bytes (a claim; downloads check the real size).
+    pub size: u64,
+    /// MIME type: `image/webp` or `image/png`.
+    pub mime: String,
+}
+
 /// Event bodies. Append new variants only at the end (postcard encodes the index).
 /// The validation rules are in `state` (module docs).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +146,21 @@ pub enum Body {
         /// The author's last valid seq: this event's seq or the one before.
         last_seq: u64,
     },
+    /// Index 11 is reserved for `MemberRemove` (kicking members), built on another branch.
+    /// This placeholder only keeps the image bodies below at 12 and 13: drop it when that
+    /// branch is merged. Every replica rejects it.
+    #[doc(hidden)]
+    ReservedMemberRemove,
+    /// The author's avatar (`None` clears it). Latest by (hlc, id) wins, like `Profile`.
+    ProfileImage {
+        /// The image, or none.
+        image: Option<ImageRef>,
+    },
+    /// Owner only. The server icon (`None` clears it).
+    ServerIcon {
+        /// The image, or none.
+        image: Option<ImageRef>,
+    },
 }
 
 impl Body {
@@ -150,6 +178,9 @@ impl Body {
             Body::InviteRevoke { .. } => "invite_revoke",
             Body::MemberAdmit { .. } => "member_admit",
             Body::MemberLeave { .. } => "member_leave",
+            Body::ReservedMemberRemove => "reserved_11",
+            Body::ProfileImage { .. } => "profile_image",
+            Body::ServerIcon { .. } => "server_icon",
         }
     }
     /// Channel the event belongs to, if any (messages).
@@ -374,6 +405,9 @@ mod tests {
             Body::InviteRevoke { invite_pk: [0; 32] }.kind_tag(),
             Body::MemberAdmit { user: UserId::default(), invite_pk: [0; 32], from_seq: 1 }.kind_tag(),
             Body::MemberLeave { last_seq: 0 }.kind_tag(),
+            Body::ReservedMemberRemove.kind_tag(),
+            Body::ProfileImage { image: None }.kind_tag(),
+            Body::ServerIcon { image: None }.kind_tag(),
         ];
         let unique: std::collections::HashSet<_> = tags.iter().collect();
         assert_eq!(unique.len(), tags.len());
@@ -386,5 +420,19 @@ mod tests {
         assert_eq!(idx(&Body::Genesis { name: String::new(), owner: UserId::default(), nonce: [0; 16] }), 0);
         assert_eq!(idx(&Body::Message { channel: EventId::default(), text: String::new(), attachments: vec![] }), 5);
         assert_eq!(idx(&Body::MemberLeave { last_seq: 0 }), 10);
+        assert_eq!(idx(&Body::ReservedMemberRemove), 11);
+        assert_eq!(idx(&Body::ProfileImage { image: None }), 12);
+        assert_eq!(idx(&Body::ServerIcon { image: None }), 13);
+    }
+
+    #[test]
+    fn image_bodies_round_trip() {
+        let img = ImageRef { hash: BlobHash([7; 32]), size: 1234, mime: "image/webp".into() };
+        for body in [Body::ProfileImage { image: Some(img.clone()) }, Body::ServerIcon { image: Some(img) }, Body::ProfileImage { image: None }] {
+            let bytes = postcard::to_stdvec(&body).unwrap();
+            assert_eq!(postcard::from_bytes::<Body>(&bytes).unwrap(), body);
+            assert!(body.is_state());
+            assert_eq!(body.channel(), None);
+        }
     }
 }

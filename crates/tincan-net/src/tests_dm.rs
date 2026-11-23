@@ -175,6 +175,53 @@ async fn dm_display_names_are_announced_checked_and_kept() {
     }
 }
 
+/// Avatars ride the DM connection like names: announced when it opens and on change, a
+/// clear included; invalid ones are ignored; kept across a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dm_avatars_are_announced_checked_and_kept() {
+    use tincan_core::event::ImageRef;
+    let img = |i: u8| ImageRef { hash: tincan_core::BlobHash([i; 32]), size: 3000, mime: "image/webp".into() };
+    let a = node("alice", fast()).await;
+    a.net.set_avatar(Some(img(1)));
+    let (b_id, b_store) = (Identity::generate(), Arc::new(MemStorage::new()));
+    let b = start(b_id.clone(), b_store.clone(), "bob", fast()).await;
+    wire(&[&a, &b]);
+    let mut b_ev = b.net.subscribe();
+    let conv = a.net.dm_open(b.net.me()).await.expect("dm_open");
+    dm_say(&a, conv, "hi").await;
+    until("bob knows alice's avatar", Duration::from_secs(5), || b.net.dm_peer_avatar(&conv) == Some(img(1))).await;
+    assert_eq!(a.net.dm_peer_avatar(&conv), None, "bob has none");
+    a.net.set_avatar(Some(img(2)));
+    until("a change arrives", Duration::from_secs(5), || b.net.dm_peer_avatar(&conv) == Some(img(2))).await;
+    // Over the size cap or of another type: ignored.
+    for bad in [ImageRef { size: 65 * 1024, ..img(3) }, ImageRef { mime: "image/svg+xml".into(), ..img(3) }] {
+        assert!(a.net.send_dm_ctl(&b.net.me(), &Ctl::DmAvatar { image: Some(bad) }));
+    }
+    a.net.set_avatar(None);
+    until("a clear arrives", Duration::from_secs(5), || b.net.dm_peer_avatar(&conv).is_none()).await;
+    let mut seen = Vec::new();
+    while let Ok(ev) = b_ev.try_recv() {
+        if let NetEvent::DmAvatarChanged { peer, image, .. } = ev
+            && peer == a.net.me()
+        {
+            seen.push(image);
+        }
+    }
+    assert_eq!(seen, vec![Some(img(1)), Some(img(2)), None]);
+    b.net.shutdown().await;
+    drop(b);
+    let b = start(b_id, b_store, "bob", fast()).await;
+    assert_eq!(b.net.dm_peer_avatar(&conv), None, "the clear is kept across a restart");
+    // After the restart the next connection announces the current avatar.
+    a.net.set_avatar(Some(img(4)));
+    wire(&[&a, &b]);
+    dm_say(&a, conv, "again").await;
+    until("the avatar arrives on the new connection", Duration::from_secs(5), || b.net.dm_peer_avatar(&conv) == Some(img(4))).await;
+    for n in [a, b] {
+        n.net.shutdown().await;
+    }
+}
+
 /// The app keeps watches in shared state and awaits probes on Tauri's runtime.
 #[test]
 fn dm_watch_and_probe_are_send() {

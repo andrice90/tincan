@@ -5,7 +5,7 @@ import type { PathKind } from "../api/types";
 import { cancelCall, leaveVoice, openDialog, setDeafened, setMuted, setSoundboardOpen, stopShare } from "../store/actions";
 import { callPanelParts } from "../store/calls";
 import { useStore } from "../store/store";
-import { ICON, IconButton } from "./common";
+import { Avatar, ICON, IconButton } from "./common";
 
 function pathLabel(path: PathKind): { text: string; cls: string } {
   switch (path) {
@@ -23,6 +23,7 @@ export function CallPanel() {
   const call = useStore((s) => s.call);
   const soundboardOpen = useStore((s) => s.soundboardOpen);
   const servers = useStore((s) => s.servers);
+  const meId = useStore((s) => s.me?.userId);
   const parts = callPanelParts(voice, call);
 
   // A call ringing out gets its own row, also above a room panel: cancelling it never
@@ -30,6 +31,7 @@ export function CallPanel() {
   const calling = parts.calling && call && (
     <section className="call-panel" aria-label="Call">
       <div className="call-panel-top">
+        <Avatar userId={call.userId} name={call.name} size={24} />
         <div className="call-panel-label">
           <span className="call-state">Calling</span>
           <span className="truncate muted">
@@ -47,6 +49,7 @@ export function CallPanel() {
     return (
       <section className="call-panel" aria-label="Call">
         <div className="call-panel-top">
+          <Avatar userId={call.userId} name={call.name} size={24} />
           <div className="call-panel-label">
             <span className="call-state conn-none">Connecting</span>
             <span className="truncate muted">
@@ -76,12 +79,15 @@ export function CallPanel() {
       </>
     );
   const leaveLabel = voice.kind === "room" ? "Leave voice" : "Hang up";
+  // In a call, the contact's picture leads the row.
+  const peer = voice.kind === "call" ? voice.participants.find((p) => p.userId !== meId) : undefined;
 
   return (
     <>
       {calling}
       <section className="call-panel" aria-label="Voice">
         <div className="call-panel-top">
+          {peer && <Avatar userId={peer.userId} name={peer.name} size={24} />}
           <div className="call-panel-label">
             <span className={`call-state ${label.cls}`} title={rtt}>
               {label.text}

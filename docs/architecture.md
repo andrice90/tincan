@@ -16,7 +16,7 @@ Locked 2026-11-22 from the research in `docs/research/` (every version and API b
   - Soundboard plays while your mic is muted; it is disabled while deafened.
   - Relays: n0's public iroh relays by default (development and hobby tier, rate-limited, no SLA). A custom relay URL is a setting. This is the one caveat to "no servers": a small self-hosted `iroh-relay` or n0 Pro ($19/month) is recommended before a public release.
   - Installer: NSIS, per-user (no admin). Windows Firewall asks once on first run; direct paths need "Allow".
-- Out of scope for v1 (room left in the event enum): kick, ban, roles, reactions, edits, replies, avatars, multi-device, group end-to-end encryption beyond QUIC, store-and-forward DM mailboxes, system audio in screen share, camera video.
+- Out of scope for v1 (room left in the event enum): kick, ban, roles, reactions, edits, replies, multi-device, group end-to-end encryption beyond QUIC, store-and-forward DM mailboxes, system audio in screen share, camera video.
 
 ## Stack (pinned)
 
@@ -147,7 +147,11 @@ Body:
   InviteRevoke  { invite_pk }
   MemberAdmit   { user, invite_pk, from_seq }
   MemberLeave   { last_seq }
+  (11 reserved for MemberRemove, on another branch)
+  ProfileImage  { image: Option<ImageRef> }                 author's own avatar, latest by hlc
+  ServerIcon    { image: Option<ImageRef> }                 owner only
 Attachment { hash, size, name, mime }
+ImageRef { hash, size, mime }                                1 B..64 KiB, image/webp or image/png
 ```
 
 - `seq` is per author per server, contiguous from 1. Events are stored only when contiguous; out-of-order events wait in a small pending buffer.
@@ -249,6 +253,7 @@ Partition merge (two solo hosts is the common case, given the 6 s solo timeout):
 Admitted members and DM contacts are untrusted, hashes are not secret, and peer-supplied names and text are untrusted for the app and the UI.
 
 - Blob access is decided per (peer, hash). A peer may fetch a blob from me only if it is shared with a conversation that peer is in right now. A blob becomes shared with a conversation when I send it there, play the clip in its voice room or call, download it from a peer that conversation named (an author of a reference there, or a holder its host listed), or when someone who may already fetch it from me reposts it in a server (a repost in a DM shares nothing). A message that only references a hash grants nothing. At most 16 shares are kept per hash; past that a DM share goes before a server share.
+- Avatars and icons follow the same rule: a `ProfileImage` or `ServerIcon` event is a reference and grants nothing, and a downloaded image is shared with the conversations that named the peer who delivered it, so members can fetch a member's avatar or the icon from each other while the author is offline. One exception: my own current avatar may be fetched by anyone in any of my conversations (it is published to all of them; per-conversation shares would hit the 16-share cap). It stops being open when I change or remove it.
 - A partial download found at start resumes only from where it came from: an attachment from the conversations of its references, a clip pull from the conversation it was played in. A partial of unknown origin is not resumed, so its hash is never shown to every host and contact.
 - Each server's host learns only the held blobs and clips shared with that server. A host is still trusted to list real holders, so a host that also references a hash can get a blob I download from the holder it named shared with its server.
 - Size caps: attachments 25 MiB, clips 5 MiB, checked against the proven size (`TooLarge`, shown as a failed download, and remembered). A provider's size header is only a claim: when it is over a cap, the provider is asked for the last chunk first, which proves the real size; one that cannot prove it fails only its own attempt. Larger declared sizes are never queued; `download` refuses them with "This file is larger than 25 MB, so Tincan won't download it."
@@ -277,6 +282,7 @@ A hint for cold joiners when every cached peer is stale. Never trusted on its ow
 ## Direct messages and 1:1 calls
 
 - ALPN `tincan/dm/1`, dialed by UserId (iroh resolves addresses via n0 DNS; cached `AddrHint`s from shared servers are tried too).
+- Profile on the DM connection: both sides send `DmProfile{name}` and, when they have one, `DmAvatar{image}` once it is up, and again on every change (a cleared avatar included). Each is budgeted per contact (a burst of 3, then one per 5 s) and kept across restarts.
 - A DM log uses the same `Event` format with `server = blake3("tincan dm" || sorted(a, b))` and only `Message`/`Delete` bodies. Both sides store it; `SyncHave` on every connect.
 - Offline delivery v1: the sender's outbox shows the message as pending and delivers when the contact is seen online in any shared server's roster, or on retry (30 s, 1, 2, 5, 15 min backoff, 4 s dial timeout).
 - Calls: `CallInvite / CallAccept / CallDecline / CallEnd` on the DM control stream; media rides the same connection with the same framing. No host, no forwarding; the call ends when either side leaves.
@@ -289,6 +295,7 @@ A hint for cold joiners when every cached peer is stale. Never trusted on its ow
 - Holder index: members announce held hashes in `Hello`/`Have`, each server only the ones shared with it; the host keeps `hash -> online holders` and answers `WhoHas{hash}` with `Holders{hash, users, addrs}`. Downloads use the online authors first, then holders from the host, then offline authors.
 - Downloader pool `connect_timeout` 4 s. A failed download is re-queued when a new holder comes online. `router.shutdown()` on exit so partial progress survives restarts (a hard kill loses the last partial chunk).
 - Auto-prefetch: every online member fetches attachments up to 25 MB when the message arrives, so the file survives the uploader leaving first.
+- Avatars and server icons are blobs of their own kind (`BlobKind::Image`, tag `img-`, refused past 64 KiB, so naming a large blob as an avatar cannot make anyone fetch it). They are auto-fetched when a DTO first shows the current image of a member, server or DM contact (never the old ones a history sync replays), from the author and the holders the host lists, and shown only after the bytes were read back and passed the PNG or WebP header check. A DM contact's avatar comes from `Ctl::DmAvatar` on the DM connection, else from a shared server. Uploads are cropped and encoded in the UI (128x128 WebP or PNG, under 64 KiB) and checked again by the app before it publishes `ProfileImage` or `ServerIcon`.
 - Opening a file exports it to `Downloads\Tincan\` with the Mark of the Web, then opens it with the default app only when it is a document, media or an image whose bytes match its extension; anything else is revealed in Explorer.
 
 ## Media

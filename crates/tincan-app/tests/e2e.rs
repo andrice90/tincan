@@ -112,11 +112,11 @@ fn assert_keys(v: &Value, want: &[&str]) {
 fn is_hex64(v: &Value) -> bool { v.as_str().is_some_and(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())) }
 
 const MESSAGE_KEYS: &[&str] = &["id", "convId", "channelId", "authorId", "authorName", "text", "attachments", "sentAt", "deleted", "pending"];
-const MEMBER_KEYS: &[&str] = &["userId", "name", "online", "isHost", "isOwner", "voiceChannelId", "muted", "deafened", "sharing", "speaking"];
-const SERVER_KEYS: &[&str] = &["id", "name", "ownerId", "isOwner", "connection", "unread", "onlineCount"];
+const MEMBER_KEYS: &[&str] = &["userId", "name", "online", "isHost", "isOwner", "voiceChannelId", "muted", "deafened", "sharing", "speaking", "avatar"];
+const SERVER_KEYS: &[&str] = &["id", "name", "ownerId", "isOwner", "connection", "unread", "onlineCount", "icon"];
 const CHANNEL_KEYS: &[&str] = &["id", "serverId", "name", "kind", "position", "unread"];
 const TRANSFER_KEYS: &[&str] = &["hash", "state", "have", "total", "peers"];
-const DM_KEYS: &[&str] = &["convId", "userId", "name", "online", "unread", "lastMessageAt"];
+const DM_KEYS: &[&str] = &["convId", "userId", "name", "online", "unread", "lastMessageAt", "avatar"];
 
 /// The first text channel of `server` (waits for the history sync to bring it).
 async fn text_channel(app: &App, server: &str) -> String {
@@ -1129,4 +1129,183 @@ async fn contract_matches_types_ts() {
     assert_eq!(snap["settings"]["theme"], "dark");
     assert_eq!(snap["settings"]["allowHosting"], false);
     again.shutdown().await;
+}
+
+/// A PNG signature and IHDR for `w` x `h`, padded to `len` bytes: enough for the app's
+/// header check (nothing decodes the pixels).
+fn png_bytes(w: u32, h: u32, len: usize, seed: u64) -> Vec<u8> {
+    let mut b = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
+    b.extend_from_slice(b"IHDR");
+    b.extend_from_slice(&w.to_be_bytes());
+    b.extend_from_slice(&h.to_be_bytes());
+    b.extend_from_slice(&data(len.saturating_sub(b.len()), seed));
+    b
+}
+
+/// A lossless WebP header for 128x128, padded to `len` bytes.
+fn webp_bytes(len: usize) -> Vec<u8> {
+    let mut d = vec![0x2f];
+    d.extend_from_slice(&(127u32 | (127 << 14)).to_le_bytes());
+    d.extend_from_slice(&data(len.saturating_sub(25), 5));
+    let mut b = b"RIFF".to_vec();
+    b.extend_from_slice(&u32::try_from(d.len() + 12).unwrap().to_le_bytes());
+    b.extend_from_slice(b"WEBPVP8L");
+    b.extend_from_slice(&u32::try_from(d.len()).unwrap().to_le_bytes());
+    b.extend_from_slice(&d);
+    b
+}
+
+fn url_hash(url: &Value) -> String { url.as_str().expect("a URL").strip_prefix(FILE_BASE).expect("the file scheme").to_string() }
+
+/// The avatar URL of `user` in `server` as `app` sees it.
+async fn member_avatar(app: &App, server: &str, user: &str) -> Value {
+    let m = call(app, "members", json!({ "serverId": server })).await;
+    m.as_array().unwrap().iter().find(|x| x["userId"] == user).map(|x| x["avatar"].clone()).unwrap_or(Value::Null)
+}
+
+/// Avatars and server icons: the app re-checks uploads, publishes them, members fetch and
+/// show them (from a member who holds one while its author is offline), DM summaries show
+/// a contact's avatar, and naming a DM-only blob as an avatar opens nothing up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn avatars_and_icons_travel_and_follow_access() {
+    let _g = serial().await;
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let files = tempfile::tempdir().unwrap();
+    let a = node(dirs[0].path(), "Alice").await;
+    let mut b = node(dirs[1].path(), "Bob").await;
+    let server = server_id(&call(&a.app, "create_server", json!({ "name": "Pics" })).await);
+    let invite = call(&a.app, "create_invite", json!({ "serverId": server })).await;
+    call(&b.app, "join_server", json!({ "invite": invite })).await;
+    all_online(&[&a, &b], &server).await;
+
+    // The app never trusts the UI: type, size and header dimensions are checked.
+    let jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4];
+    assert_eq!(call_err(&a.app, "set_avatar", json!({ "bytes": jpeg })).await, "That isn't a PNG or WebP image.");
+    let big = png_bytes(128, 128, 70_000, 1);
+    assert_eq!(call_err(&a.app, "set_avatar", json!({ "bytes": big })).await, "That image is larger than 64 KB. Pick a smaller one.");
+    let huge = png_bytes(4000, 4000, 2000, 1);
+    assert!(call_err(&a.app, "set_avatar", json!({ "bytes": huge })).await.starts_with("That image is 4000x4000."));
+    let icon_bytes = webp_bytes(3000);
+    assert_eq!(call_err(&b.app, "set_server_icon", json!({ "serverId": server, "bytes": icon_bytes })).await, "Only the server owner can do that.");
+
+    // Alice sets an avatar: her own panel shows it at once, Bob fetches it.
+    let avatar = png_bytes(128, 128, 5000, 2);
+    let me = call(&a.app, "set_avatar", json!({ "bytes": avatar })).await;
+    assert_keys(&me, &["userId", "userCode", "name", "avatar"]);
+    let hash = url_hash(&me["avatar"]);
+    let (got, mime) = a.app.file_for_url(&hash).await.expect("served");
+    assert_eq!((got, mime.as_str()), (avatar.clone(), "image/png"));
+    let at_b = eventually("Bob shows Alice's avatar", 30, || async { Some(member_avatar(&b.app, &server, &a.user).await).filter(|v| !v.is_null()) }).await;
+    assert_eq!(url_hash(&at_b), hash);
+    assert_eq!(b.app.file_for_url(&hash).await.expect("Bob holds it").0, avatar);
+    assert_eq!(member_avatar(&a.app, &server, &a.user).await, me["avatar"], "my own row shows my avatar");
+    assert!(member_avatar(&a.app, &server, &b.user).await.is_null(), "Bob has none");
+
+    // Alice sets the server icon; Bob's server summary shows it.
+    let summary = call(&a.app, "set_server_icon", json!({ "serverId": server, "bytes": icon_bytes })).await;
+    assert_keys(&summary, SERVER_KEYS);
+    let icon = url_hash(&summary["icon"]);
+    wait_for(&mut b.rx, "server-updated", 30, |s| s["id"] == server.as_str() && s["icon"].as_str().is_some_and(|u| u.ends_with(&icon))).await;
+
+    // A DM shows the contact's avatar (announced over the DM, or from the shared server).
+    a.app.test_add_addr(&b.user, &b.app.test_addrs()).unwrap();
+    b.app.test_add_addr(&a.user, &a.app.test_addrs()).unwrap();
+    let ab = call(&b.app, "open_dm", json!({ "userId": a.user })).await;
+    assert_keys(&ab, DM_KEYS);
+    let ab_conv = ab["convId"].as_str().unwrap().to_string();
+    eventually("Bob's DM shows Alice's avatar", 20, || async {
+        let s = call(&b.app, "app_snapshot", json!({})).await;
+        s["dms"].as_array().unwrap().iter().find(|d| d["convId"] == ab_conv.as_str()).and_then(|d| d["avatar"].as_str().map(|u| u.ends_with(&hash))).filter(|x| *x)
+    })
+    .await;
+    // Alice sends Bob a small file in their DM (the target of the reference attack below).
+    assert_eq!(call(&a.app, "open_dm", json!({ "userId": b.user })).await["convId"], ab_conv.as_str());
+    let dm_file = files.path().join("note.png");
+    std::fs::write(&dm_file, png_bytes(16, 16, 900, 3)).unwrap();
+    let dm_hash = send_file(&a.app, &ab_conv, None, &dm_file).await;
+    until_complete(&b.app, &dm_hash, "Bob fetches the DM file").await;
+
+    // Alice leaves: Bob hosts, Cam joins and gets Alice's avatar from Bob.
+    a.app.shutdown().await;
+    wait_for(&mut b.rx, "server-updated", 40, |s| {
+        s["id"] == server.as_str() && s["connection"]["hostId"] == b.user.as_str() && matches!(s["connection"]["state"].as_str(), Some("solo" | "hosting"))
+    })
+    .await;
+    let invite2 = call(&b.app, "create_invite", json!({ "serverId": server })).await;
+    let c = node(dirs[2].path(), "Cam").await;
+    call(&c.app, "join_server", json!({ "invite": invite2 })).await;
+    let at_c = eventually("Cam shows Alice's avatar, fetched from Bob", 40, || async {
+        Some(member_avatar(&c.app, &server, &a.user).await).filter(|v| !v.is_null())
+    })
+    .await;
+    assert_eq!(url_hash(&at_c), hash);
+    eventually("Cam shows the server icon", 30, || async {
+        let s = call(&c.app, "app_snapshot", json!({})).await;
+        s["servers"].as_array().unwrap().iter().find(|x| x["id"] == server.as_str()).and_then(|x| x["icon"].as_str().map(|u| u.ends_with(&icon))).filter(|x| *x)
+    })
+    .await;
+
+    // Cam names the DM-only file as his avatar: Bob still refuses it to him.
+    let bob_addrs = b.app.test_addrs();
+    c.app.test_post_profile_image(&server, &dm_hash, 900).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!c.app.test_fetch_from(&dm_hash, &b.user, &bob_addrs, 10).await, "naming a DM-only blob as an avatar shared it");
+    // Control: Bob's copy of Alice's avatar is shared with the server, so it is served.
+    let control = tempfile::tempdir().unwrap();
+    let d = node(control.path(), "Dee").await;
+    let invite3 = call(&b.app, "create_invite", json!({ "serverId": server })).await;
+    call(&d.app, "join_server", json!({ "invite": invite3 })).await;
+    all_online(&[&b, &d], &server).await;
+    assert!(d.app.test_fetch_from(&hash, &b.user, &bob_addrs, 20).await, "a member could not fetch Alice's avatar from Bob");
+
+    // Removing an avatar.
+    let me_b = call(&b.app, "set_avatar", json!({ "bytes": png_bytes(64, 64, 800, 4) })).await;
+    assert!(me_b["avatar"].is_string());
+    eventually("Cam sees Bob's avatar", 30, || async { member_avatar(&c.app, &server, &b.user).await.is_string().then_some(()) }).await;
+    let me_b = call(&b.app, "set_avatar", json!({ "bytes": null })).await;
+    assert!(me_b["avatar"].is_null());
+    eventually("Cam sees Bob's avatar removed", 20, || async { member_avatar(&c.app, &server, &b.user).await.is_null().then_some(()) }).await;
+
+    for n in [b, c, d] {
+        n.app.shutdown().await;
+    }
+}
+
+/// The DM avatar of a contact who shares no server: announced over the DM connection
+/// (`DmAvatar`), fetched from the contact, removed when they remove it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dm_only_contact_shows_their_avatar() {
+    let _g = serial().await;
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let x = node(dirs[0].path(), "Xena").await;
+    let b = node(dirs[1].path(), "Bob").await;
+    let avatar = png_bytes(128, 128, 3000, 9);
+    let hash = url_hash(&call(&x.app, "set_avatar", json!({ "bytes": avatar })).await["avatar"]);
+
+    x.app.test_add_addr(&b.user, &b.app.test_addrs()).unwrap();
+    b.app.test_add_addr(&x.user, &x.app.test_addrs()).unwrap();
+    let b_code = call(&b.app, "app_snapshot", json!({})).await["me"]["userCode"].as_str().unwrap().to_string();
+    let xb = call(&x.app, "add_contact", json!({ "code": b_code })).await["convId"].as_str().unwrap().to_string();
+    call(&x.app, "send_message", json!({ "convId": xb, "channelId": null, "text": "hi", "attachments": [] })).await;
+    let dm_avatar = |app: Arc<App>, conv: String| async move {
+        let s = call(&app, "app_snapshot", json!({})).await;
+        s["dms"].as_array().unwrap().iter().find(|d| d["convId"] == conv.as_str()).map(|d| d["avatar"].clone())
+    };
+    let shown = eventually("Bob's DM shows Xena's avatar", 30, || {
+        let f = dm_avatar(b.app.clone(), xb.clone());
+        async move { f.await.filter(|v| v.is_string()) }
+    })
+    .await;
+    assert_eq!(url_hash(&shown), hash);
+    assert_eq!(b.app.file_for_url(&hash).await.expect("Bob holds it").0, avatar);
+
+    call(&x.app, "set_avatar", json!({ "bytes": null })).await;
+    eventually("Bob's DM drops the avatar", 20, || {
+        let f = dm_avatar(b.app.clone(), xb.clone());
+        async move { f.await.filter(|v| v.is_null()).map(|_| ()) }
+    })
+    .await;
+    for n in [x, b] {
+        n.app.shutdown().await;
+    }
 }

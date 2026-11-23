@@ -175,6 +175,21 @@
   color: var(--accent-fg);
 }
 
+.rail-icon {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: var(--r-server);
+  object-fit: cover;
+}
+
+/* An icon covers the accent fill, so the selected one gets the accent as a ring. */
+.rail-btn[aria-current="page"] .rail-icon {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .rail-add {
   color: var(--text-2);
 }
@@ -593,6 +608,25 @@ html:has(.resize-handle.is-dragging) {
   font-size: var(--fs-20);
   outline-width: 3px;
   outline-offset: 3px;
+}
+
+.avatar-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.avatar-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.avatar-row .avatar {
+  margin-right: var(--sp-1);
 }
 
 .avatar-online {
@@ -1467,6 +1501,64 @@ button.clip-tile:hover:not(:disabled) {
 
 .modal::backdrop {
   background: var(--scrim);
+}
+
+.modal-crop {
+  width: min(360px, calc(100vw - 32px));
+}
+
+.crop-view {
+  position: relative;
+  margin: 0 auto;
+  overflow: hidden;
+  border-radius: var(--r-card);
+  background: var(--bg-side);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.crop-view:active {
+  cursor: grabbing;
+}
+
+.crop-view:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.crop-img {
+  position: absolute;
+  top: 0;
+  left: 0;
+  max-width: none;
+  pointer-events: none;
+}
+
+.crop-mask {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.crop-dim {
+  fill: var(--scrim);
+}
+
+.crop-outline {
+  fill: none;
+  stroke: rgb(255 255 255 / 0.8);
+  stroke-width: 1.5;
+}
+
+.crop-zoom {
+  margin-top: var(--sp-4);
+}
+
+.crop-zoom input {
+  width: 100%;
 }
 
 .modal-wide {

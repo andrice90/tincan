@@ -27,6 +27,77 @@ fn att(n: &str) -> Attachment { Attachment { hash: BlobHash([5; 32]), size: 10, 
 
 fn named(n: &str) -> Body { Body::Profile { name: n.into() } }
 
+fn img(i: u8) -> ImageRef { ImageRef { hash: BlobHash([i; 32]), size: 2000, mime: "image/webp".into() } }
+
+// ------------------------------------------------------------------ avatars and icons
+
+#[test]
+fn profile_images_follow_the_latest_and_can_be_cleared() {
+    let mut fx = Fx::new();
+    let m = fx.member("m");
+    let e = fx.peek(&m, Body::ProfileImage { image: Some(img(1)) });
+    assert_eq!(fx.state.apply(&e, NOW), (Verdict::Accept, Change::Members));
+    fx.seqs.insert(m.user(), e.event.seq);
+    assert_eq!(fx.state.members[&m.user()].avatar, Some(img(1)));
+    fx.ok(&m, Body::ProfileImage { image: Some(img(2)) });
+    assert_eq!(fx.state.members[&m.user()].avatar, Some(img(2)));
+    fx.ok(&m, Body::ProfileImage { image: None });
+    assert_eq!(fx.state.members[&m.user()].avatar, None);
+    // A member's avatar is theirs only: nobody sets anyone else's (the event is the author's).
+    assert_eq!(fx.state.members[&fx.owner.user()].avatar, None);
+}
+
+#[test]
+fn image_refs_are_validated() {
+    let mut fx = Fx::new();
+    let m = fx.member("m");
+    let o = fx.owner.clone();
+    let big = ImageRef { size: crate::image::MAX_IMAGE_BYTES + 1, ..img(1) };
+    let svg = ImageRef { mime: "image/svg+xml".into(), ..img(1) };
+    let empty = ImageRef { size: 0, ..img(1) };
+    for bad in [big, svg, empty] {
+        assert!(is_reject(&fx.try_apply(&m, Body::ProfileImage { image: Some(bad.clone()) })));
+        assert!(is_reject(&fx.try_apply(&o, Body::ServerIcon { image: Some(bad) })));
+    }
+    fx.ok(&m, Body::ProfileImage { image: Some(ImageRef { mime: "image/png".into(), size: crate::image::MAX_IMAGE_BYTES, ..img(1) }) });
+}
+
+#[test]
+fn only_the_owner_sets_the_server_icon() {
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let m = fx.member("m");
+    assert!(is_reject(&fx.try_apply(&m, Body::ServerIcon { image: Some(img(1)) })));
+    assert!(is_reject(&fx.try_apply(&m, Body::ServerIcon { image: None })));
+    let s = Identity::generate();
+    assert!(is_reject(&fx.try_apply(&s, Body::ServerIcon { image: Some(img(1)) })), "a stranger is rejected, not buffered");
+    assert_eq!(fx.state.icon, None);
+    let e = fx.peek(&o, Body::ServerIcon { image: Some(img(1)) });
+    assert_eq!(fx.state.apply(&e, NOW), (Verdict::Accept, Change::ServerRenamed));
+    fx.seqs.insert(o.user(), e.event.seq);
+    assert_eq!(fx.state.icon, Some(img(1)));
+    fx.ok(&o, Body::ServerIcon { image: None });
+    assert_eq!(fx.state.icon, None);
+}
+
+#[test]
+fn the_reserved_body_is_always_rejected() {
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let m = fx.member("m");
+    assert!(is_reject(&fx.try_apply(&o, Body::ReservedMemberRemove)));
+    assert!(is_reject(&fx.try_apply(&m, Body::ReservedMemberRemove)));
+}
+
+#[test]
+fn dms_carry_no_images() {
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let st = ConvState::new_dm(a.user(), b.user());
+    let e = raw(&a, st.conv, 1, hlc_from_ms(T0), Body::ProfileImage { image: Some(img(1)) });
+    assert!(is_reject(&st.check(&e.id, &e.event, NOW)));
+}
+
 /// A server with an owner, `general` (text), `voice` (voice) and an owner invite that never
 /// expires. Tracks seqs per author and a global hlc clock.
 struct Fx {
@@ -712,6 +783,11 @@ fn scenario() -> (ConvId, Vec<StoredEvent>, ConvState) {
     fx.ok(&a, Body::Delete { target: v1 });
     fx.ok(&o, Body::ChannelUpdate { channel: den, name: None, position: None, deleted: Some(true) });
     fx.ok(&c, text(den, "posted before seeing the room go"));
+    fx.ok(&a, Body::ProfileImage { image: Some(img(1)) });
+    fx.ok(&a, Body::ProfileImage { image: Some(img(2)) });
+    fx.ok(&b, Body::ProfileImage { image: Some(img(3)) });
+    fx.ok(&b, Body::ProfileImage { image: None });
+    fx.ok(&o, Body::ServerIcon { image: Some(img(4)) });
 
     // sanity of the reference state
     let st = &fx.state;
@@ -722,6 +798,9 @@ fn scenario() -> (ConvId, Vec<StoredEvent>, ConvState) {
     assert_eq!(st.members[&b.user()].last_leave, Some(3));
     assert_eq!(st.display_name(&b.user()), "b again");
     assert!(st.channels[&random].deleted);
+    assert_eq!(st.members[&a.user()].avatar, Some(img(2)));
+    assert_eq!(st.members[&b.user()].avatar, None);
+    assert_eq!(st.icon, Some(img(4)));
     assert!(st.invites[&inv2].revoked);
     assert_eq!(st.invites[&inv2].uses, 3);
     assert_eq!(st.invites[&fx.invite].uses, 2);

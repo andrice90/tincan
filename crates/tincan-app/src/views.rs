@@ -54,6 +54,10 @@ pub(crate) struct ConvView {
     pub all_channels: BTreeMap<ChannelId, ChannelInfo>,
     /// Current members (servers).
     pub members: Vec<UserId>,
+    /// Current avatars by member (servers).
+    pub avatars: HashMap<UserId, tincan_core::event::ImageRef>,
+    /// Server icon.
+    pub icon: Option<tincan_core::event::ImageRef>,
     /// Display names of everyone who ever had one here.
     pub names: HashMap<UserId, String>,
 }
@@ -81,6 +85,8 @@ impl ConvView {
             all_channels: st.channels.iter().map(|(id, c)| (*id, info(c))).collect(),
             members,
             names: st.members.iter().filter(|(_, m)| !m.name.is_empty()).map(|(u, m)| (*u, m.name.clone())).collect(),
+            avatars: st.members.iter().filter_map(|(u, m)| Some((*u, m.avatar.clone()?))).collect(),
+            icon: st.icon.clone(),
         }
     }
 
@@ -293,6 +299,7 @@ impl Core {
             user_id: self.me.to_z32(),
             user_code: tincan_core::invite::user_code(&self.me),
             name,
+            avatar: self.my_avatar_url(),
         })
     }
 
@@ -331,6 +338,7 @@ impl Core {
             },
             unread,
             online_count: u32::try_from(online_count).unwrap_or(u32::MAX),
+            icon: self.icon_url(&view),
         })
     }
 
@@ -375,6 +383,7 @@ impl Core {
                     deafened: entry.is_some_and(|e| e.deafened),
                     sharing: entry.is_some_and(|e| e.sharing.is_some()),
                     speaking: self.media.is_speaking(u),
+                    avatar: self.member_avatar_url(view, u),
                 }
             })
             .collect();
@@ -434,6 +443,7 @@ impl Core {
             online: self.net.peer_online(&peer),
             unread: self.storage.unread(conv, None, &self.me).unwrap_or(false),
             last_message_at: last.map(|e| hlc_ms(e.event.hlc)),
+            avatar: self.dm_avatar_url(&peer),
         })
     }
 
@@ -542,6 +552,8 @@ mod tests {
             all_channels: BTreeMap::new(),
             members: Vec::new(),
             names: HashMap::new(),
+            avatars: HashMap::new(),
+            icon: None,
         })
     }
 

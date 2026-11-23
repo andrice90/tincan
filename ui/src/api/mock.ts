@@ -290,6 +290,28 @@ function addMessages(convId: ConvId, channelId: ChannelId | null, base: number, 
   st.messages.set(convKey(convId, channelId), list);
 }
 
+/** Sample images (data URLs stand in for `http://tincan.localhost/file/<hash>`). */
+const SAMPLE_AVATARS = new Map<UserId, string>();
+const SAMPLE_ICON = sampleImage("#3f7a7a", "#e0784f", true);
+
+/** A small SVG as a data URL: two overlapping shapes on a coloured ground. */
+function sampleImage(bg: string, fg: string, square = false): string {
+  const shape = square ? `<rect x="34" y="30" width="60" height="68" rx="10" fill="${fg}"/>` : `<circle cx="64" cy="50" r="24" fill="${fg}"/><rect x="26" y="82" width="76" height="60" rx="30" fill="${fg}"/>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><rect width="128" height="128" fill="${bg}"/>${shape}</svg>`;
+  return `data:image/svg+xml;base64,${btoa(svg)}`;
+}
+
+/** Bytes from the UI as a data URL, the way the app serves an uploaded image. */
+function bytesUrl(bytes: number[]): string {
+  const isPng = bytes[0] === 0x89 && bytes[1] === 0x50;
+  const isWebp = bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
+  if (!isPng && !isWebp) fail("That isn't a PNG or WebP image.");
+  if (bytes.length > 64 * 1024) fail("That image is larger than 64 KB. Pick a smaller one.");
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return `data:${isPng ? "image/png" : "image/webp"};base64,${btoa(s)}`;
+}
+
 function member(p: Person, extra: Partial<Member> = {}): Member {
   return {
     userId: p.id,
@@ -302,6 +324,7 @@ function member(p: Person, extra: Partial<Member> = {}): Member {
     deafened: false,
     sharing: false,
     speaking: false,
+    avatar: SAMPLE_AVATARS.get(p.id) ?? null,
     ...extra,
   };
 }
@@ -311,7 +334,9 @@ function channel(serverId: ServerId, name: string, kind: ChannelKind, position: 
 }
 
 function seed(): void {
-  st.me = { userId: people.sam.id, userCode: `tincan1u${people.sam.id}`, name: "Sam" };
+  SAMPLE_AVATARS.set(people.jordan.id, sampleImage("#4f6d8f", "#e9eaec"));
+  SAMPLE_AVATARS.set(people.alex.id, sampleImage("#8a5a44", "#f3c9a8"));
+  st.me = { userId: people.sam.id, userCode: `tincan1u${people.sam.id}`, name: "Sam", avatar: null };
 
   // Game night: Sam owns it, Jordan hosts it right now.
   const gn = hexId("server:game-night");
@@ -329,6 +354,7 @@ function seed(): void {
       connection: { state: "member", hostId: people.jordan.id, hostName: "Jordan", path: "direct", rttMs: 24 },
       unread: true,
       onlineCount: 5,
+      icon: SAMPLE_ICON,
     },
     channels: [gnGeneral, gnClips, gnLounge, gnSquad],
     members: [
@@ -448,6 +474,7 @@ function seed(): void {
       connection: { state: "hosting", hostId: people.sam.id, hostName: "Sam", path: "none", rttMs: null },
       unread: true,
       onlineCount: 2,
+      icon: null,
     },
     channels: [bcGeneral, bcList, bcRoom],
     members: [
@@ -475,8 +502,8 @@ function seed(): void {
   const dmAlex = hexId("dm:alex");
   const dmRiley = hexId("dm:riley");
   st.dms.push(
-    { convId: dmAlex, userId: people.alex.id, name: "Alex", online: true, unread: false, lastMessageAt: now - 50 * MIN },
-    { convId: dmRiley, userId: people.riley.id, name: "Riley", online: false, unread: false, lastMessageAt: now - 25 * MIN },
+    { convId: dmAlex, userId: people.alex.id, name: "Alex", online: true, unread: false, lastMessageAt: now - 50 * MIN, avatar: SAMPLE_AVATARS.get(people.alex.id) ?? null },
+    { convId: dmRiley, userId: people.riley.id, name: "Riley", online: false, unread: false, lastMessageAt: now - 25 * MIN, avatar: null },
   );
   addMessages(dmAlex, null, now - 4 * 60 * MIN, [
     ["alex", 0, "you still have my controller from last week?"],
@@ -585,6 +612,7 @@ function participantOf(m: { userId: UserId; name: string; muted: boolean; deafen
     muted: m.muted,
     deafened: m.deafened,
     speaking: m.speaking,
+    avatar: m.userId === st.me?.userId ? st.me.avatar : (SAMPLE_AVATARS.get(m.userId) ?? null),
     screenTrack: st.screenTracks.get(m.userId) ?? null,
     volume: m.userId === st.me?.userId ? 1 : (st.volumes.get(m.userId) ?? 1),
   };
@@ -860,7 +888,7 @@ function ringFrom(p: Person): void {
 function dmWith(p: Person): DmSummary {
   let dm = st.dms.find((d) => d.userId === p.id);
   if (!dm) {
-    dm = { convId: hexId(`dm:${p.name.toLowerCase()}`), userId: p.id, name: p.name, online: p.online, unread: false, lastMessageAt: null };
+    dm = { convId: hexId(`dm:${p.name.toLowerCase()}`), userId: p.id, name: p.name, online: p.online, unread: false, lastMessageAt: null, avatar: SAMPLE_AVATARS.get(p.id) ?? null };
     st.dms.push(dm);
     st.messages.set(convKey(dm.convId, null), []);
   }
@@ -922,7 +950,7 @@ const handlers: Handlers = {
     if (st.me) {
       st.me.name = n;
     } else {
-      st.me = { userId: people.sam.id, userCode: `tincan1u${people.sam.id}`, name: n };
+      st.me = { userId: people.sam.id, userCode: `tincan1u${people.sam.id}`, name: n, avatar: null };
     }
     people.sam.name = n;
     for (const s of st.servers) {
@@ -950,6 +978,7 @@ const handlers: Handlers = {
         connection: { state: "solo", hostId: me.userId, hostName: me.name, path: "none", rttMs: null },
         unread: false,
         onlineCount: 1,
+        icon: null,
       },
       channels: [channel(id, "general", "text", 0), channel(id, "Lounge", "voice", 1)],
       members: [member({ id: me.userId, name: me.name, online: true }, { isHost: true, isOwner: true })],
@@ -985,6 +1014,7 @@ const handlers: Handlers = {
         connection: { state: "member", hostId: people.morgan.id, hostName: "Morgan", path: "relay", rttMs: 92 },
         unread: false,
         onlineCount: 3,
+        icon: null,
       },
       channels: [channel(id, "general", "text", 0), channel(id, "Theater", "voice", 1)],
       members: [
@@ -1008,6 +1038,36 @@ const handlers: Handlers = {
     st.servers = st.servers.filter((s) => s.summary.id !== serverId);
     emit("snapshot", snapshot());
     return null;
+  },
+
+  set_avatar: async ({ bytes }) => {
+    const me = st.me ?? fail("Pick a display name first.");
+    const url = bytes ? bytesUrl(bytes) : null;
+    await sleep(200);
+    me.avatar = url;
+    for (const s of st.servers) {
+      const m = s.members.find((x) => x.userId === me.userId);
+      if (m) {
+        m.avatar = url;
+        emitMembers(s);
+      }
+    }
+    if (st.voice) {
+      rebuildVoice();
+      emit("voice-updated", st.voice);
+    }
+    emit("snapshot", snapshot());
+    return me;
+  },
+
+  set_server_icon: async ({ serverId, bytes }) => {
+    const s = server(serverId);
+    requireOwner(s, "change its icon");
+    const url = bytes ? bytesUrl(bytes) : null;
+    await sleep(200);
+    s.summary.icon = url;
+    emit("server-updated", s.summary);
+    return s.summary;
   },
 
   rename_server: ({ serverId, name }) => {

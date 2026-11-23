@@ -10,7 +10,8 @@
 //! when that dial fails and the contact's address changed meanwhile.
 //!
 //! Once a connection is up both sides send `DmProfile{name}` (their display name, again when
-//! it changes). A watched contact (`Net::dm_watch`) stays connected: a lost or failed
+//! it changes), then `DmAvatar{image}` when they have an avatar (and again on every change,
+//! a clear included). A watched contact (`Net::dm_watch`) stays connected: a lost or failed
 //! connection is redialed on a short backoff, and a `Tick` every `dm_keepalive` keeps the
 //! contact's side from closing it as idle (every version ignores a `Tick` on a DM link).
 
@@ -21,7 +22,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use iroh::endpoint::{Connection, SendStream};
 use parking_lot::Mutex;
-use tincan_core::event::{Body, StoredEvent};
+use tincan_core::event::{Body, ImageRef, StoredEvent};
+use tincan_core::image::validate_image_ref;
 use tincan_core::state::{ConvState, Verdict, dm_channel, validate_name};
 use tincan_core::storage::ConvRecord;
 use tincan_core::sync::Heads;
@@ -42,6 +44,9 @@ use crate::replica::{Replica, ReplicaRef, send_missing};
 fn ack_key(conv: &ConvId) -> String { format!("net/dm_ack/{}", conv.to_hex()) }
 
 fn name_key(conv: &ConvId) -> String { format!("net/dm_name/{}", conv.to_hex()) }
+
+/// The contact's announced avatar: postcard `Option<ImageRef>`.
+fn avatar_key(conv: &ConvId) -> String { format!("net/dm_avatar/{}", conv.to_hex()) }
 
 /// The live connection to a contact.
 #[derive(Debug)]
@@ -71,6 +76,9 @@ struct DmPeer {
     /// The display name the contact announced (validated), once kv was read.
     name: Option<String>,
     name_loaded: bool,
+    /// The avatar the contact announced (validated), once kv was read.
+    avatar: Option<ImageRef>,
+    avatar_loaded: bool,
     /// Reachability probes that failed in a row, and when the last one failed.
     probe_failures: usize,
     probe_failed_at: Option<Instant>,
@@ -121,6 +129,8 @@ struct DmGates {
     call_invite: Buckets<UserId>,
     call_state: Buckets<UserId>,
     profile: Buckets<UserId>,
+    /// Avatar changes per contact, budgeted like names.
+    avatar: Buckets<UserId>,
     /// New events applied per contact (`DM_EVENTS_BURST`).
     events: Buckets<UserId>,
     /// New events applied in a stranger's conversation (`DM_UNANSWERED_BURST`).
@@ -137,6 +147,7 @@ impl Default for DmGates {
             call_invite: Buckets::new(CALL_INVITE_EVERY, CALL_INVITE_BURST),
             call_state: Buckets::new(CALL_STATE_EVERY, CALL_STATE_BURST),
             profile: Buckets::new(DM_PROFILE_EVERY, DM_PROFILE_BURST),
+            avatar: Buckets::new(DM_PROFILE_EVERY, DM_PROFILE_BURST),
             events: Buckets::new(DM_EVENTS_EVERY, DM_EVENTS_BURST),
             unanswered: Buckets::new(DM_UNANSWERED_EVERY, DM_UNANSWERED_BURST),
             event_bytes: Buckets::rate(DM_BYTES_PER_S, DM_BYTES_BURST),
@@ -519,6 +530,84 @@ impl DmManager {
         }
     }
 
+    /// My avatar changed: announce it on every DM connection.
+    pub fn broadcast_avatar(&self, net: &Inner) {
+        let image = net.cfg.read().avatar.clone();
+        let Some(b) = link::encode(&Ctl::DmAvatar { image }) else { return };
+        for p in self.peers.lock().values() {
+            if let Some(l) = &p.link {
+                let _ = l.live.try_send(b.clone());
+            }
+        }
+    }
+
+    /// Read the persisted announced avatar of `conv`'s contact into `p` (once).
+    fn load_avatar(net: &Inner, conv: &ConvId, p: &mut DmPeer) {
+        if p.avatar_loaded {
+            return;
+        }
+        p.avatar_loaded = true;
+        if let Ok(Some(v)) = net.storage.get_kv(&avatar_key(conv))
+            && let Ok(Some(img)) = postcard::from_bytes::<Option<ImageRef>>(&v)
+            && validate_image_ref(&img).is_ok()
+        {
+            p.avatar = Some(img);
+        }
+    }
+
+    /// The avatar `peer` announced in `conv`.
+    pub fn peer_avatar(&self, net: &Inner, conv: &ConvId, peer: &UserId) -> Option<ImageRef> {
+        let mut peers = self.peers.lock();
+        let p = peers.entry(*peer).or_default();
+        Self::load_avatar(net, conv, p);
+        p.avatar.clone()
+    }
+
+    /// `peer` announced `image` as its avatar. Kept if valid, new and within the profile
+    /// budget (its own, sized like names); stored and announced to the app when the conversation
+    /// exists (`stored`), otherwise kept in memory until the stranger's first message opens it.
+    fn note_avatar(&self, net: &Inner, peer: &UserId, conv: &ConvId, image: Option<ImageRef>, stored: bool) {
+        if image.as_ref().is_some_and(|i| validate_image_ref(i).is_err()) {
+            tracing::debug!(peer = %peer.short(), "ignoring an invalid DM avatar");
+            return;
+        }
+        {
+            let mut peers = self.peers.lock();
+            let p = peers.entry(*peer).or_default();
+            Self::load_avatar(net, conv, p);
+            if p.avatar == image {
+                return;
+            }
+            if !self.gates.lock().avatar.take(peer, Instant::now()) {
+                return;
+            }
+            p.avatar = image.clone();
+        }
+        if stored {
+            Self::persist_avatar(net, peer, conv, image);
+        }
+    }
+
+    /// A stranger's conversation was just opened: store the avatar they announced before.
+    fn flush_avatar(&self, net: &Inner, peer: &UserId, conv: &ConvId) {
+        let image = self.peers.lock().get(peer).and_then(|p| p.avatar.clone());
+        if image.is_some() {
+            Self::persist_avatar(net, peer, conv, image);
+        }
+    }
+
+    fn persist_avatar(net: &Inner, peer: &UserId, conv: &ConvId, image: Option<ImageRef>) {
+        match postcard::to_stdvec(&image) {
+            Ok(v) => {
+                if let Err(e) = net.storage.set_kv(&avatar_key(conv), &v) {
+                    tracing::warn!(error = %e, "persisting a DM avatar failed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "encoding a DM avatar failed"),
+        }
+        net.emit(NetEvent::DmAvatarChanged { conv: *conv, peer: *peer, image });
+    }
+
     /// Read the persisted announced name of `conv`'s contact into `p` (once).
     fn load_name(net: &Inner, conv: &ConvId, p: &mut DmPeer) {
         if p.name_loaded {
@@ -653,6 +742,10 @@ impl DmManager {
         }
         if let Some(name) = my_name(net) {
             let _ = new_link.send(&Ctl::DmProfile { name });
+        }
+        let avatar = net.cfg.read().avatar.clone();
+        if avatar.is_some() {
+            let _ = new_link.send(&Ctl::DmAvatar { image: avatar });
         }
         self.bump();
         net.media.dm_link(net, peer);
@@ -1051,6 +1144,10 @@ async fn run_conn(
                             net.dm.note_name(&net, &peer, &conv, name, false);
                             continue;
                         }
+                        if let Ctl::DmAvatar { image } = &ctl {
+                            net.dm.note_avatar(&net, &peer, &conv, image.clone(), false);
+                            continue;
+                        }
                         replica = stranger_frame(&net, &peer, &conv, &ctl);
                         if replica.is_none() {
                             if is_extra(&ctl) && net.dm.allow(&peer, &ctl) {
@@ -1137,6 +1234,7 @@ fn stranger_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, ctl: &Ctl) -> 
         Ok(_) => {
             net.dm.strangers.lock().remove(peer);
             net.dm.flush_name(net, peer, conv);
+            net.dm.flush_avatar(net, peer, conv);
             net.replica(conv)
         }
         Err(e) => {
@@ -1197,6 +1295,7 @@ fn on_frame(net: &Arc<Inner>, peer: &UserId, conv: &ConvId, replica: &ReplicaRef
         }
         Ctl::DmHello { heads, .. } => on_heads(net, peer, conv, replica, link, sync, heads),
         Ctl::DmProfile { name } => net.dm.note_name(net, peer, conv, &name, true),
+        Ctl::DmAvatar { image } => net.dm.note_avatar(net, peer, conv, image, true),
         // A watching contact's keepalive; receiving it already restarted the idle timer.
         Ctl::Tick { .. } => {}
         other if is_extra(&other) => {

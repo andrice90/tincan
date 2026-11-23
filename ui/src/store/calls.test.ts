@@ -48,14 +48,14 @@ test("UI-LOGIC-09: an active call without a voice session still gets a Hang up p
 });
 
 test("UI-LOGIC-13: the volume slider starts at the saved volume, not 100%", () => {
-  const p = { userId: "alex", name: "Alex", muted: false, deafened: false, speaking: false, screenTrack: null, volume: 0.3 };
+  const p = { userId: "alex", name: "Alex", muted: false, deafened: false, speaking: false, avatar: null, screenTrack: null, volume: 0.3 };
   eq(initialVolume(undefined, p), 0.3, "saved by the app");
   eq(initialVolume(0.8, p), 0.8, "moved in this session");
   eq(initialVolume(undefined, { ...p, volume: 1 }), 1, "never changed");
 });
 
 test("REGRESSION-4: a tile whose saved volume is not known shows no slider", () => {
-  const p = { userId: "jordan", name: "Jordan", muted: false, deafened: false, speaking: false, screenTrack: null, volume: null };
+  const p = { userId: "jordan", name: "Jordan", muted: false, deafened: false, speaking: false, avatar: null, screenTrack: null, volume: null };
   eq(initialVolume(undefined, p), null, "a room you have not joined: no made-up 100%");
   eq(initialVolume(0.5, p), 0.5, "moved in this session");
 });

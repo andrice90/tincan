@@ -11,6 +11,7 @@ function server(id: string, hostName: string | null): ServerSummary {
     connection: { state: "member", hostId: "alice", hostName, path: "direct", rttMs: 1 },
     unread: false,
     onlineCount: 2,
+    icon: null,
   };
 }
 

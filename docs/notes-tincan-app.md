@@ -8,6 +8,7 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 |---|---|
 | `lib.rs` | Frozen surface: `App` wraps `Arc<Core>`, plus the test hooks |
 | `app.rs` | `Core`: every subsystem and cache, `start` and `shutdown`, conversation membership for the access check, what to announce, `set_name` and Profile publishing, `net_err` |
+| `images.rs` | Avatars and server icons: `set_avatar`, `set_server_icon`, `ensure_avatar`, image URLs for the DTOs, fetch and read-back check (`ImgState`) |
 | `index.rs` | The hash index (`HashInfo`: references and shares per hash), its kv encoding, the bounded cache, and `Access` / `Policy`, the per (peer, hash) rule the blobs provider applies |
 | `profile.rs` | Profile directory layout, the lock file, `identity.key`, the display-name kv key |
 | `settings.rs` | `Settings` defaults, validation (`normalize`), load and save |
@@ -36,6 +37,7 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 - Other kv keys:
   - `app/att/<hash>`: the hash index record (`index.rs`): up to 8 references (conv, DM flag, author, name, declared size, mime) and up to 16 conversations the blob is shared with. Written whenever a message referencing the hash is seen (pages, live events, history sync), a file is sent, a download completes, or a clip is played. A record from before this format (one origin) reads as one reference plus a share with that conversation.
   - `app/refused2/<hash>`: the proven size of an attachment tincan-files refused (`TooLarge`). Auto-fetch and `download` never ask for it again. Rows under the old `app/refused/` key were written from a provider's unproven claim and are ignored.
+  - `app/avatar`: my avatar (JSON hash, size, MIME); an empty value means none.
   - `app/export/<hash>`: the exported path, so `open_file` reuses an export that still exists with the right size.
 
 ## Startup
@@ -113,6 +115,8 @@ Rules from api.md and the task:
 | `RosterUpdated` | `server-updated`, `members-updated`, DM online states; holders re-queried for parked downloads. The refresh is skipped when nothing the UI shows changed (`RosterSig`: online users, voice room, muted, deafened, sharing, host; not RTT buckets, addresses or revisions); a changed address still re-queries parked downloads |
 | `ConnectionChanged` | `server-updated`, `members-updated`; on a new state or host also DM online states, a fresh roster comparison and (as member) the start of the server's history sync |
 | `SyncComplete` | ends the conversation's bulk window at once (one refresh plus the `snapshot`) |
+| `DmAvatarChanged` | `dm-updated` and the call or voice DTO for that contact (the avatar is fetched when the DM summary is built) |
+| `FileEvent::Completed` (image) | queues the read-back check; a passing check refreshes what shows the image |
 | `DmNameChanged` | `dm-updated`, the contact record's name, `call-updated` / `voice-updated` when they show the contact (no `snapshot`: a peer can send names often) |
 | `ConvUpdated` + `Channels` deleting my voice room | `Media::on_channels`: I leave the room ("The voice room was deleted.") |
 | `Typing` | `typing` (`channelId` null for DMs), never for my own typing |
@@ -183,6 +187,14 @@ Throttling:
 - **URLs:**
   - `file_url` returns `file_url_base + hashHex` once the blob is complete.
   - `file_for_url` reads at most 25 MiB and hands the store's buffer over without a second copy (`Vec::from(Bytes)`). The MIME is sniffed from magic bytes for common images, else the type of the cleaned file name if that is a raster image, audio or video (never the peer's declared type). Everything else, SVG and HTML included, is served as `application/octet-stream`, so nothing runs script on the app origin.
+
+## Avatars and server icons (`images.rs`)
+
+- **Upload:** `set_avatar { bytes | null }` and `set_server_icon { serverId, bytes | null }` run `tincan_core::image::inspect` on the bytes (never trusting the UI), import them as `BlobKind::Image` and mark them checked. My avatar is saved in kv `app/avatar` (JSON), given to `Net::set_avatar` (DM contacts) and published as `ProfileImage` in every server where the state differs (`ensure_avatar`, one publish in flight per server, again on each connection, like `ensure_profile`). An icon is indexed with me as author, shared with its server and published as `ServerIcon`.
+- **URLs:** `image_url(conv, dm, author, img)` returns the file URL only for an image in state `ImgState::Ok`: held, at most 64 KiB (`Files::held_size`) and read back through `inspect`. Otherwise it indexes the image as a reference (`AttRef` named `image.png` / `image.webp`) and queues `FetchReq::Image` once per session (`Core::images`, 4096 hashes). The worker downloads it as `BlobKind::Image` from the author and the holders, or checks it when already held; completion (`FileEvent::Completed` with the image kind) queues the check, and a passing check refreshes every conversation referencing the hash, the DMs, the voice DTO and, for my avatar, the snapshot. `TooLarge` marks it `Bad`; `Failed` forgets it so the next DTO retries. Image transfers emit no `transfer-updated`.
+- **Which image:** only the current one per member and server (DTOs are built from the state), so a history sync full of old avatars fetches nothing old. A DM contact's avatar is the one they announced over the DM (`Net::dm_peer_avatar`, referenced in the DM conversation), else their avatar in any shared server.
+- **Access:** see Blob access. My own current avatar is open to every peer allowed to connect (`Access::set_own_avatar`), loaded at start from kv.
+- **Tests:** `index::tests::my_avatar_goes_to_my_peers_only`, e2e `avatars_and_icons_travel_and_follow_access` (upload checks, a member fetches and shows the avatar and the icon, a DM shows the contact's avatar, a newcomer gets the avatar from a member while its author is offline, naming a DM-only blob as an avatar still gets it refused, removal) and `a_dm_only_contact_shows_their_avatar` (no shared server: the avatar comes over `DmAvatar`, is fetched from the contact and goes away when they remove it).
 
 ## Blob access
 

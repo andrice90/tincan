@@ -16,6 +16,8 @@ export interface Me {
   /** "tincan1u" + userId, for "Copy my ID". */
   userCode: string;
   name: string;
+  /** My avatar (an `http://tincan.localhost/file/<hash>` URL), null when I have none. */
+  avatar: string | null;
 }
 
 export type HostState =
@@ -45,6 +47,8 @@ export interface ServerSummary {
   unread: boolean;
   /** Members currently online (including me). */
   onlineCount: number;
+  /** Server icon URL once this device holds and checked it; null otherwise. */
+  icon: string | null;
 }
 
 export type ChannelKind = "text" | "voice";
@@ -71,6 +75,8 @@ export interface Member {
   deafened: boolean;
   sharing: boolean;
   speaking: boolean;
+  /** Avatar URL once this device holds and checked it; null shows the coloured initial. */
+  avatar: string | null;
 }
 
 export interface Attachment {
@@ -119,6 +125,8 @@ export interface DmSummary {
   online: boolean;
   unread: boolean;
   lastMessageAt: number | null;
+  /** Their avatar URL (announced over the DM or from a shared server); null when none yet. */
+  avatar: string | null;
 }
 
 export interface VoiceParticipant {
@@ -127,6 +135,8 @@ export interface VoiceParticipant {
   muted: boolean;
   deafened: boolean;
   speaking: boolean;
+  /** Avatar URL once this device holds and checked it; null shows the coloured initial. */
+  avatar: string | null;
   /** Present while they share their screen. */
   screenTrack: number | null;
   /** How loud they are for me (0..2, saved per user; 1 for me). */
@@ -221,6 +231,11 @@ export interface AppSnapshot {
 export interface Commands {
   app_snapshot: { args: {}; result: AppSnapshot };
   set_name: { args: { name: string }; result: Me };
+  /**
+   * My avatar: PNG or WebP bytes (at most 64 KB, at most 256x256; the UI sends 128x128),
+   * or null to remove it. The app checks the bytes again and publishes the image.
+   */
+  set_avatar: { args: { bytes: number[] | null }; result: Me };
 
   create_server: { args: { name: string }; result: ServerSummary };
   /** Invite code ("tincan1...") valid for 7 days, unlimited uses. */
@@ -228,6 +243,8 @@ export interface Commands {
   join_server: { args: { invite: string }; result: ServerSummary };
   leave_server: { args: { serverId: ServerId }; result: null };
   rename_server: { args: { serverId: ServerId; name: string }; result: null };
+  /** Owner only. Same bytes rules as `set_avatar`; null removes the icon. */
+  set_server_icon: { args: { serverId: ServerId; bytes: number[] | null }; result: ServerSummary };
 
   channels: { args: { serverId: ServerId }; result: Channel[] };
   create_channel: { args: { serverId: ServerId; name: string; kind: ChannelKind }; result: Channel };

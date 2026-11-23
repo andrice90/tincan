@@ -152,6 +152,7 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
             muted: voice.muted,
             deafened: voice.deafened,
             speaking: false,
+            avatar: me.avatar,
             screenTrack: null,
             volume: 1,
           },
@@ -285,7 +286,7 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
               {inside.map((m) => (
                 <Tile
                   key={m.userId}
-                  p={{ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, speaking: m.speaking, screenTrack: null, volume: null }}
+                  p={{ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, speaking: m.speaking, avatar: m.avatar, screenTrack: null, volume: null }}
                   isMe={false}
                   sharing={m.sharing}
                 />

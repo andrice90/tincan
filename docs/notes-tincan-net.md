@@ -276,3 +276,7 @@ Idle cost:
 - During the 30 s a retired probe link stays open, the probed host lists the prober as one of its online members.
 - An admission of a new member (by any author) that arrives while its author's chain at the host is stuck behind an event waiting in the pending buffer is not the next seq, so it and the rest of that author's events in the batch are held back; the host asks a member for a resend after a minute (on a probe link a later sync brings them).
 - Rendezvous: holders of `server_secret`, ex-members included, can still write the record. With far-future values ignored, the worst they can do is make DHT puts fail (BEP44 keeps the highest seq), so rendezvous degrades to the relay copy and cached peers. This lasts until secret rotation exists.
+
+## Avatars on DM connections
+
+`NetConfig.avatar` and `Net::set_avatar(Option<ImageRef>)`: the avatar goes out as `Ctl::DmAvatar` right after `DmProfile` when a DM connection opens (only when I have one) and on every open connection when it changes (a clear included). Received ones are validated (`image::validate_image_ref`), budgeted per contact by their own bucket (3, then one per 5 s), persisted in kv `net/dm_avatar/<conv>` (postcard `Option<ImageRef>`) and announced as `NetEvent::DmAvatarChanged`; read them with `Net::dm_peer_avatar(conv)`. A stranger's avatar stays in memory until their first message opens the conversation, like their name. Test: `tests_dm::dm_avatars_are_announced_checked_and_kept`.

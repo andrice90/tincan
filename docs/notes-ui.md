@@ -145,3 +145,11 @@ Tasks for the owner:
 
 - [x] `crates/tincan-app`: the toasts and error texts the UI shows come from the app (mirrored in `src/api/mock.ts`) and were outside this pass. Checked afterwards: one passive toast reworded ("Audio stopped working, so Tincan restarted it.").
 - [x] `docs/HANDOFF.md`: mark "unslop-ui pass on the UI" done.
+
+## Avatars and server icons
+
+- `Avatar` (components/common.tsx) looks the user's picture up itself (`useAvatarUrl`, built by `lib/avatars.ts` from members, DMs, voice participants and me; mine wins and a removal shows at once). The image sits over the coloured initial, loads lazily at the avatar size and hides itself on error, so the initial shows. The rail shows `ServerSummary.icon` the same way.
+- Picking: `pickImageFor(target, back)` (store/actions.ts) clicks a temporary `<input type="file">`, which opens the native Windows picker in WebView2. The dialog plugin was not used: it returns a path, and the webview cannot read a path's pixels without a new file-read command or asset scope. Playwright can drive the input through its file chooser.
+- `CropImageDialog` (dialogs/) crops on a canvas. The maths (cover scale, clamping, zoom around a focus point, crop rect, arrow-key nudges) and the encode policy (WebP 0.9 down to 0.25, then PNG at 128, 112, 96, 80 and 64 px, each under 64 KB) are pure functions in `lib/crop.ts`, tested in `lib/crop.test.ts`. `back` reopens Settings after the dialog closes. The Modal's native `<dialog>` gives the focus trap and Escape.
+- The mock serves sample SVG data URLs (Jordan, Alex, the Game night icon) and turns uploaded bytes into data URLs; the real app never serves SVG.
+- unslop-ui final pass on the avatar and crop UI: light; one app error gained its next step ("That image file is damaged." → "That image file is damaged. Pick another one.").

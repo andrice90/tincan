@@ -1,10 +1,10 @@
 // Channel list for one server: header with host state and server menu, text
 // channels, voice rooms with the people inside.
 
-import { ChevronDown, Hash, HeadphoneOff, LogOut, MessageSquare, MicOff, Monitor, Pencil, Plus, Trash2, UserPlus, Volume2 } from "lucide-react";
+import { ChevronDown, Hash, HeadphoneOff, Image as ImageIcon, ImageOff, LogOut, MessageSquare, MicOff, Monitor, Pencil, Plus, Trash2, UserPlus, Volume2 } from "lucide-react";
 import { memo, useMemo, useRef, type MouseEvent, type ReactNode } from "react";
 import type { Channel, Connection, Member, ServerSummary, VoiceSession } from "../api/types";
-import { openDialog, openRoomChat, selectChannel } from "../store/actions";
+import { openDialog, openRoomChat, pickImageFor, removeServerIcon, selectChannel } from "../store/actions";
 import { roomChatMode } from "../store/chatView";
 import { useStore } from "../store/store";
 import { unreadBadge } from "../lib/unread";
@@ -52,6 +52,12 @@ export function ChannelSidebar({ server }: { server: ServerSummary }) {
   if (server.isOwner) {
     items.push(
       { label: "Rename server", icon: <Pencil size={ICON_SM} />, onSelect: () => openDialog({ kind: "rename-server", serverId: server.id }) },
+      { label: "Change icon", icon: <ImageIcon size={ICON_SM} />, onSelect: () => pickImageFor({ kind: "server-icon", serverId: server.id }) },
+    );
+    if (server.icon) {
+      items.push({ label: "Remove icon", icon: <ImageOff size={ICON_SM} />, onSelect: () => removeServerIcon(server.id) });
+    }
+    items.push(
       {
         label: "Create channel",
         icon: <Plus size={ICON_SM} />,

@@ -28,9 +28,11 @@
 //! 4. Self-contained body rules (`Reject`): names non-empty, at most `MAX_NAME_CHARS`, no
 //!    control characters; Message text at most `MAX_TEXT_CHARS` chars, at most
 //!    `MAX_ATTACHMENTS`, not empty; `MemberLeave.last_seq`
-//!    is `seq - 1` or `seq`; `MemberAdmit.from_seq >= 1`.
-//! 5. Servers: no Genesis applied yet -> `Gap`. ChannelCreate / ChannelUpdate / ServerUpdate:
-//!    owner only (`Reject`).
+//!    is `seq - 1` or `seq`; `MemberAdmit.from_seq >= 1`; `ProfileImage` / `ServerIcon`
+//!    images pass `image::validate_image_ref` (1 byte to 64 KiB, WebP or PNG); the reserved
+//!    body at index 11 is always rejected.
+//! 5. Servers: no Genesis applied yet -> `Gap`. ChannelCreate / ChannelUpdate / ServerUpdate /
+//!    ServerIcon: owner only (`Reject`). `ProfileImage` sets the author's own avatar.
 //! 6. Membership: the author must be a member at `ev.seq`: some admission (the owner's Genesis
 //!    counts as an admission from seq 1, `MemberAdmit{user=author}` from `from_seq`) with
 //!    `from_seq <= ev.seq` and `from_seq > last_seq` of the author's latest `MemberLeave`.
@@ -77,7 +79,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 
-use crate::event::{Attachment, Body, ChannelKind, Event, StoredEvent};
+use crate::event::{Attachment, Body, ChannelKind, Event, ImageRef, StoredEvent};
+use crate::image::validate_image_ref;
 use crate::hlc::hlc_ms;
 use crate::sync::Heads;
 use crate::wire::RejectCode;
@@ -160,12 +163,18 @@ pub struct Member {
     pub last_leave: Option<u64>,
     /// Lowest hlc among the events that admitted the user (Genesis for the owner).
     pub admitted_hlc: u64,
+    /// Latest `ProfileImage` (by hlc), None until set or after it was cleared.
+    pub avatar: Option<ImageRef>,
+    /// hlc of the `ProfileImage` that set `avatar`.
+    pub avatar_hlc: u64,
 }
 
 impl Member {
     fn new(user: UserId, admitted_hlc: u64) -> Self {
         Self {
             user,
+            avatar: None,
+            avatar_hlc: 0,
             name: String::new(),
             name_hlc: 0,
             admitted_from_seq: 0,
@@ -315,6 +324,8 @@ pub struct ConvState {
     pub name: String,
     /// Server owner (Genesis author), None until Genesis is applied.
     pub owner: Option<UserId>,
+    /// Server icon (latest `ServerIcon`), None until set or after it was cleared.
+    pub icon: Option<ImageRef>,
     /// Channels by id, deleted ones included.
     pub channels: BTreeMap<ChannelId, Channel>,
     /// Members, former ones included.
@@ -338,6 +349,7 @@ impl ConvState {
             dm_parties: Vec::new(),
             name: String::new(),
             owner: None,
+            icon: None,
             channels: BTreeMap::new(),
             members: HashMap::new(),
             invites: HashMap::new(),
@@ -600,7 +612,9 @@ impl ConvState {
             return if mode == Mode::Forced { reject("no genesis") } else { Verdict::Gap };
         };
         let by_owner = ev.author == owner;
-        if matches!(ev.body, Body::ChannelCreate { .. } | Body::ChannelUpdate { .. } | Body::ServerUpdate { .. }) && !by_owner {
+        if matches!(ev.body, Body::ChannelCreate { .. } | Body::ChannelUpdate { .. } | Body::ServerUpdate { .. } | Body::ServerIcon { .. })
+            && !by_owner
+        {
             return reject("only the owner can change channels or the server");
         }
         // 6. membership
@@ -610,9 +624,15 @@ impl ConvState {
         }
         // 7. references
         match &ev.body {
-            Body::Genesis { .. } | Body::Profile { .. } | Body::ChannelCreate { .. } | Body::ServerUpdate { .. } | Body::MemberLeave { .. } => {
-                Verdict::Accept
-            }
+            Body::Genesis { .. }
+            | Body::Profile { .. }
+            | Body::ChannelCreate { .. }
+            | Body::ServerUpdate { .. }
+            | Body::MemberLeave { .. }
+            | Body::ProfileImage { .. }
+            | Body::ServerIcon { .. } => Verdict::Accept,
+            // Refused by `check_shape` before this point.
+            Body::ReservedMemberRemove => reject("reserved event type"),
             Body::ChannelUpdate { channel, .. } => {
                 if self.channels.contains_key(channel) {
                     Verdict::Accept
@@ -692,6 +712,8 @@ impl ConvState {
                     Err("leave last_seq must be this seq or the one before".into())
                 }
             }
+            Body::ProfileImage { image } | Body::ServerIcon { image } => image.as_ref().map_or(Ok(()), validate_image_ref),
+            Body::ReservedMemberRemove => Err("reserved event type".into()),
         }
     }
 
@@ -780,6 +802,20 @@ impl ConvState {
                 }
                 Change::Members
             }
+            Body::ProfileImage { image } => match self.members.get_mut(&ev.author) {
+                Some(m) if ev.hlc >= m.avatar_hlc => {
+                    m.avatar = image.clone();
+                    m.avatar_hlc = ev.hlc;
+                    Change::Members
+                }
+                _ => Change::Nothing,
+            },
+            Body::ServerIcon { image } => {
+                // Owner only, and one author's events apply in seq (and hlc) order.
+                self.icon = image.clone();
+                Change::ServerRenamed
+            }
+            Body::ReservedMemberRemove => Change::Nothing,
         }
     }
 }

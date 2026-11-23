@@ -724,4 +724,23 @@ mod tests {
         assert_eq!(d.admit(crate::MAX_CLIP_BYTES + 1), Admit::Refused(Kinds::of(BlobKind::Clip)));
         assert_eq!(d.info(BlobHash::from_bytes([0; 32])).state, TransferState::TooLarge);
     }
+
+    /// An avatar or icon download is refused past 64 KiB, so naming a large blob as an image
+    /// cannot make everyone fetch it.
+    #[test]
+    fn an_image_request_is_refused_past_64_kib() {
+        assert_eq!(BlobKind::Image.max_size(), 64 * 1024);
+        assert_eq!(BlobKind::Image.tag_name(&BlobHash::from_bytes([0xab; 32])), format!("img-{}", "ab".repeat(32)));
+        let mut d = Download::new(1, BlobKind::Image, Arc::new(Notify::new()));
+        assert_eq!(d.admit(crate::MAX_IMAGE_BYTES), Admit::Ok);
+        assert_eq!(d.admit(crate::MAX_IMAGE_BYTES + 1), Admit::Refused(Kinds::of(BlobKind::Image)));
+        assert_eq!(d.state, TransferState::TooLarge);
+        // Merged with an attachment request, only the image kind is dropped.
+        let mut d = Download::new(1, BlobKind::Image, Arc::new(Notify::new()));
+        d.kinds.insert(BlobKind::Attachment);
+        assert_eq!(d.admit(crate::MAX_IMAGE_BYTES + 1), Admit::Dropped(Kinds::of(BlobKind::Image)));
+        let k = Kinds::of(BlobKind::Image);
+        assert!(k.has(BlobKind::Image) && !k.is_empty());
+        assert_eq!(k.iter().collect::<Vec<_>>(), vec![BlobKind::Image]);
+    }
 }

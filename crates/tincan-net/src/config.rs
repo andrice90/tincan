@@ -48,6 +48,9 @@ pub struct NetConfig {
     /// The local user's display name, used for the owner Profile of new servers and the
     /// Profile event of a join. Change it with `Net::set_display_name`.
     pub display_name: String,
+    /// The local user's avatar, announced to DM contacts (`Ctl::DmAvatar`). Change it with
+    /// `Net::set_avatar`. Servers learn it from the `ProfileImage` event the app publishes.
+    pub avatar: Option<tincan_core::event::ImageRef>,
     /// Publish and resolve the rendezvous record (pkarr relay and mainline DHT). Always off
     /// when `relay` is `RelayChoice::Disabled`, so tests and LAN-only setups make no
     /// rendezvous traffic at all.
@@ -68,6 +71,7 @@ impl Default for NetConfig {
             allow_hosting: true,
             bind_addr: None,
             display_name: "Anonymous".to_string(),
+            avatar: None,
             rendezvous: true,
         }
     }

@@ -15,6 +15,8 @@ pub struct Me {
     pub user_code: String,
     /// Display name.
     pub name: String,
+    /// Avatar URL (`http://tincan.localhost/file/<hash>`), null when none.
+    pub avatar: Option<String>,
 }
 
 /// `HostState`.
@@ -79,6 +81,8 @@ pub struct ServerSummary {
     pub unread: bool,
     /// Members online, me included.
     pub online_count: u32,
+    /// Server icon URL once held and checked, else null.
+    pub icon: Option<String>,
 }
 
 /// `ChannelKind`.
@@ -133,6 +137,8 @@ pub struct Member {
     pub sharing: bool,
     /// Speaking right now.
     pub speaking: bool,
+    /// Avatar URL once held and checked, else null.
+    pub avatar: Option<String>,
 }
 
 /// `Attachment`.
@@ -249,6 +255,8 @@ pub struct DmSummary {
     pub unread: bool,
     /// Newest message time.
     pub last_message_at: Option<u64>,
+    /// Their avatar URL once held and checked, else null.
+    pub avatar: Option<String>,
 }
 
 /// `VoiceParticipant`.
@@ -265,6 +273,8 @@ pub struct VoiceParticipant {
     pub deafened: bool,
     /// Speaking.
     pub speaking: bool,
+    /// Avatar URL once held and checked, else null.
+    pub avatar: Option<String>,
     /// Screen track while sharing.
     pub screen_track: Option<u16>,
     /// How loud they play for me (0..2, saved per user; 1 for me).

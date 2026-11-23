@@ -72,3 +72,11 @@ None of these changes a signature.
   - `ConvState` derives `PartialEq, Eq`.
   - `Storage::insert_events` (a provided method, so existing implementations still compile).
   - `Ctl::DmProfile { name }`, appended as variant 39: the sender's display name on a DM connection. `within_limits` drops names over `4 * MAX_NAME_CHARS` bytes; receivers also run `state::validate_name` on the trimmed name. Peers that predate it skip the frame, since `FrameDecoder` consumes undecodable frames. Putting the name into `DmHello` instead was not done: postcard is not self-describing, so a 4-field `DmHello` cannot decode an old 3-field one.
+
+## Avatars and server icons
+
+- `Body::ProfileImage { image: Option<ImageRef> }` (index 12) sets the author's own avatar; `Body::ServerIcon { image }` (index 13) is owner only. `None` clears. `ImageRef { hash, size, mime }` is checked by `image::validate_image_ref`: 1 byte to `image::MAX_IMAGE_BYTES` (64 KiB), MIME `image/webp` or `image/png`. Both are rejected in DMs.
+- `ProfileImage` applies like `Profile` (latest hlc wins, `Change::Members`); `ServerIcon` returns `Change::ServerRenamed` (the server summary changed). State: `Member.avatar` / `avatar_hlc`, `ConvState.icon`.
+- Index 11 is `Body::ReservedMemberRemove`, a placeholder every replica rejects. It only keeps the image bodies at 12 and 13 while `MemberRemove` is built on another branch; drop it at that merge. A build without these variants cannot decode events 12 and 13 (postcard), so it treats them as unverifiable: an older host refuses such a publish (the author's chain then waits at that host) and drops a member whose `Events` carry one ("sent an event with a bad signature"); an older member never applies them. Every member of a server needs this build before anyone sets an avatar or icon.
+- `image::inspect(bytes)` is what an app runs before publishing: magic bytes (PNG or WebP only), size, and width and height from the PNG IHDR or the WebP VP8, VP8L or VP8X header (1 to 256 pixels). Nothing is decoded.
+- `Ctl::DmAvatar { image }` is appended as variant 40 (`within_limits`: MIME at most 32 bytes). Other branches that append `Ctl` variants may collide at 40; the wire test pins it.

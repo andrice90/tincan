@@ -395,6 +395,13 @@ pub enum Ctl {
         /// The sender's display name.
         name: String,
     },
+    /// DM connections: the sender's avatar (`None`: no avatar). Sent like `DmProfile`, after
+    /// it. Receivers keep it only if `image::validate_image_ref` passes. Peers that predate
+    /// this variant skip the frame.
+    DmAvatar {
+        /// The sender's avatar, or none.
+        image: Option<crate::event::ImageRef>,
+    },
 }
 
 /// Longest soundboard clip name, in chars (same as other names).
@@ -475,6 +482,7 @@ impl Ctl {
             Ctl::HostCompare2 { attests, .. } => attests.len() <= MAX_ATTESTS,
             Ctl::SyncHave { heads } | Ctl::SyncHavePart { heads, .. } => heads.0.len() <= 4 * HEADS_PER_FRAME,
             Ctl::DmProfile { name } => name.len() <= 4 * crate::state::MAX_NAME_CHARS,
+            Ctl::DmAvatar { image } => image.as_ref().is_none_or(|i| i.mime.len() <= 32),
             _ => true,
         }
     }
@@ -748,6 +756,18 @@ mod tests {
         assert_eq!(idx(&Ctl::CallState { call_id: 0, muted: false, deafened: false, sharing: None }), 35);
         assert_eq!(idx(&Ctl::SyncHavePart { heads: Heads::default(), more: false }), 38);
         assert_eq!(idx(&Ctl::DmProfile { name: String::new() }), 39);
+        assert_eq!(idx(&Ctl::DmAvatar { image: None }), 40);
+    }
+
+    #[test]
+    fn dm_avatar_round_trips_and_is_bounded() {
+        let img = crate::event::ImageRef { hash: BlobHash([4; 32]), size: 900, mime: "image/png".into() };
+        for msg in [Ctl::DmAvatar { image: Some(img.clone()) }, Ctl::DmAvatar { image: None }] {
+            let f = encode_frame(&msg).unwrap();
+            assert_eq!(decode_body(&f[4..]).unwrap(), msg);
+            assert!(msg.within_limits());
+        }
+        assert!(!Ctl::DmAvatar { image: Some(crate::event::ImageRef { mime: "x".repeat(33), ..img }) }.within_limits());
     }
 
     #[test]

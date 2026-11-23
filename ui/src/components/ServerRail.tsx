@@ -6,6 +6,7 @@ import type { ServerSummary } from "../api/types";
 import { initials } from "../lib/format";
 import { openDms, openHome, selectServer } from "../store/actions";
 import { useStore } from "../store/store";
+import { AvatarImage } from "./common";
 
 const ServerButton = memo(function ServerButton({ server, selected }: { server: ServerSummary; selected: boolean }) {
   return (
@@ -18,6 +19,7 @@ const ServerButton = memo(function ServerButton({ server, selected }: { server: 
       onClick={() => selectServer(server.id)}
     >
       {initials(server.name)}
+      {server.icon && <AvatarImage key={server.icon} src={server.icon} alt="" size={44} className="rail-icon" />}
       {server.unread && !selected && <span className="rail-unread" />}
     </button>
   );
