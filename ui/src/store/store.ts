@@ -169,15 +169,19 @@ export function useStore<T>(selector: (s: State) => T): T {
   );
 }
 
-let nameMemo: { members: State["members"]; dms: State["dms"]; index: NameIndex } | null = null;
+let nameMemo: { members: State["members"]; dms: State["dms"]; me: State["me"]; index: NameIndex } | null = null;
 
-/** Display names of everyone the UI knows (all server members, DM contacts), rebuilt when those lists change. */
+/**
+ * Display names of everyone the UI knows (all server members, DM contacts, me), rebuilt when
+ * those lists change.
+ */
 function nameIndex(s: State): NameIndex {
-  if (nameMemo && nameMemo.members === s.members && nameMemo.dms === s.dms) return nameMemo.index;
+  if (nameMemo && nameMemo.members === s.members && nameMemo.dms === s.dms && nameMemo.me === s.me) return nameMemo.index;
   const people: { userId: UserId; name: string }[] = [];
   for (const list of Object.values(s.members)) people.push(...list);
   people.push(...s.dms);
-  nameMemo = { members: s.members, dms: s.dms, index: buildNameIndex(people) };
+  if (s.me) people.push(s.me);
+  nameMemo = { members: s.members, dms: s.dms, me: s.me, index: buildNameIndex(people) };
   return nameMemo.index;
 }
 

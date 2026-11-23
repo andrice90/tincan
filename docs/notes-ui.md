@@ -23,7 +23,7 @@ Pure UI logic has dependency-free tests: from `ui/`, run `node --experimental-st
 | `store/typing.ts` | the typing list and its sweep timer (timers injected) |
 | `store/transfers.ts` | when a command's transfer result may replace the store's, which transfers a snapshot re-reads |
 | `store/clips.ts` | heard clip cap, the clip picker's formats |
-| `lib/names.ts` | short ids and name clashes |
+| `lib/names.ts` | short ids, name clashes and the lookalike fold |
 | `lib/compose.ts` | the composer box around a send |
 | `lib/scroll.ts` | the load-older scroll anchor |
 | `dialogs/settingsLogic.ts` | auto-download choices, Settings > Network status, the volume slider debounce |
@@ -62,7 +62,9 @@ Join errors: codes shorter than 40 chars, codes not starting with `tincan1`, `ti
 
 ## Names
 
-Display names are chosen by each peer and are not unique. When two people the UI knows (members of any server, DM contacts) use the same name, compared without case, width, spacing or invisible characters, both are shown with their short id (the first 8 characters of the user id, the app's fallback name) after the name: member list, DM list, DM header, message authors, voice tiles, room lists, incoming call. The member menu and the voice tile popover always show "ID <short id>". Peer names and ids render in `<bdi>`, so a name's bidi controls can't reorder the id. Nothing changes in text e2e matches unless two names clash.
+Display names are chosen by each peer and are not unique. When two people the UI knows (members of any server, DM contacts) use names that look the same, both are shown with their short id (the first 8 characters of the user id, the app's fallback name) after the name: member list, DM list, DM header, message authors, voice tiles, room lists, incoming call. The member menu and the voice tile popover always show "ID <short id>". Peer names and ids render in `<bdi>`, so a name's bidi controls can't reorder the id, and a long name is cut short with an ellipsis while the id after it stays whole (`.person` is an inline flex row). Nothing changes in text e2e matches unless two names clash.
+
+`nameKey` decides what "look the same" means: NFKD (width, ligatures, math letters), then default-ignorable and format characters (zero-width, bidi controls, variation selectors, Hangul fillers, soft hyphen) and combining marks (accents, overlays) are removed, Cyrillic, Greek, Armenian and a few Latin letters that look like a Latin letter are mapped to it (a UTS #39 confusables subset, mapped before lowercasing so Greek capital eta is H and small eta is n), then lowercase, 0 to o, and 1, l, i, I and | to l, and runs of spaces to one. It folds too much on purpose: two different names that fold together only get an extra short id. My own name is in the index too, so a contact named like me gets the id. Results are cached (bounded, names come from peers).
 
 ## Screen share (media/ScreenPlayer.ts)
 

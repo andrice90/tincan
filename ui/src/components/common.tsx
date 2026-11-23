@@ -37,15 +37,16 @@ export function SpeakingAvatar(props: Omit<AvatarProps, "speaking">) {
 
 /**
  * A peer-chosen display name, isolated so its bidi controls can't reorder the text around
- * it, followed by the short id when someone else the UI knows uses the same name.
+ * it, followed by the short id when someone else the UI knows uses a name that looks the
+ * same. A long name is cut short, never the id after it.
  */
 export function PersonName({ userId, name, you = false }: { userId: UserId; name: string; you?: boolean }) {
   return (
-    <>
-      <bdi>{name}</bdi>
-      {you && " (you)"}
+    <span className="person">
+      <bdi className="person-name">{name}</bdi>
+      {you && <span className="person-you"> (you)</span>}
       <IdSuffix userId={userId} name={name} />
-    </>
+    </span>
   );
 }
 

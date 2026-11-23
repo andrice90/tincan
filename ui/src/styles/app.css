@@ -12,6 +12,27 @@
   font-size: var(--fs-13);
 }
 
+/* A peer's display name: the name is cut short, the "(you)" and short id after it never are. */
+.person {
+  display: inline-flex;
+  align-items: baseline;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.person-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.person-you,
+.person .user-id {
+  flex: none;
+  white-space: pre;
+}
+
 /* Short id after a display name that someone else also uses. */
 .user-id {
   margin-left: var(--sp-2);
