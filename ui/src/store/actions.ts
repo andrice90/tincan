@@ -17,6 +17,7 @@ import type {
   UserId,
   VoiceSession,
 } from "../api/types";
+import { leaveCommand } from "./calls";
 import {
   convKey,
   getState,
@@ -641,14 +642,20 @@ export function joinVoice(serverId: ServerId, channelId: ChannelId): void {
   );
 }
 
-/** Leaves the voice room or hangs up the call. */
+/** Leaves the voice room or hangs up the call. A call ringing out from a room keeps ringing. */
 export function leaveVoice(): void {
   const s = getState();
-  if (s.voice?.kind === "call" || s.call) {
-    run(invoke("call_hangup", {}).then(() => patch({ voice: null, call: null, soundboardOpen: false, fullStage: false })));
-  } else if (s.voice) {
+  const cmd = leaveCommand(s.voice, s.call);
+  if (cmd === "voice_leave") {
     run(invoke("voice_leave", {}).then(() => patch({ voice: null, soundboardOpen: false, fullStage: false })));
+  } else if (cmd === "call_hangup") {
+    run(invoke("call_hangup", {}).then(() => patch({ voice: null, call: null, soundboardOpen: false, fullStage: false })));
   }
+}
+
+/** Cancels the call that is ringing out, without leaving a voice room. */
+export function cancelCall(): void {
+  run(invoke("call_hangup", {}).then(() => patch({ call: null })));
 }
 
 function patchVoice(p: Partial<VoiceSession>): void {

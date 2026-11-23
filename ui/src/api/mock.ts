@@ -4,8 +4,9 @@
 //
 // URL flags: `?fresh` starts at the name picker with no servers, `?noenc`
 // makes screen sharing fail with "no-hardware-encoder", `?ring` rings an
-// incoming call shortly after start. `window.tincanMock` has helpers for the
-// console: ring(), online(name), offline(name), migrate(), toast(text).
+// incoming call shortly after start, `?noanswer` leaves outgoing calls ringing.
+// `window.tincanMock` has helpers for the console: ring(), online(name),
+// offline(name), migrate(), toast(text), state().
 
 import type { Backend } from "./client";
 import type {
@@ -74,6 +75,7 @@ const params = new URLSearchParams(typeof location === "undefined" ? "" : locati
 const FLAG_FRESH = params.has("fresh");
 const FLAG_NOENC = params.has("noenc");
 const FLAG_RING = params.has("ring");
+const FLAG_NOANSWER = params.has("noanswer");
 
 // ------------------------------------------------------------------ people
 
@@ -1258,12 +1260,21 @@ const handlers: Handlers = {
     const call: CallInfo = { callId: freshHex(), userId: p.id, name: p.name, state: "ringing-out" };
     st.call = call;
     emit("call-updated", call);
-    setTimeout(() => {
-      if (st.call?.callId !== call.callId) return;
-      st.call = { ...call, state: "active" };
-      emit("call-updated", st.call);
-      startCallVoice(dm);
-    }, 2500);
+    setTimeout(
+      () => {
+        if (st.call?.callId !== call.callId) return;
+        if (FLAG_NOANSWER) {
+          st.call = null;
+          emit("call-updated", null);
+          toast("info", `${p.name} didn't answer.`);
+          return;
+        }
+        st.call = { ...call, state: "active" };
+        emit("call-updated", st.call);
+        startCallVoice(dm);
+      },
+      FLAG_NOANSWER ? 45_000 : 2500,
+    );
     return call;
   },
 
@@ -1490,6 +1501,8 @@ declare global {
       offline(name: string): void;
       migrate(): void;
       toast(text: string): void;
+      /** What the mock backend thinks, for scripted checks. */
+      state(): { voice: VoiceSession | null; call: CallInfo | null };
     };
   }
 }
@@ -1512,6 +1525,7 @@ if (typeof window !== "undefined") {
       toast("info", "Morgan is now hosting Game night");
     },
     toast: (text) => toast("info", text),
+    state: () => structuredClone({ voice: st.voice, call: st.call }),
   };
   if (FLAG_RING) setTimeout(() => ringFrom(people.alex), 1500);
   if (!FLAG_FRESH) {
