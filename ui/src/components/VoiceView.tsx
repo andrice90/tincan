@@ -5,9 +5,10 @@ import { HeadphoneOff, Maximize2, MessageSquare, MicOff, Minimize2, Monitor, Vol
 import { memo, useEffect, useRef, useState, type MouseEvent } from "react";
 import type { Channel, Member, ServerSummary, UserId, VoiceParticipant, VoiceSession } from "../api/types";
 import { ScreenView } from "../media/ScreenView";
-import { joinVoice, messageUser, setFullStage, setUserVolume, stopShare } from "../store/actions";
+import { joinVoice, messageUser, setFullStage, setUserVolume, stopShare, toggleRoomChat } from "../store/actions";
 import { initialVolume, shouldSend, type TilePerson } from "../store/calls";
 import { useStore } from "../store/store";
+import { ChannelMessages } from "./ChatView";
 import { ICON, ICON_SM, IconButton, PersonId, PersonName, SpeakingAvatar } from "./common";
 import { Popover, useMenu } from "./Menu";
 
@@ -244,6 +245,8 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
   const members = useStore((s) => s.members[server.id] ?? EMPTY_MEMBERS);
   const joined = voice?.kind === "room" && voice.channelId === channel.id;
   const inside = members.filter((m) => m.online && m.voiceChannelId === channel.id);
+  const chatOpen = useStore((s) => s.roomChatPanel);
+  const unread = channel.unread && !chatOpen;
 
   return (
     <>
@@ -254,28 +257,46 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
             <bdi>{channel.name}</bdi>
           </span>
         </h1>
-        {!joined && (
-          <button type="button" className="btn btn-primary btn-sm" disabled={call !== null} onClick={() => joinVoice(server.id, channel.id)}>
-            Join voice
+        <div className="main-actions">
+          {!joined && (
+            <button type="button" className="btn btn-primary btn-sm" disabled={call !== null} onClick={() => joinVoice(server.id, channel.id)}>
+              Join voice
+            </button>
+          )}
+          <button
+            type="button"
+            className={unread ? "btn btn-ghost btn-sm room-chat-toggle is-unread" : "btn btn-ghost btn-sm room-chat-toggle"}
+            aria-pressed={chatOpen}
+            onClick={toggleRoomChat}
+          >
+            Chat
+            {unread && <span className="sr-only">, unread messages</span>}
           </button>
-        )}
+        </div>
       </header>
-      <div className="voice-body">
-        {joined && voice ? (
-          <VoiceStage voice={voice} />
-        ) : inside.length === 0 ? (
-          <p className="voice-empty">No one is here yet.</p>
-        ) : (
-          <div className="tiles">
-            {inside.map((m) => (
-              <Tile
-                key={m.userId}
-                p={{ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, speaking: m.speaking, screenTrack: null, volume: null }}
-                isMe={false}
-                sharing={m.sharing}
-              />
-            ))}
-          </div>
+      <div className="voice-split">
+        <div className="voice-body">
+          {joined && voice ? (
+            <VoiceStage voice={voice} />
+          ) : inside.length === 0 ? (
+            <p className="voice-empty">No one is here yet.</p>
+          ) : (
+            <div className="tiles">
+              {inside.map((m) => (
+                <Tile
+                  key={m.userId}
+                  p={{ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, speaking: m.speaking, screenTrack: null, volume: null }}
+                  isMe={false}
+                  sharing={m.sharing}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+        {chatOpen && (
+          <section className="room-chat" aria-label={`Chat in ${channel.name}`}>
+            <ChannelMessages server={server} channel={channel} />
+          </section>
         )}
       </div>
     </>

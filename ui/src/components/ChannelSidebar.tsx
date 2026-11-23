@@ -1,10 +1,11 @@
 // Channel list for one server: header with host state and server menu, text
 // channels, voice rooms with the people inside.
 
-import { ChevronDown, Hash, HeadphoneOff, LogOut, MicOff, Monitor, Pencil, Plus, Trash2, UserPlus, Volume2 } from "lucide-react";
+import { ChevronDown, Hash, HeadphoneOff, LogOut, MessageSquare, MicOff, Monitor, Pencil, Plus, Trash2, UserPlus, Volume2 } from "lucide-react";
 import { memo, useMemo, useRef, type MouseEvent, type ReactNode } from "react";
 import type { Channel, Connection, Member, ServerSummary, VoiceSession } from "../api/types";
-import { openDialog, selectChannel } from "../store/actions";
+import { openDialog, openRoomChat, selectChannel } from "../store/actions";
+import { roomChatMode } from "../store/chatView";
 import { useStore } from "../store/store";
 import { ICON_SM, IconButton, PersonName, SpeakingAvatar } from "./common";
 import { Menu, useMenu, type MenuItem } from "./Menu";
@@ -200,6 +201,8 @@ function VoiceRoomRow({
   voice: VoiceSession | null;
 }) {
   const ctx = useChannelMenu(server, channel);
+  // the dot stays until the room's chat itself is on screen (its tiles alone don't count)
+  const chatShown = useStore((s) => roomChatMode(s.view, channel, s.roomChatPanel) !== null);
   const people: RoomPerson[] = useMemo(() => {
     if (voice?.kind === "room" && voice.channelId === channel.id) {
       return voice.participants.map((p) => ({
@@ -215,20 +218,28 @@ function VoiceRoomRow({
       .map((m) => ({ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, sharing: m.sharing }));
   }, [voice, members, channel.id]);
 
+  const unread = channel.unread && !chatShown;
+
   return (
     <li>
-      <button
-        type="button"
-        className="channel-row"
-        aria-current={selected ? "page" : undefined}
-        onClick={() => selectChannel(server.id, channel)}
-        onContextMenu={ctx.onContextMenu}
-      >
-        <Volume2 size={ICON_SM} aria-hidden="true" />
-        <span className="truncate">
-          <bdi>{channel.name}</bdi>
-        </span>
-      </button>
+      <div className="channel-row-wrap">
+        <button
+          type="button"
+          className={unread ? "channel-row is-unread" : "channel-row"}
+          aria-current={selected ? "page" : undefined}
+          onClick={() => selectChannel(server.id, channel)}
+          onContextMenu={ctx.onContextMenu}
+        >
+          <Volume2 size={ICON_SM} aria-hidden="true" />
+          <span className="truncate">
+            <bdi>{channel.name}</bdi>
+          </span>
+          {unread && <span className="sr-only">, unread messages</span>}
+        </button>
+        <IconButton small className="room-chat-btn" label={`Open chat for ${channel.name}`} onClick={() => openRoomChat(server.id, channel)}>
+          <MessageSquare size={ICON_SM} />
+        </IconButton>
+      </div>
       {ctx.node}
       {people.length > 0 && (
         <ul className="room-people" aria-label={`In ${channel.name}`}>

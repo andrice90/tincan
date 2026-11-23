@@ -41,6 +41,7 @@ export interface ServerSummary {
   ownerId: UserId;
   isOwner: boolean;
   connection: Connection;
+  /** Any channel is unread, a voice room's chat included. */
   unread: boolean;
   /** Members currently online (including me). */
   onlineCount: number;
@@ -54,6 +55,7 @@ export interface Channel {
   name: string;
   kind: ChannelKind;
   position: number;
+  /** Has unread messages. A voice room has a chat too, so this applies to both kinds. */
   unread: boolean;
 }
 

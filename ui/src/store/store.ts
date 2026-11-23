@@ -29,7 +29,8 @@ import { buildNameIndex, sharesName, type NameIndex } from "../lib/names";
 /** What the main area shows. */
 export type View =
   | { kind: "home" }
-  | { kind: "server"; serverId: ServerId; channelId: ChannelId | null }
+  /** `chat`: a voice room shown as its chat page instead of its tiles. */
+  | { kind: "server"; serverId: ServerId; channelId: ChannelId | null; chat?: boolean }
   | { kind: "dms"; convId: ConvId | null };
 
 /** Settings dialog tabs. */
@@ -98,6 +99,8 @@ export interface State {
   lastDm: ConvId | null;
   showMembers: boolean;
   soundboardOpen: boolean;
+  /** The chat panel beside a voice room's tiles is open. */
+  roomChatPanel: boolean;
   /** Voice room whose stage is shown in full window, by channel or conv id. */
   fullStage: boolean;
   dialog: DialogState | null;
@@ -124,6 +127,7 @@ const initial: State = {
   lastDm: null,
   showMembers: true,
   soundboardOpen: false,
+  roomChatPanel: false,
   fullStage: false,
   dialog: null,
   toasts: [],

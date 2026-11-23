@@ -19,6 +19,7 @@ import type {
   VoiceSession,
 } from "../api/types";
 import { leaveCommand } from "./calls";
+import { shownChat } from "./chatView";
 import { addPlayedClip } from "./clips";
 import { withCreatedServer } from "./servers";
 import { staleTransfers, takeTransfer } from "./transfers";
@@ -96,7 +97,7 @@ function repairView(s: State): View {
   if (!chans) return v;
   if (v.channelId === null || !chans.some((c) => c.id === v.channelId)) {
     const id = firstTextChannel(chans);
-    return id === v.channelId ? v : { ...v, channelId: id };
+    return id === v.channelId ? v : { kind: "server", serverId: v.serverId, channelId: id };
   }
   return v;
 }
@@ -145,15 +146,10 @@ export function loadServer(serverId: ServerId): void {
 let cacheGen = 0;
 const msgsKey = (key: string): string => `msgs:${cacheGen}:${key}`;
 
-/** The conversation in the main area, if it is a text channel or a DM. */
+/** The conversation whose messages are on screen: a text channel, a voice room's chat, or a DM. */
 function shownConv(s: State): { convId: ConvId; channelId: ChannelId | null; key: string } | null {
-  const v = s.view;
-  if (v.kind === "server" && v.channelId) {
-    const ch = s.channels[v.serverId]?.find((c) => c.id === v.channelId);
-    return ch?.kind === "text" ? { convId: v.serverId, channelId: ch.id, key: convKey(v.serverId, ch.id) } : null;
-  }
-  if (v.kind === "dms" && v.convId) return { convId: v.convId, channelId: null, key: convKey(v.convId, null) };
-  return null;
+  const shown = shownChat(s.view, s.channels, s.roomChatPanel);
+  return shown && { ...shown, key: convKey(shown.convId, shown.channelId) };
 }
 
 function shownKey(s: State): string | null {
@@ -299,12 +295,14 @@ function putMessage(m: Message): void {
 /** Marks the conversation shown in the main area as read if the backend says it is unread. */
 function markCurrentRead(): void {
   const s = getState();
+  const shown = shownConv(s);
+  if (!shown) return;
   const v = s.view;
-  if (v.kind === "server" && v.channelId) {
-    const ch = s.channels[v.serverId]?.find((c) => c.id === v.channelId);
-    if (ch?.kind === "text" && ch.unread) {
+  if (v.kind === "server" && shown.channelId) {
+    const ch = s.channels[v.serverId]?.find((c) => c.id === shown.channelId);
+    if (ch?.unread) {
       const serverId = v.serverId;
-      const channelId = v.channelId;
+      const channelId = ch.id;
       update((st) => ({
         ...st,
         channels: {
@@ -335,12 +333,10 @@ const seenMarks = new Map<string, { last: number; timer: ReturnType<typeof setTi
  */
 function markSeen(m: Message): void {
   if (m.authorId === getState().me?.userId) return;
-  const shown = (): boolean => {
-    const v = getState().view;
-    return v.kind === "server" ? v.serverId === m.convId && v.channelId === m.channelId : v.kind === "dms" && v.convId === m.convId;
-  };
-  if (!shown()) return;
   const key = convKey(m.convId, m.channelId);
+  // a voice room counts only while its chat is showing, not just its tiles
+  const shown = (): boolean => shownKey(getState()) === key;
+  if (!shown()) return;
   let mark = seenMarks.get(key);
   if (!mark) {
     mark = { last: 0, timer: null };
@@ -363,13 +359,8 @@ function markSeen(m: Message): void {
 
 /** Loads what the current view needs and marks it read. */
 function afterViewChange(): void {
-  const v = getState().view;
-  if (v.kind === "server") {
-    const ch = getState().channels[v.serverId]?.find((c) => c.id === v.channelId);
-    if (ch?.kind === "text") ensureMessages(v.serverId, ch.id);
-  } else if (v.kind === "dms" && v.convId) {
-    ensureMessages(v.convId, null);
-  }
+  const shown = shownConv(getState());
+  if (shown) ensureMessages(shown.convId, shown.channelId);
   markCurrentRead();
 }
 
@@ -508,6 +499,22 @@ export function selectChannel(serverId: ServerId, channel: Channel): void {
     const s = getState();
     if (!s.voice && !s.call) joinVoice(serverId, channel.id);
   }
+}
+
+/** Opens a voice room's chat as the whole page, without joining voice. */
+export function openRoomChat(serverId: ServerId, channel: Channel): void {
+  update((s) => ({
+    ...s,
+    view: { kind: "server", serverId, channelId: channel.id, chat: true },
+    lastChannel: { ...s.lastChannel, [serverId]: channel.id },
+  }));
+  afterViewChange();
+}
+
+/** Shows or hides the chat panel beside a voice room's tiles. */
+export function toggleRoomChat(): void {
+  update((s) => ({ ...s, roomChatPanel: !s.roomChatPanel }));
+  afterViewChange();
 }
 
 /** Opens the DM list, at a conversation if given. */
