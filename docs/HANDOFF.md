@@ -55,6 +55,10 @@ Profiles: `--profile <name>` or `TINCAN_PROFILE`, data in `%APPDATA%\Tincan\prof
 - `e2e.md`: the two-profile run, its timings and resource numbers.
 - `review/`: confirmed review findings and their status.
 
+## Resuming the in-flight work
+
+The round 2 fix workflow (run `wf_3e0c42f2-14e`, script under `~/.claude/projects/D--code-projects-tincan/<session>/workflows/scripts/tincan-fix-round2-wf_3e0c42f2-14e.js`) was running when the usage limit hit. Its four fixers work in git worktrees and leave branches `fix/net`, `fix/files-sec`, `fix/ui`, `fix/shell` (check `git branch --list fix/*`). If the workflow cannot be resumed, merge those branches into main yourself, then do the remaining steps below. Also open: `ui/src/lib/names.ts` `nameKey` (on `fix/ui`) does not fold lookalike letters (Cyrillic "А" vs Latin "A"), so the duplicate-name suffix can be dodged; fold a UTS #39 confusables subset there, with a test.
+
 ## Next steps
 
 1. Finish the round 2 fixes, highest severity first, then run a review of the fixes.
