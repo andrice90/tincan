@@ -21,7 +21,7 @@ function VolumePopover({ p, anchor, onClose }: { p: VoiceParticipant; anchor: No
     <Popover anchor={anchor} onClose={onClose} label={`${p.name} options`} className="volume-pop">
       <PersonId userId={p.userId} />
       <label className="field-label" htmlFor={id}>
-        Volume for {p.name}
+        Volume for <bdi>{p.name}</bdi>
       </label>
       <div className="volume-row">
         <input
@@ -188,7 +188,15 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
         ) : (
           stagePerson.screenTrack !== null && <ScreenView key={stagePerson.screenTrack} track={stagePerson.screenTrack} label={label} />
         )}
-        <span className="stage-label">{label}</span>
+        <span className="stage-label">
+          {mine ? (
+            label
+          ) : (
+            <>
+              <bdi>{stagePerson.name}</bdi>'s screen
+            </>
+          )}
+        </span>
         {!mine && (
           <IconButton
             className="stage-full-btn"
@@ -230,7 +238,9 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
       <header className="main-header">
         <h1 className="main-title">
           <Volume2 size={ICON} aria-hidden="true" className="faint" />
-          <span className="truncate">{channel.name}</span>
+          <span className="truncate">
+            <bdi>{channel.name}</bdi>
+          </span>
         </h1>
         {!joined && (
           <button type="button" className="btn btn-primary btn-sm" disabled={call !== null} onClick={() => joinVoice(server.id, channel.id)}>

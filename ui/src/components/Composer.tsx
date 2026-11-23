@@ -1,7 +1,7 @@
 // Message input: Enter sends, Shift+Enter adds a line, files attach through the picker.
 
 import { Paperclip, X } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { errorText, pickFiles } from "../api/client";
 import type { ChannelId, ConvId } from "../api/types";
 import { finishSend, type Draft } from "../lib/compose";
@@ -177,9 +177,20 @@ export function Composer({ convId, channelId, placeholder }: Props) {
 
 /** "Jordan is typing" line under the composer. Space is reserved so the layout never jumps. */
 export function TypingLine({ names }: { names: string[] }) {
-  let text = "";
-  if (names.length === 1) text = `${names[0]} is typing`;
-  else if (names.length === 2) text = `${names[0]} and ${names[1]} are typing`;
+  // Names are peer-chosen: each is isolated so its direction can't reorder the sentence.
+  let text: ReactNode = "";
+  if (names.length === 1)
+    text = (
+      <>
+        <bdi>{names[0]}</bdi> is typing
+      </>
+    );
+  else if (names.length === 2)
+    text = (
+      <>
+        <bdi>{names[0]}</bdi> and <bdi>{names[1]}</bdi> are typing
+      </>
+    );
   else if (names.length > 2) text = "Several people are typing";
   return (
     <div className="typing-line" aria-live="polite">

@@ -8,7 +8,11 @@ import { acceptCall, declineCall } from "../store/actions";
 export function IncomingCallDialog({ call }: { call: CallInfo }) {
   return (
     <Modal
-      title={`${call.name} is calling`}
+      title={
+        <>
+          <bdi>{call.name}</bdi> is calling
+        </>
+      }
       // Escape or a stray click outside must not decline: only the Decline button does
       onClose={() => {}}
       className="modal-call"

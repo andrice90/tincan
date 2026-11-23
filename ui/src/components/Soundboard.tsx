@@ -25,7 +25,9 @@ const OwnedTile = memo(function OwnedTile({ clip, disabled }: { clip: Clip; disa
         onClick={() => playClip(clip)}
         onContextMenu={menu.openAt}
       >
-        <span className="clip-name truncate">{clip.name}</span>
+        <span className="clip-name truncate">
+        <bdi>{clip.name}</bdi>
+      </span>
         <span className="clip-meta">{formatSeconds(clip.durationMs)}</span>
       </button>
       {menu.anchor && (
@@ -50,8 +52,18 @@ const HeardTile = memo(function HeardTile({ clip, fromName }: { clip: Clip; from
   const pct = t && t.total > 0 ? Math.floor((t.have / t.total) * 100) : 0;
   return (
     <div className={playing ? "clip-tile is-heard is-playing" : "clip-tile is-heard"}>
-      <span className="clip-name truncate">{clip.name}</span>
-      <span className="clip-meta truncate">{fromName ? `From ${fromName}` : formatSeconds(clip.durationMs)}</span>
+      <span className="clip-name truncate">
+        <bdi>{clip.name}</bdi>
+      </span>
+      <span className="clip-meta truncate">
+        {fromName ? (
+          <>
+            From <bdi>{fromName}</bdi>
+          </>
+        ) : (
+          formatSeconds(clip.durationMs)
+        )}
+      </span>
       {downloading ? (
         <span
           className="clip-progress"

@@ -75,7 +75,9 @@ export function ChannelSidebar({ server }: { server: ServerSummary }) {
         onClick={() => headerRef.current && menu.openBelow(headerRef.current)}
       >
         <span className="side-header-text">
-          <span className="side-title truncate">{server.name}</span>
+          <span className="side-title truncate">
+            <bdi>{server.name}</bdi>
+          </span>
           <span className={conn.state === "offline" || conn.state === "connecting" ? "side-sub is-warn" : "side-sub"}>
             {hostLine(conn, meId)}
           </span>
@@ -165,7 +167,9 @@ const ChannelRow = memo(function ChannelRow({ channel, server, selected }: { cha
         onContextMenu={ctx.onContextMenu}
       >
         <Hash size={ICON_SM} aria-hidden="true" />
-        <span className="truncate">{channel.name}</span>
+        <span className="truncate">
+          <bdi>{channel.name}</bdi>
+        </span>
         {unread && <span className="sr-only">, unread messages</span>}
       </button>
       {ctx.node}
@@ -220,7 +224,9 @@ function VoiceRoomRow({
         onContextMenu={ctx.onContextMenu}
       >
         <Volume2 size={ICON_SM} aria-hidden="true" />
-        <span className="truncate">{channel.name}</span>
+        <span className="truncate">
+          <bdi>{channel.name}</bdi>
+        </span>
       </button>
       {ctx.node}
       {people.length > 0 && (

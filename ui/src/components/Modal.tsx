@@ -3,7 +3,8 @@
 import { useEffect, useRef, type FormEvent, type ReactNode } from "react";
 
 interface ModalProps {
-  title: string;
+  /** The heading (peer-chosen names in it go in a <bdi>). */
+  title: ReactNode;
   onClose: () => void;
   children: ReactNode;
   /** Buttons, right-aligned at the bottom. */

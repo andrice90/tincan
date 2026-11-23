@@ -23,7 +23,9 @@ export function ChannelChat({ server, channel }: { server: ServerSummary; channe
       <header className="main-header">
         <h1 className="main-title">
           <Hash size={ICON} aria-hidden="true" className="faint" />
-          <span className="truncate">{channel.name}</span>
+          <span className="truncate">
+            <bdi>{channel.name}</bdi>
+          </span>
         </h1>
         <IconButton label={showMembers ? "Hide members" : "Show members"} pressed={showMembers} onClick={toggleMembers}>
           <Users size={ICON} />

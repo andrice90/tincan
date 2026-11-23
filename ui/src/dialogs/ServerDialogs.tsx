@@ -1,6 +1,6 @@
 // Dialogs for servers, channels, messages and contacts.
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { copyText, errorText, invoke } from "../api/client";
 import type { ChannelId, ChannelKind, Message, ServerId } from "../api/types";
 import {
@@ -228,7 +228,7 @@ function ConfirmDialog({
   label,
   action,
 }: {
-  title: string;
+  title: ReactNode;
   body: string;
   label: string;
   action: () => Promise<void>;
@@ -246,7 +246,11 @@ export function ConfirmLeaveServer({ serverId }: { serverId: ServerId }) {
   const server = useStore((s) => s.servers.find((x) => x.id === serverId));
   return (
     <ConfirmDialog
-      title={`Leave ${server?.name ?? "this server"}?`}
+      title={
+        <>
+          Leave <bdi>{server?.name ?? "this server"}</bdi>?
+        </>
+      }
       body="You can rejoin with a new invite."
       label="Leave server"
       action={() => leaveServer(serverId)}
@@ -329,7 +333,11 @@ export function ConfirmDeleteChannel({ serverId, channelId }: { serverId: Server
   const name = channel ? (channel.kind === "text" ? `#${channel.name}` : channel.name) : "this channel";
   return (
     <ConfirmDialog
-      title={`Delete ${name}?`}
+      title={
+        <>
+          Delete <bdi>{name}</bdi>?
+        </>
+      }
       body={channel?.kind === "voice" ? "The room is removed for everyone." : "The channel is removed for everyone."}
       label="Delete channel"
       action={() => deleteChannel(serverId, channelId)}

@@ -114,7 +114,9 @@ function ImagePreview({ a, onFail }: { a: AttachmentT; onFail: () => void }) {
       title={a.name}
       onClick={() => openFile(a.hash, a.name)}
     >
-      <img src={url} alt={a.name} onLoad={() => setLoaded(true)} onError={onFail} />
+      {/* Off-screen images in a long history are not read from the app until scrolled near;
+          the placeholder keeps its size until the image has decoded. */}
+      <img src={url} alt={a.name} loading="lazy" decoding="async" onLoad={() => setLoaded(true)} onError={onFail} />
     </button>
   );
 }
@@ -139,7 +141,7 @@ export const Attachment = memo(function Attachment({ a }: { a: AttachmentT }) {
       </span>
       <div className="file-info">
         <span className="file-name truncate" title={a.name}>
-          {a.name}
+          <bdi>{a.name}</bdi>
         </span>
         <Meta a={a} t={t} />
         {pct !== null && (

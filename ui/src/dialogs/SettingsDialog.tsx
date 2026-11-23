@@ -364,7 +364,9 @@ function NetworkTab({ settings, save, saveError }: { settings: Settings; save: (
               const status = connStatus(s.connection, s.onlineCount);
               return (
                 <li key={s.id} className="conn-row">
-                  <span className="truncate">{s.name}</span>
+                  <span className="truncate">
+                    <bdi>{s.name}</bdi>
+                  </span>
                   <span className="muted truncate">{hostLine(s.connection, meId)}</span>
                   <span className={status.cls}>{status.text}</span>
                 </li>

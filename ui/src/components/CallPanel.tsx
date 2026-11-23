@@ -32,7 +32,9 @@ export function CallPanel() {
       <div className="call-panel-top">
         <div className="call-panel-label">
           <span className="call-state">Calling</span>
-          <span className="truncate muted">{call.name}</span>
+          <span className="truncate muted">
+            <bdi>{call.name}</bdi>
+          </span>
         </div>
         <IconButton label="Cancel call" tone="danger" onClick={cancelCall}>
           <PhoneOff size={ICON} />
@@ -47,7 +49,9 @@ export function CallPanel() {
         <div className="call-panel-top">
           <div className="call-panel-label">
             <span className="call-state conn-none">Connecting</span>
-            <span className="truncate muted">Call with {call.name}</span>
+            <span className="truncate muted">
+              Call with <bdi>{call.name}</bdi>
+            </span>
           </div>
           <IconButton label="Hang up" tone="danger" onClick={leaveVoice}>
             <PhoneOff size={ICON} />
@@ -60,10 +64,17 @@ export function CallPanel() {
 
   const label = pathLabel(voice.path);
   const rtt = voice.rttMs !== null ? `Round trip ${voice.rttMs} ms` : undefined;
+  // Room, server and contact names are peer-chosen: each is isolated from the text around it.
   const place =
-    voice.kind === "room"
-      ? `${voice.name} / ${servers.find((s) => s.id === voice.convId)?.name ?? ""}`
-      : `Call with ${voice.name}`;
+    voice.kind === "room" ? (
+      <>
+        <bdi>{voice.name}</bdi> / <bdi>{servers.find((s) => s.id === voice.convId)?.name ?? ""}</bdi>
+      </>
+    ) : (
+      <>
+        Call with <bdi>{voice.name}</bdi>
+      </>
+    );
   const leaveLabel = voice.kind === "room" ? "Leave voice" : "Hang up";
 
   return (
