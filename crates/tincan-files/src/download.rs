@@ -5,10 +5,16 @@
 //! provider has been tried. [`add_providers`] marks holders as worth trying again and wakes
 //! it. Cancellation aborts the task; whatever was written stays in the store.
 //!
-//! Size caps: as soon as the size is known (a partial blob already has one; otherwise the
-//! first verified chunk carries it), kinds whose [`BlobKind::max_size`] it exceeds are
-//! dropped from the request and their tags deleted. If no kind is left, or the verified
-//! bytes pass the largest cap, the request turns [`TransferState::TooLarge`] and ends.
+//! Size caps act only on a proven size. A provider's size header is a claim: BLAKE3 commits
+//! to the size through the tree shape, so a provider can claim any size in the same
+//! power-of-two bucket and still have the first chunks verify. The size is proven once the
+//! last chunk verified (a partial blob that has it, the end of a download, or a last-chunk
+//! request). When a provider claims more than the largest cap, it is asked for the last
+//! chunk first: proven over the cap, kinds whose [`BlobKind::max_size`] it exceeds are
+//! dropped and their tags deleted, and with no kind left the request turns
+//! [`TransferState::TooLarge`] and ends (for good: the hash commits to the size). A provider
+//! that cannot prove its claim fails only its own attempt. Verified bytes past the largest
+//! cap end the request too.
 
 use std::{
     sync::{Arc, atomic::Ordering},
@@ -16,7 +22,11 @@ use std::{
 };
 
 use iroh::EndpointId;
-use iroh_blobs::{api::remote::GetProgressItem, get::GetError};
+use iroh_blobs::{
+    api::remote::GetProgressItem,
+    get::GetError,
+    protocol::{ChunkRanges, ChunkRangesExt, GetRequest},
+};
 use n0_future::StreamExt;
 use tincan_core::{BlobHash, UserId, wire::AddrHint};
 use tokio::{sync::Notify, task::JoinHandle};
@@ -58,7 +68,36 @@ struct Provider {
     pending: bool,
 }
 
-/// What the size cap says about a request once its size is known.
+/// What is known of a blob's size, measured against the smallest cap of a request.
+#[derive(Debug, PartialEq, Eq)]
+enum SizeVerdict {
+    /// Nothing proven over the cap: keep going.
+    Ok,
+    /// Only the provider's unproven claim is over the cap: ask it for the last chunk.
+    NeedProof,
+    /// Proven over the cap (the last chunk verified, or verified bytes past it): apply the
+    /// caps to this size ([`Download::admit`] drops kinds or refuses).
+    Apply(u64),
+}
+
+/// `claimed`: a provider's size header (unproven until the last chunk verifies);
+/// `validated`: the size proven by the last chunk; `have`: verified bytes held; `cap`: the
+/// smallest cap of the request's kinds. Only a proven size or verified bytes are applied to
+/// the caps (and can drop kinds or refuse, for good); a claim alone asks for proof.
+fn size_verdict(claimed: Option<u64>, validated: Option<u64>, have: u64, cap: u64) -> SizeVerdict {
+    if let Some(v) = validated.filter(|v| *v > cap) {
+        return SizeVerdict::Apply(v);
+    }
+    if have > cap {
+        return SizeVerdict::Apply(have);
+    }
+    if validated.is_none() && claimed.is_some_and(|c| c > cap) {
+        return SizeVerdict::NeedProof;
+    }
+    SizeVerdict::Ok
+}
+
+/// What the size cap says about a request once its size is proven.
 #[derive(Debug, PartialEq, Eq)]
 enum Admit {
     /// Every requested kind allows it.
@@ -115,7 +154,13 @@ impl Download {
         self.kinds.iter().map(BlobKind::max_size).max().unwrap_or(0)
     }
 
-    /// Applies the size caps for a blob of `size` bytes.
+    /// The smallest size every requested kind accepts.
+    fn min_cap(&self) -> u64 {
+        self.kinds.iter().map(BlobKind::max_size).min().unwrap_or(0)
+    }
+
+    /// Applies the size caps for a blob of `size` bytes (a proven size: see
+    /// [`size_verdict`]).
     fn admit(&mut self, size: u64) -> Admit {
         let mut over = Kinds::default();
         for k in self.kinds.iter().filter(|k| size > k.max_size()) {
@@ -387,32 +432,42 @@ async fn attempt(inner: &Inner, hash: BlobHash, id: u64, provider: EndpointId) -
     }
     let base = local.local_bytes();
     let connection: iroh::endpoint::Connection = (*conn).clone();
-    let stream = inner.store.remote().execute_get(connection, local.missing()).stream();
-    tokio::pin!(stream);
+    let mut stream = Box::pin(inner.store.remote().execute_get(connection.clone(), local.missing()).stream());
     let mut last_emit: Option<Instant> = None;
-    let Some((mut size_known, mut cap)) = with_entry(inner, hash, id, |d| (d.total.is_some(), d.cap())) else {
+    let Some(mut cap) = with_entry(inner, hash, id, |d| d.cap()) else {
         return Attempt::Refused;
     };
+    let mut size_known = false;
     while let Some(item) = stream.next().await {
         match item {
             GetProgressItem::Progress(n) => {
                 let have = base + n;
                 if !size_known && n > 0 {
-                    // The first verified chunk carries the size.
+                    // The first verified chunk carries the provider's size claim.
                     if let Ok(bf) = inner.store.blobs().observe(bh).await
                         && bf.size() > 0
                     {
-                        let size = bf.size();
-                        with_entry(inner, hash, id, |d| d.total = Some(size));
                         size_known = true;
-                        if !check_size(inner, hash, id, size).await {
-                            return Attempt::Refused;
+                        let validated = bf.validated_size();
+                        // Shown while downloading; the caps act only on a proven size.
+                        with_entry(inner, hash, id, |d| d.total = Some(validated.unwrap_or(bf.size())));
+                        let min_cap = with_entry(inner, hash, id, |d| d.min_cap()).unwrap_or(0);
+                        match size_verdict(Some(bf.size()), validated, have, min_cap) {
+                            SizeVerdict::NeedProof => {
+                                drop(stream);
+                                return prove_size(inner, hash, id, provider, connection).await;
+                            }
+                            SizeVerdict::Apply(size) => {
+                                if !check_size(inner, hash, id, size).await {
+                                    return Attempt::Refused;
+                                }
+                                cap = with_entry(inner, hash, id, |d| d.cap()).unwrap_or(0);
+                            }
+                            SizeVerdict::Ok => {}
                         }
-                        cap = with_entry(inner, hash, id, |d| d.cap()).unwrap_or(0);
                     }
                 }
-                // The size is the provider's claim until the last chunk verifies; verified
-                // bytes past the cap end it regardless.
+                // Verified bytes past the cap end it whatever the claim.
                 if have > cap && !check_size(inner, hash, id, have).await {
                     return Attempt::Refused;
                 }
@@ -450,10 +505,47 @@ fn is_local(e: &GetError) -> bool {
     matches!(e, GetError::LocalFailure { .. }) || e.local_write().is_some()
 }
 
-/// The size the store knows for `hash` (0 means unknown).
+/// The size the store has proven for `hash` (its last chunk verified), if any. A partial
+/// blob's other size is only what a provider claimed.
 async fn known_size(inner: &Inner, hash: &BlobHash) -> Option<u64> {
     let bf = inner.store.blobs().observe(blobs_hash(hash)).await.ok()?;
-    (bf.size() > 0).then(|| bf.size())
+    bf.validated_size().filter(|s| *s > 0)
+}
+
+/// The size claim was over the cap: ask `provider` for the last chunk, which proves the
+/// real size (the hash commits to it). Proven over the cap, the request is refused for
+/// good. A provider that cannot prove the claim fails this attempt only. Proven under the
+/// cap (the claim came from someone else's partial, or was a lie), the provider is tried
+/// again at once: the size is settled now.
+async fn prove_size(inner: &Inner, hash: BlobHash, id: u64, provider: EndpointId, conn: iroh::endpoint::Connection) -> Attempt {
+    let bh = blobs_hash(&hash);
+    let request = GetRequest::blob_ranges(bh, ChunkRanges::last_chunk());
+    let mut stream = Box::pin(inner.store.remote().execute_get(conn, request).stream());
+    while let Some(item) = stream.next().await {
+        match item {
+            GetProgressItem::Progress(_) => {}
+            GetProgressItem::Done(_) => break,
+            GetProgressItem::Error(e) => {
+                debug!(hash = %hash.short(), "size proof failed: {e}");
+                return if is_local(&e) { Attempt::LocalError(e.to_string()) } else { Attempt::ProviderFailed };
+            }
+        }
+    }
+    let validated = match inner.store.blobs().observe(bh).await {
+        Ok(bf) => bf.validated_size(),
+        Err(e) => return Attempt::LocalError(e.to_string()),
+    };
+    let Some(size) = validated else {
+        debug!(hash = %hash.short(), "the provider did not prove its size claim");
+        return Attempt::ProviderFailed;
+    };
+    with_entry(inner, hash, id, |d| d.total = Some(size));
+    if !check_size(inner, hash, id, size).await {
+        return Attempt::Refused;
+    }
+    debug!(hash = %hash.short(), size, "size proven under the cap; fetching the rest");
+    with_entry(inner, hash, id, |d| d.merge(&[provider]));
+    Attempt::ProviderFailed
 }
 
 /// Applies the size caps once `size` is known. False when the request was refused: the
@@ -607,6 +699,23 @@ mod tests {
         assert_eq!(d.state, TransferState::TooLarge);
         assert_eq!(d.total, Some(crate::MAX_ATTACHMENT_BYTES + 1));
         assert!(!d.has_pending());
+    }
+
+    /// APP-SECURITY-1: a provider's size claim over the cap never refuses or drops a kind (a
+    /// refusal is permanent); only a proven size or verified bytes past the cap do.
+    #[test]
+    fn only_a_proven_size_refuses() {
+        let cap = crate::MAX_ATTACHMENT_BYTES;
+        for claim in [cap + 1, 30 * 1024 * 1024, u64::MAX] {
+            for have in [0, 1024, cap] {
+                assert_eq!(size_verdict(Some(claim), None, have, cap), SizeVerdict::NeedProof, "an unproven claim of {claim}");
+            }
+        }
+        assert_eq!(size_verdict(Some(cap), None, 1024, cap), SizeVerdict::Ok);
+        assert_eq!(size_verdict(None, None, 0, cap), SizeVerdict::Ok);
+        assert_eq!(size_verdict(Some(u64::MAX), Some(cap + 1), 0, cap), SizeVerdict::Apply(cap + 1), "proven over the cap");
+        assert_eq!(size_verdict(Some(cap + 5), Some(cap), 0, cap), SizeVerdict::Ok, "a proven size wins over the claim");
+        assert_eq!(size_verdict(Some(cap), None, cap + 1, cap), SizeVerdict::Apply(cap + 1), "verified bytes past the cap");
     }
 
     #[test]

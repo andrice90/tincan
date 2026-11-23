@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tincan_core::state::{Change, dm_channel};
-use tincan_core::wire::Roster;
+use tincan_core::wire::{AddrHint, Roster};
 use tincan_core::{ChannelId, ConvId, UserId};
 use tincan_files::FileEvent;
 use tincan_net::{ConnState, NetEvent};
@@ -138,6 +138,10 @@ impl Bulks {
         }
     }
 
+    /// `conv` is no longer connected to a host as a member: no sync of a host runs, so new
+    /// windows get the short maximum again.
+    pub fn sync_ended(&mut self, conv: ConvId) { self.syncing.remove(&conv); }
+
     /// `SyncComplete`: the sync of `conv` is in. Returns the window it ends, if any.
     pub fn sync_complete(&mut self, conv: ConvId, now: Instant) -> Option<Bulk> {
         self.syncing.remove(&conv);
@@ -235,6 +239,72 @@ impl RosterSig {
     }
 }
 
+/// The addresses of the members online in a roster, by user. The UI does not show them,
+/// but parked downloads need them: a new address re-arms a provider that failed to dial.
+pub(crate) fn addr_sig(r: &Roster) -> Vec<(UserId, AddrHint)> {
+    let mut v: Vec<(UserId, AddrHint)> = r.online.iter().map(|e| (e.user, e.addr.clone())).collect();
+    v.sort_by_key(|e| e.0);
+    v
+}
+
+/// What a roster update changed for the pump.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RosterChange {
+    /// Something the UI shows: refresh members, the server and the DM list.
+    pub ui: bool,
+    /// Something parked downloads use (shown state or addresses): re-query them.
+    pub requery: bool,
+}
+
+/// The last roster and connection state handled per server, so rebroadcasts that change
+/// nothing (RTT, revisions) cost nothing.
+#[derive(Debug, Default)]
+pub(crate) struct Seen {
+    rosters: HashMap<ConvId, (RosterSig, Vec<(UserId, AddrHint)>)>,
+    conns: HashMap<ConvId, (ConnState, Option<UserId>)>,
+}
+
+impl Seen {
+    /// A roster of `server` arrived.
+    pub fn roster(&mut self, server: ConvId, r: &Roster) -> RosterChange {
+        let next = (RosterSig::of(r), addr_sig(r));
+        let change = match self.rosters.get(&server) {
+            None => RosterChange { ui: true, requery: true },
+            Some((sig, addrs)) => {
+                let ui = *sig != next.0;
+                RosterChange { ui, requery: ui || *addrs != next.1 }
+            }
+        };
+        self.rosters.insert(server, next);
+        change
+    }
+
+    /// A `ConnectionChanged` of `server`. Returns (the state or host changed, a history
+    /// sync starts: a new connection to a host). Net also sends it on RTT and path moves.
+    pub fn conn(&mut self, server: ConvId, state: ConnState, host: Option<UserId>) -> (bool, bool) {
+        let now = (state, host);
+        let changed = self.conns.insert(server, now) != Some(now);
+        if changed {
+            // Rosters count only while member, hosting or solo: the next one after a
+            // reconnect or a new host is always handled.
+            self.rosters.remove(&server);
+        }
+        (changed, changed && state == ConnState::Member)
+    }
+
+    /// Events were lost: a missed roster may differ from the last one handled, so rosters
+    /// are compared afresh. Connections are kept: the next RTT-only `ConnectionChanged` of
+    /// a server is not a new connection (taking it for one would mark a sync that never
+    /// ends with `SyncComplete`).
+    pub fn lagged(&mut self) { self.rosters.clear(); }
+
+    /// `server` was left.
+    pub fn forget(&mut self, server: &ConvId) {
+        self.rosters.remove(server);
+        self.conns.remove(server);
+    }
+}
+
 struct Pump {
     core: Arc<Core>,
     dirty: HashMap<ConvId, Refresh>,
@@ -248,10 +318,8 @@ struct Pump {
     bulks: Bulks,
     /// Message events per conversation in the batch being handled.
     batch_counts: HashMap<ConvId, usize>,
-    /// The last roster signature handled per server.
-    rosters: HashMap<ConvId, RosterSig>,
-    /// The last connection state and host per server.
-    conns: HashMap<ConvId, (ConnState, Option<UserId>)>,
+    /// The last roster and connection state handled per server.
+    seen: Seen,
 }
 
 /// Run until the network's event stream closes (or the task is aborted on shutdown).
@@ -272,8 +340,7 @@ pub(crate) async fn run(
         snapshot_due: false,
         bulks: Bulks::default(),
         batch_counts: HashMap::new(),
-        rosters: HashMap::new(),
-        conns: HashMap::new(),
+        seen: Seen::default(),
     };
     let mut files_open = true;
     loop {
@@ -349,9 +416,7 @@ impl Pump {
             self.core.invalidate_view(&conv);
             self.dirty.entry(conv).or_default().merge(Refresh::ALL);
         }
-        // A missed roster may differ from the last one handled: compare afresh.
-        self.rosters.clear();
-        self.conns.clear();
+        self.seen.lagged();
         self.policy_dirty = true;
         self.dms_dirty = true;
         self.rosters_changed = true;
@@ -449,27 +514,31 @@ impl Pump {
                 _ => {}
             },
             NetEvent::RosterUpdated { server, roster } => {
-                // The host rebroadcasts on RTT and address changes the UI does not show.
-                let sig = RosterSig::of(&roster);
-                if self.rosters.get(&server) == Some(&sig) {
+                // The host rebroadcasts on RTT and address changes the UI does not show; a
+                // new address still re-arms parked downloads.
+                let change = self.seen.roster(server, &roster);
+                if change.requery {
+                    self.rosters_changed = true;
+                    self.schedule();
+                }
+                if !change.ui {
                     return;
                 }
-                self.rosters.insert(server, sig);
                 self.mark(server, Refresh { server: true, members: true, ..Refresh::default() });
                 self.dms_dirty = true;
-                self.rosters_changed = true;
             }
             NetEvent::ConnectionChanged { server, info } => {
                 self.mark(server, Refresh { server: true, members: true, ..Refresh::default() });
                 // Also sent on RTT and path changes; only a new state or host matters here.
-                let now = (info.state, info.host);
-                if self.conns.insert(server, now) != Some(now) {
-                    // Rosters count only while member, hosting or solo: the next one after
-                    // a reconnect or a new host is always handled.
-                    self.rosters.remove(&server);
+                let (changed, sync_starts) = self.seen.conn(server, info.state, info.host);
+                if changed {
                     self.dms_dirty = true;
-                    if info.state == ConnState::Member {
+                    if sync_starts {
                         self.bulks.sync_started(server);
+                    } else if info.state != ConnState::Member {
+                        // No longer a member (hosting now, or looking for a host): no sync
+                        // of a host is running, whether or not its SyncComplete came.
+                        self.bulks.sync_ended(server);
                     }
                 }
                 if matches!(info.state, ConnState::Member | ConnState::Hosting | ConnState::Solo) {
@@ -512,8 +581,7 @@ impl Pump {
                 core.forget_sent(&server);
                 self.dirty.remove(&server);
                 self.bulks.forget(&server);
-                self.rosters.remove(&server);
-                self.conns.remove(&server);
+                self.seen.forget(&server);
                 self.policy_dirty = true;
                 self.dms_dirty = true;
                 self.snapshot_due = true;
@@ -740,5 +808,53 @@ mod tests {
         let mut gone = r.clone();
         gone.online.pop();
         assert_ne!(RosterSig::of(&r), RosterSig::of(&gone));
+    }
+
+    /// REGRESSION-1: a roster that changes only an address refreshes nothing on screen but
+    /// still re-queries parked downloads (the new address re-arms a provider that failed).
+    #[test]
+    fn an_address_change_requeries_without_a_refresh() {
+        let (a, b) = (tincan_core::keys::Identity::generate().user(), tincan_core::keys::Identity::generate().user());
+        let r = Roster { epoch: 1, rev: 1, host: a, online: vec![entry(a, 10), entry(b, 20)], succession: vec![b] };
+        let mut seen = Seen::default();
+        assert_eq!(seen.roster(conv(), &r), RosterChange { ui: true, requery: true }, "the first one");
+        let mut rtt = r.clone();
+        rtt.rev = 2;
+        rtt.online[1].rtt_ms = 90;
+        assert_eq!(seen.roster(conv(), &rtt), RosterChange { ui: false, requery: false }, "RTT and revision only");
+        let mut moved = rtt.clone();
+        moved.online[1].addr.direct = vec!["192.0.2.7:4433".parse().unwrap()];
+        assert_eq!(seen.roster(conv(), &moved), RosterChange { ui: false, requery: true }, "a new address");
+        let mut muted = moved.clone();
+        muted.online[1].muted = true;
+        assert_eq!(seen.roster(conv(), &muted), RosterChange { ui: true, requery: true }, "a mute");
+        // After a lag, rosters are compared afresh.
+        seen.lagged();
+        assert!(seen.roster(conv(), &muted).ui);
+    }
+
+    /// REGRESSION-2: after a lag, an RTT-only connection change of a member is not a new
+    /// connection (no sync that would never end); a new host still is.
+    #[test]
+    fn a_lag_does_not_turn_an_rtt_change_into_a_new_sync() {
+        let (h1, h2) = (tincan_core::keys::Identity::generate().user(), tincan_core::keys::Identity::generate().user());
+        let mut seen = Seen::default();
+        assert_eq!(seen.conn(conv(), ConnState::Member, Some(h1)), (true, true));
+        assert_eq!(seen.conn(conv(), ConnState::Member, Some(h1)), (false, false), "an RTT move");
+        seen.lagged();
+        assert_eq!(seen.conn(conv(), ConnState::Member, Some(h1)), (false, false), "an RTT move after a lag");
+        assert_eq!(seen.conn(conv(), ConnState::Member, Some(h2)), (true, true), "a new host");
+        assert_eq!(seen.conn(conv(), ConnState::Hosting, Some(h2)), (true, false), "hosting: no sync of a host");
+    }
+
+    /// REGRESSION-2: leaving the member state ends the sync's long maximum.
+    #[test]
+    fn a_sync_that_ends_without_sync_complete_loses_the_long_maximum() {
+        let mut b = Bulks::default();
+        let t0 = Instant::now();
+        b.sync_started(conv());
+        b.sync_ended(conv());
+        b.on_message(conv(), 100, t0);
+        assert!(!b.due(t0 + MAX_BULK).is_empty(), "the short maximum");
     }
 }

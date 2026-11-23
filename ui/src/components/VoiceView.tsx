@@ -2,11 +2,11 @@
 // someone shares a screen, that share on the stage with tiles in a strip.
 
 import { HeadphoneOff, Maximize2, MessageSquare, MicOff, Minimize2, Monitor, Volume2 } from "lucide-react";
-import { memo, useEffect, useState, type MouseEvent } from "react";
+import { memo, useEffect, useRef, useState, type MouseEvent } from "react";
 import type { Channel, Member, ServerSummary, UserId, VoiceParticipant, VoiceSession } from "../api/types";
 import { ScreenView } from "../media/ScreenView";
 import { joinVoice, messageUser, setFullStage, setUserVolume, stopShare } from "../store/actions";
-import { initialVolume } from "../store/calls";
+import { initialVolume, shouldSend, type TilePerson } from "../store/calls";
 import { useStore } from "../store/store";
 import { ICON, ICON_SM, IconButton, PersonId, PersonName, SpeakingAvatar } from "./common";
 import { Popover, useMenu } from "./Menu";
@@ -14,12 +14,19 @@ import { Popover, useMenu } from "./Menu";
 /** Per-user playback volume picked in this session (0..2); the app's saved value seeds it. */
 const volumes = new Map<UserId, number>();
 
-function VolumePopover({ p, anchor, onClose }: { p: VoiceParticipant; anchor: NonNullable<ReturnType<typeof useMenu>["anchor"]>; onClose: () => void }) {
-  const [v, setV] = useState(() => initialVolume(volumes.get(p.userId), p));
+function VolumeSlider({ p, start }: { p: TilePerson; start: number }) {
+  const [v, setV] = useState(start);
+  // The value last sent (the one shown at open until then): a release or key that changed
+  // nothing sends nothing.
+  const sent = useRef(start);
   const id = `vol-${p.userId}`;
+  const commit = () => {
+    if (!shouldSend(sent.current, v)) return;
+    sent.current = v;
+    setUserVolume(p.userId, v);
+  };
   return (
-    <Popover anchor={anchor} onClose={onClose} label={`${p.name} options`} className="volume-pop">
-      <PersonId userId={p.userId} />
+    <>
       <label className="field-label" htmlFor={id}>
         Volume for <bdi>{p.name}</bdi>
       </label>
@@ -36,11 +43,21 @@ function VolumePopover({ p, anchor, onClose }: { p: VoiceParticipant; anchor: No
             setV(next);
             volumes.set(p.userId, next);
           }}
-          onPointerUp={() => setUserVolume(p.userId, v)}
-          onKeyUp={() => setUserVolume(p.userId, v)}
+          onPointerUp={commit}
+          onKeyUp={commit}
         />
         <span className="volume-value">{Math.round(v * 100)}%</span>
       </div>
+    </>
+  );
+}
+
+function VolumePopover({ p, anchor, onClose }: { p: TilePerson; anchor: NonNullable<ReturnType<typeof useMenu>["anchor"]>; onClose: () => void }) {
+  const start = initialVolume(volumes.get(p.userId), p);
+  return (
+    <Popover anchor={anchor} onClose={onClose} label={`${p.name} options`} className="volume-pop">
+      <PersonId userId={p.userId} />
+      {start !== null && <VolumeSlider p={p} start={start} />}
       <button
         type="button"
         className="menu-item"
@@ -64,7 +81,7 @@ const Tile = memo(function Tile({
   picked,
   sharing = p.screenTrack !== null,
 }: {
-  p: VoiceParticipant;
+  p: TilePerson;
   isMe: boolean;
   small?: boolean;
   onPick?: (track: number) => void;
@@ -258,7 +275,7 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
             {inside.map((m) => (
               <Tile
                 key={m.userId}
-                p={{ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, speaking: m.speaking, screenTrack: null, volume: 1 }}
+                p={{ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, speaking: m.speaking, screenTrack: null, volume: null }}
                 isMe={false}
                 sharing={m.sharing}
               />

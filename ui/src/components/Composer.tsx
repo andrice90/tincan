@@ -4,7 +4,7 @@ import { Paperclip, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { errorText, pickFiles } from "../api/client";
 import type { ChannelId, ConvId } from "../api/types";
-import { finishSend, type Draft } from "../lib/compose";
+import { finishSend, registerComposer, restoreFailed, type Draft } from "../lib/compose";
 import { baseName } from "../lib/format";
 import { pushToast, sendMessage, sendTyping } from "../store/actions";
 import { convKey } from "../store/store";
@@ -50,6 +50,20 @@ export function Composer({ convId, channelId, placeholder }: Props) {
     else drafts.delete(key);
   };
 
+  // A send started by an earlier composer for this conversation (switched away and back
+  // during it) that fails puts its text and files back here.
+  useEffect(
+    () =>
+      registerComposer(key, (sent) => {
+        const d = finishSend(box.current, sent, false);
+        box.current = d;
+        setText(d.text);
+        setFiles(d.files);
+        if (d.text) drafts.set(key, d.text);
+      }),
+    [key],
+  );
+
   useLayoutEffect(() => {
     const el = area.current;
     if (!el) return;
@@ -89,8 +103,9 @@ export function Composer({ convId, channelId, placeholder }: Props) {
     }
     busy.current = false;
     if (!mounted.current) {
-      // switched away during the send: keep a failed text as the draft
-      if (!ok) drafts.set(key, finishSend({ text: drafts.get(key) ?? "", files: [] }, sent, false).text);
+      // switched away during the send: a failed send goes to the composer showing this
+      // conversation now, or waits as its draft
+      if (!ok) restoreFailed(key, sent, drafts);
       return;
     }
     setBox(finishSend(box.current, sent, ok));

@@ -17,7 +17,7 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 | `commands.rs` | Servers, channels, messages, DMs and settings commands; cursor and id parsing |
 | `transfers.rs` | Attachment import, hash index bookkeeping (references, shares, download nominations), auto-fetch, the fetch worker, `transfer` / `download` / `open_file` / `file_url` / `file_for_url`, resume, lag recovery |
 | `views.rs` | `ConvView` (a slice of `ConvState` built under the replica lock with `Net::with_state`), `ViewCache` (views plus a generation per conversation), DTO builders, user names, `refresh` with dedup |
-| `pump.rs` | The event pump: `NetEvent`/`FileEvent` to UI events, debounce, `Bulks` (bulk windows), `RosterSig` (roster dedup) |
+| `pump.rs` | The event pump: `NetEvent`/`FileEvent` to UI events, debounce, `Bulks` (bulk windows), `Seen` (roster and connection dedup) |
 | `shell.rs` | MIME types, safe export names, peer text clean-up, unique paths, the open or reveal decision, the Mark of the Web |
 | `media/mod.rs` | `Media`: state, `COMMANDS`, command routing, the hooks the rest of the app calls, lock order |
 | `media/engine.rs` | The `AudioEngine` slot, its event forwarder, restart after the engine thread dies, the synthetic test microphone, `decode_clip` under `catch_unwind` |
@@ -35,7 +35,7 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 - Settings are one JSON document in the store's settings table.
 - Other kv keys:
   - `app/att/<hash>`: the hash index record (`index.rs`): up to 8 references (conv, DM flag, author, name, declared size, mime) and up to 16 conversations the blob is shared with. Written whenever a message referencing the hash is seen (pages, live events, history sync), a file is sent, a download completes, or a clip is played. A record from before this format (one origin) reads as one reference plus a share with that conversation.
-  - `app/refused/<hash>`: the size an attachment turned out to have when tincan-files refused it (`TooLarge`). Auto-fetch and `download` never ask for it again.
+  - `app/refused2/<hash>`: the proven size of an attachment tincan-files refused (`TooLarge`). Auto-fetch and `download` never ask for it again. Rows under the old `app/refused/` key were written from a provider's unproven claim and are ignored.
   - `app/export/<hash>`: the exported path, so `open_file` reuses an export that still exists with the right size.
 
 ## Startup
@@ -109,7 +109,7 @@ Rules from api.md and the task:
 | `EventAdded` + `Change::Message` | `message-added` at once, then an unread refresh (my own messages refresh the DM summary, so `lastMessageAt` and the DM order follow a send) |
 | `EventAdded` + `Change::Deleted` | `message-updated` (the stored event, `deleted: true`) |
 | `ConvUpdated` (`ServerRenamed`, `Channels`, `Members`) | view invalidated, then `server-updated` / `channels-updated` / `members-updated` after the debounce |
-| `RosterUpdated` | `server-updated`, `members-updated`, DM online states; holders re-queried for parked downloads. Skipped when nothing the UI shows changed (`RosterSig`: online users, voice room, muted, deafened, sharing, host; not RTT buckets, addresses or revisions) |
+| `RosterUpdated` | `server-updated`, `members-updated`, DM online states; holders re-queried for parked downloads. The refresh is skipped when nothing the UI shows changed (`RosterSig`: online users, voice room, muted, deafened, sharing, host; not RTT buckets, addresses or revisions); a changed address still re-queries parked downloads |
 | `ConnectionChanged` | `server-updated`, `members-updated`; on a new state or host also DM online states, a fresh roster comparison and (as member) the start of the server's history sync |
 | `SyncComplete` | ends the conversation's bulk window at once (one refresh plus the `snapshot`) |
 | `DmNameChanged` | `dm-updated`, the contact record's name, `call-updated` / `voice-updated` when they show the contact (no `snapshot`: a peer can send names often) |
@@ -160,7 +160,7 @@ Throttling:
   - A download asks `who_has` in every conversation that references the hash and tries every author. Name and size shown for hash-only commands come from the first reference. `download` refuses a hash whose smallest declared size is over 25 MiB.
   - A reference grants no access (see Blob access).
   - A new reference to a hash whose download is parked queues a holder lookup: at once for a server reference, under the 10 s throttle for a DM reference.
-- **Size caps:** tincan-files refuses an attachment over 25 MiB and a clip over 5 MiB as soon as the real size is known (`TransferState::TooLarge`, shown as `failed`), and drops its tags so the partial data is freed. The app records the refusal (`app/refused/<hash>`). Declared sizes over the cap are never queued (auto-fetch, `download`, resume).
+- **Size caps:** tincan-files refuses an attachment over 25 MiB and a clip over 5 MiB once the size is proven (the last chunk verified; a provider that claims more than a cap is asked for it first) (`TransferState::TooLarge`, shown as `failed`), and drops its tags so the partial data is freed. The app records the refusal (`app/refused2/<hash>`). A clip pull is forgotten on `TooLarge`, or when its download completes as an attachment larger than 5 MB; a size still downloading is only a claim and never acted on. Declared sizes over the cap are never queued (auto-fetch, `download`, resume).
 - **Auto-fetch:**
   - Incoming attachments that declare at most `autoFetchLimit` (default 25 MiB, 0 = off, never past 25 MiB) and that are not mine, not held, not requested and not refused are pushed on `AutoQueue` (1024 hashes). It is served newest first and drops the oldest when full: a history sync streams the oldest messages first, and the newest are on screen and the likeliest to lose their holders.
   - One fetch worker, one item at a time. Holder lookups (`Peers`), parked-download retries (`Requery`) and resumes go through a separate bounded channel (1024) that the worker serves before any auto-fetch.
@@ -168,7 +168,7 @@ Throttling:
   - Provider order: online authors, then the other holders, then offline authors last (a dead first provider costs the 4 s connect timeout).
   - History attachments are auto-fetched too (architecture.md: every member keeps attachments available).
 - **Parked downloads:** an `unavailable` download is re-queried when rosters change or a DM link comes up. The 10 s per-hash throttle is checked before queueing (`requery_due`), and only providers online now are added (`online_only`); with none, the download is not woken.
-- **Resume:** `partial_downloads()` is read at start. The first time any server reaches member, hosting or solo, or a DM link comes up, each entry is queued with its indexed references. Entries the queue has no room for wait for the next connection. An entry without references (for example a clip) asks every conversation's `who_has`.
+- **Resume:** `partial_downloads()` is read at start. The first time any server reaches member, hosting or solo, or a DM link comes up, each entry is queued with its indexed references. Entries the queue has no room for wait for the next connection. A clip pull resumes from the conversation it was played in (kept in its pull record, like `clip_fetch`); an attachment from the conversations of its references. A partial of unknown origin (no references, a pull record from before the conversation was kept) is not resumed: nobody is asked, and a stale clip pull is forgotten with its clip tag (`transfers::resume_targets`).
 - **Lost file events:** when the pump's file receiver lags, `on_files_lagged` finishes the shares of downloads that completed meanwhile (`Files::provided_by` names who delivered them), re-announces, re-reads every tracked transfer and open download record through `on_transfer` (which fixes the records and the UI), and finishes clip pulls whose blob is complete.
 - **`transfer`:**
   - `idle` when tincan-files has no record and the blob is not held.

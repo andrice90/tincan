@@ -142,7 +142,8 @@ pub(crate) fn safe_file_name(name: &str) -> String {
             continue;
         }
         in_space = false;
-        out.push(if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') { '_' } else { c });
+        // A comma is legal but Explorer splits its command line at commas (`open_arg`).
+        out.push(if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | ',') { '_' } else { c });
     }
     let mut out = out.trim_start().to_string();
     trim_name_end(&mut out);
@@ -279,6 +280,12 @@ pub(crate) fn reveal_in_folder(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The argument that makes `explorer.exe` open `path`: always quoted and passed raw. Explorer
+/// splits its command line at commas, and normal argument quoting quotes only paths with a
+/// space or a tab, so `report,v2.pdf` would reach Explorer as two tokens. Windows paths
+/// cannot contain `"`.
+pub(crate) fn open_arg(path: &Path) -> String { format!("\"{}\"", path.display()) }
+
 /// Open `path` with its default app, without a console window. Only for files
 /// [`open_action`] allows.
 pub(crate) fn open_with_default_app(path: &Path) -> std::io::Result<()> {
@@ -287,7 +294,7 @@ pub(crate) fn open_with_default_app(path: &Path) -> std::io::Result<()> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         // explorer.exe hands the file to its registered app and returns at once.
-        std::process::Command::new("explorer.exe").arg(path).creation_flags(CREATE_NO_WINDOW).spawn().map(drop)
+        std::process::Command::new("explorer.exe").raw_arg(open_arg(path)).creation_flags(CREATE_NO_WINDOW).spawn().map(drop)
     }
     #[cfg(not(windows))]
     {
@@ -324,6 +331,7 @@ mod tests {
         assert_eq!(safe_file_name("..\\..\\evil.exe"), "evil.exe");
         assert_eq!(safe_file_name("a/b/c.txt"), "c.txt");
         assert_eq!(safe_file_name("what?.txt"), "what_.txt");
+        assert_eq!(safe_file_name("setup.exe,.pdf"), "setup.exe_.pdf", "no commas for Explorer to split at");
         assert_eq!(safe_file_name("con.txt"), "_con.txt");
         assert_eq!(safe_file_name("COM1"), "_COM1");
         assert_eq!(safe_file_name("nul .txt"), "_nul .txt");
@@ -419,6 +427,14 @@ mod tests {
         let p = Path::new(r"C:\Users\me\Downloads\Tincan\my file.exe");
         assert_eq!(reveal_arg(p), r#"/select,"C:\Users\me\Downloads\Tincan\my file.exe""#);
         assert_eq!(zone_stream(p), PathBuf::from(r"C:\Users\me\Downloads\Tincan\my file.exe:Zone.Identifier"));
+    }
+
+    /// APP-SECURITY-3: the path Explorer opens is one quoted token, commas and spaces
+    /// included (the download folder the user picked may have commas).
+    #[test]
+    fn open_passes_one_quoted_path() {
+        assert_eq!(open_arg(Path::new(r"C:\Users\me\Downloads\Tincan\report,v2.pdf")), r#""C:\Users\me\Downloads\Tincan\report,v2.pdf""#);
+        assert_eq!(open_arg(Path::new(r"C:\Users\me\My Files,old\a b.pdf")), r#""C:\Users\me\My Files,old\a b.pdf""#);
     }
 
     #[test]

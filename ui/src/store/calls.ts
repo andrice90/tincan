@@ -17,9 +17,24 @@ export function leaveCommand(voice: VoiceSession | null, call: CallInfo | null):
   return null;
 }
 
-/** Where the per-user volume slider starts: this session's choice, else the saved volume. */
-export function initialVolume(chosen: number | undefined, p: VoiceParticipant): number {
+/**
+ * A tile's person. `volume` is null when it is not known: tiles of a room you have not
+ * joined (the app reports saved volumes only for joined rooms and calls).
+ */
+export type TilePerson = Omit<VoiceParticipant, "volume"> & { volume: number | null };
+
+/**
+ * Where the per-user volume slider starts: this session's choice, else the saved volume.
+ * Null when neither is known: then no slider is shown, so a click on it can never replace
+ * the saved volume with a made-up 100%.
+ */
+export function initialVolume(chosen: number | undefined, p: TilePerson): number | null {
   return chosen ?? p.volume;
+}
+
+/** Send the slider's value only when it differs from the one last sent (or shown at open). */
+export function shouldSend(last: number, current: number): boolean {
+  return Math.round(last * 100) !== Math.round(current * 100);
 }
 
 /** Which parts the call panel shows. */

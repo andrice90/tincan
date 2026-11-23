@@ -1,6 +1,6 @@
 import type { CallInfo, VoiceSession } from "../api/types";
 import { eq, test } from "../test/harness";
-import { callPanelParts, initialVolume, leaveCommand } from "./calls";
+import { callPanelParts, initialVolume, leaveCommand, shouldSend } from "./calls";
 
 function voice(kind: "room" | "call"): VoiceSession {
   return {
@@ -52,4 +52,17 @@ test("UI-LOGIC-13: the volume slider starts at the saved volume, not 100%", () =
   eq(initialVolume(undefined, p), 0.3, "saved by the app");
   eq(initialVolume(0.8, p), 0.8, "moved in this session");
   eq(initialVolume(undefined, { ...p, volume: 1 }), 1, "never changed");
+});
+
+test("REGRESSION-4: a tile whose saved volume is not known shows no slider", () => {
+  const p = { userId: "jordan", name: "Jordan", muted: false, deafened: false, speaking: false, screenTrack: null, volume: null };
+  eq(initialVolume(undefined, p), null, "a room you have not joined: no made-up 100%");
+  eq(initialVolume(0.5, p), 0.5, "moved in this session");
+});
+
+test("REGRESSION-4: releasing the slider without a change sends nothing", () => {
+  eq(shouldSend(0.3, 0.3), false);
+  eq(shouldSend(1, 1), false);
+  eq(shouldSend(0.3, 0.35), true);
+  eq(shouldSend(0.3000001, 0.3), false, "the same percent");
 });

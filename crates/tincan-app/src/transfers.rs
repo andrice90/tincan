@@ -98,7 +98,10 @@ impl AutoQueue {
 }
 
 fn export_key(hash: &BlobHash) -> String { format!("app/export/{}", hash.to_hex()) }
-fn refused_key(hash: &BlobHash) -> String { format!("app/refused/{}", hash.to_hex()) }
+/// A blob refused for its proven size. Rows under the old `app/refused/` key were written
+/// from a provider's unproven size claim (APP-SECURITY-1) and are ignored: a blob that
+/// really is too large is refused again after one cheap size proof.
+fn refused_key(hash: &BlobHash) -> String { format!("app/refused2/{}", hash.to_hex()) }
 
 /// Parse a blob hash argument.
 pub(crate) fn parse_hash(s: &str) -> Result<BlobHash, String> {
@@ -131,6 +134,36 @@ pub(crate) fn requery_due(last: Option<Instant>, now: Instant, every: Duration) 
 /// author would only cost a download slot and a 4 s connect timeout.
 pub(crate) fn online_only(providers: Vec<(UserId, AddrHint)>, online: impl Fn(&UserId) -> bool) -> Vec<(UserId, AddrHint)> {
     providers.into_iter().filter(|(u, _)| online(u)).collect()
+}
+
+/// Does a reference to a blob I hold share it with the reference's conversation? Only in a
+/// server, by someone else, when that author may already fetch it from me (`allowed`). A
+/// DM reference never does: its only other party is the author, who has access already,
+/// and each DM share would take a slot from the conversations the file was posted in.
+pub(crate) fn reshare_allowed(dm: bool, author_is_me: bool, complete: bool, allowed: impl FnOnce() -> bool) -> bool {
+    !dm && !author_is_me && complete && allowed()
+}
+
+/// Whom a partial download found at start is resumed from.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResumeTargets {
+    /// The conversations its references are in (an attachment).
+    RefConvs,
+    /// The conversation a clip pull came from.
+    Conv(ConvId),
+    /// Nobody: its origin is unknown. Asking every conversation would show the hash to
+    /// every host and DM contact, and their answers would share the blob with them.
+    Nothing,
+}
+
+/// `kind`: the partial's kind; `has_refs`: the index has references to it; `pull_conv`: the
+/// conversation of a pending clip pull of it.
+pub(crate) fn resume_targets(kind: BlobKind, has_refs: bool, pull_conv: Option<ConvId>) -> ResumeTargets {
+    match kind {
+        BlobKind::Clip => pull_conv.map_or(ResumeTargets::Nothing, ResumeTargets::Conv),
+        BlobKind::Attachment if has_refs => ResumeTargets::RefConvs,
+        BlobKind::Attachment => ResumeTargets::Nothing,
+    }
 }
 
 /// The background worker: holder lookups, parked-download retries and resumes first, then
@@ -189,26 +222,26 @@ pub(crate) async fn fetch_worker(core: Arc<Core>, mut rx: mpsc::Receiver<FetchRe
                 if core.files.is_complete(&hash) || core.files.transfer(hash).is_some() {
                     continue;
                 }
-                match core.att_info(&hash).filter(|i| !i.refs.is_empty()) {
-                    Some(info) if kind == BlobKind::Attachment && info.declared_size().is_some_and(|s| s > MAX_ATTACHMENT_BYTES) => {
-                        tracing::debug!(hash = %hash.short(), "not resuming an attachment declared over the size limit");
-                    }
-                    Some(info) => core.start_download(hash, &info, kind).await,
-                    None => {
-                        // Origin unknown (a clip, or an index entry lost): ask every
-                        // conversation. A DM's who_has names the contact.
-                        let mut providers: Vec<(UserId, AddrHint)> = Vec::new();
-                        for conv in core.net.convs() {
-                            let holders = core.net.who_has(&conv, hash).await;
-                            core.nominate(hash, conv, holders.iter().map(|(u, _)| *u));
-                            for (u, a) in holders {
-                                if !providers.iter().any(|(x, _)| *x == u) {
-                                    providers.push((u, a));
-                                }
-                            }
+                let info = core.att_info(&hash).filter(|i| !i.refs.is_empty());
+                let pull_conv = if kind == BlobKind::Clip { core.media.clip_pull_conv(&hash) } else { None };
+                match resume_targets(kind, info.is_some(), pull_conv) {
+                    ResumeTargets::RefConvs => {
+                        let Some(info) = info else { continue };
+                        if kind == BlobKind::Attachment && info.declared_size().is_some_and(|s| s > MAX_ATTACHMENT_BYTES) {
+                            tracing::debug!(hash = %hash.short(), "not resuming an attachment declared over the size limit");
+                        } else {
+                            core.start_download(hash, &info, kind).await;
                         }
-                        core.note_holders(hash, &providers);
-                        core.files.download(hash, kind, providers);
+                    }
+                    ResumeTargets::Conv(conv) => core.media.resume_clip(&core, hash, conv).await,
+                    ResumeTargets::Nothing => {
+                        // Origin unknown (a lost index entry, a clip pull from before its
+                        // conversation was kept): nobody is asked and nothing gets shared.
+                        // An attachment resumes when a reference names it again.
+                        tracing::debug!(hash = %hash.short(), ?kind, "not resuming a partial download of unknown origin");
+                        if kind == BlobKind::Clip {
+                            core.media.drop_clip_pull(&core, hash).await;
+                        }
                     }
                 }
             }
@@ -279,26 +312,32 @@ impl Core {
         }
     }
 
+    /// Is `conv` a DM?
+    fn conv_is_dm(&self, conv: &ConvId) -> bool { self.net.with_state(conv, |s| s.is_dm).unwrap_or(false) }
+
     /// Share `hash` with `conv`: I sent it there, or played the clip there.
-    pub(crate) fn share_blob(&self, hash: BlobHash, conv: ConvId) { self.update_info(hash, |i| i.share(conv)); }
+    pub(crate) fn share_blob(&self, hash: BlobHash, conv: ConvId) {
+        let dm = self.conv_is_dm(&conv);
+        self.update_info(hash, |i| i.share(conv, dm));
+    }
 
     /// Record where the attachments of a message can be fetched.
     ///
     /// A reference alone shares nothing (anyone who can post can name any hash). One
-    /// exception: when its author may already fetch the blob from me (it is shared with a
-    /// conversation the author is in), the author could pass the bytes on anyway, so I
-    /// serve the conversation it was reposted in too.
+    /// exception (`reshare_allowed`): when its author may already fetch the blob from me (it
+    /// is shared with a conversation the author is in), the author could pass the bytes on
+    /// anyway, so I serve the server it was reposted in too.
     ///
     /// A new reference also wakes a parked download of the hash (`requery_on_new_ref`).
     pub(crate) fn index_attachments(&self, conv: ConvId, dm: bool, author: UserId, attachments: &[Attachment]) {
         for a in attachments {
-            let reshare = author != self.me && self.files.is_complete(&a.hash) && self.access.read().allow_blob(&author, &a.hash);
+            let reshare = reshare_allowed(dm, author == self.me, self.files.is_complete(&a.hash), || self.access.read().allow_blob(&author, &a.hash));
             let r = AttRef { conv, dm, author, name: a.name.clone(), size: a.size, mime: a.mime.clone() };
             let mut added = false;
             self.update_info(a.hash, |i| {
                 added = i.add_ref(r);
                 // Both run: an earlier reference may predate the blob being shared.
-                added | (reshare && i.share(conv))
+                added | (reshare && i.share(conv, false))
             });
             if added {
                 self.requery_on_new_ref(a.hash, dm);
@@ -351,10 +390,11 @@ impl Core {
             tracing::debug!(hash = %hash.short(), from = %from.short(), "no conversation named the provider; the blob stays unshared");
             return;
         }
+        let convs: Vec<(ConvId, bool)> = convs.into_iter().map(|c| (c, self.conv_is_dm(&c))).collect();
         self.update_info(hash, |i| {
             let mut changed = false;
-            for c in &convs {
-                changed |= i.share(*c);
+            for (c, dm) in &convs {
+                changed |= i.share(*c, *dm);
             }
             changed
         });
@@ -574,7 +614,7 @@ impl Core {
         }
     }
 
-    /// Was `hash` refused for its size before (kv `app/refused/<hash>`)?
+    /// Was `hash` refused for its proven size before (kv `app/refused2/<hash>`)?
     pub(crate) fn is_refused(&self, hash: &BlobHash) -> bool { matches!(self.storage.get_kv(&refused_key(hash)), Ok(Some(_))) }
 
     /// A `FileEvent::Transfer`: emit `transfer-updated`, persist state changes, remember a
@@ -788,7 +828,7 @@ impl Core {
             let r = AttRef { conv, dm, author: self.me, name: a.name.clone(), size: a.size, mime: a.mime.clone() };
             self.update_info(a.hash, |i| {
                 let added = i.add_ref(r);
-                i.share(conv) || added
+                i.share(conv, dm) || added
             });
             out.push(a);
         }
@@ -861,6 +901,29 @@ mod tests {
         assert!(!auto_fetch_ok(MAX_ATTACHMENT_BYTES + 1, u64::MAX), "the setting cannot lift the cap");
         assert!(!auto_fetch_ok(2000, 1000));
         assert!(!auto_fetch_ok(0, 0), "0 turns auto-fetch off");
+    }
+
+    /// APP-SECURITY-4: a reference in a DM never reshares.
+    #[test]
+    fn dm_references_never_reshare() {
+        assert!(reshare_allowed(false, false, true, || true));
+        assert!(!reshare_allowed(true, false, true, || true), "a DM reference");
+        assert!(!reshare_allowed(false, true, true, || true), "my own reference");
+        assert!(!reshare_allowed(false, false, false, || true), "not held");
+        assert!(!reshare_allowed(false, false, true, || false), "the author has no access");
+    }
+
+    /// APP-SECURITY-2: a resumed clip pull asks only its own conversation, and a partial of
+    /// unknown origin asks nobody (no branch fans out to every conversation).
+    #[test]
+    fn resumes_ask_only_where_the_blob_came_from() {
+        let s1 = ConvId::from_bytes([1; 32]);
+        assert_eq!(resume_targets(BlobKind::Clip, false, Some(s1)), ResumeTargets::Conv(s1));
+        assert_eq!(resume_targets(BlobKind::Clip, true, Some(s1)), ResumeTargets::Conv(s1), "a clip pull follows its own conversation");
+        assert_eq!(resume_targets(BlobKind::Clip, false, None), ResumeTargets::Nothing, "an old pull record");
+        assert_eq!(resume_targets(BlobKind::Clip, true, None), ResumeTargets::Nothing);
+        assert_eq!(resume_targets(BlobKind::Attachment, true, None), ResumeTargets::RefConvs);
+        assert_eq!(resume_targets(BlobKind::Attachment, false, Some(s1)), ResumeTargets::Nothing, "a lost index entry");
     }
 
     #[test]

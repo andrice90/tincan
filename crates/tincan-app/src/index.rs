@@ -58,6 +58,8 @@ pub(crate) struct HashInfo {
     pub refs: Vec<AttRef>,
     /// Conversations it is shared with, oldest first.
     pub shared: Vec<ConvId>,
+    /// The DMs among `shared` (they go first when the list is full).
+    pub shared_dm: Vec<ConvId>,
 }
 
 impl HashInfo {
@@ -81,15 +83,21 @@ impl HashInfo {
         true
     }
 
-    /// Shares the hash with `conv`. Past [`MAX_SHARED`] the oldest share goes. True if the
-    /// list changed.
-    pub fn share(&mut self, conv: ConvId) -> bool {
+    /// Shares the hash with `conv` (`dm`: a DM). Past [`MAX_SHARED`] the oldest DM share
+    /// goes first (anyone can open a DM, so DM shares must not push out the server the file
+    /// was posted in), else the oldest share. True if the list changed.
+    pub fn share(&mut self, conv: ConvId, dm: bool) -> bool {
         if self.shared.contains(&conv) {
             return false;
         }
         self.shared.push(conv);
+        if dm {
+            self.shared_dm.push(conv);
+        }
         if self.shared.len() > MAX_SHARED {
-            self.shared.remove(0);
+            let victim = self.shared.iter().position(|c| self.shared_dm.contains(c)).unwrap_or(0);
+            let gone = self.shared.remove(victim);
+            self.shared_dm.retain(|c| *c != gone);
         }
         true
     }
@@ -133,6 +141,10 @@ struct InfoRecord {
     refs: Vec<RefRecord>,
     #[serde(default)]
     shared: Vec<String>,
+    /// The DMs among `shared` (records from before this was kept count every share as a
+    /// server share).
+    #[serde(default)]
+    shared_dm: Vec<String>,
 }
 
 fn ref_from(r: RefRecord) -> Option<AttRef> {
@@ -151,6 +163,7 @@ pub(crate) fn encode(info: &HashInfo) -> Vec<u8> {
             .map(|r| RefRecord { conv: r.conv.to_hex(), dm: r.dm, author: r.author.to_hex(), name: r.name.clone(), size: r.size, mime: r.mime.clone() })
             .collect(),
         shared: info.shared.iter().map(ConvId::to_hex).collect(),
+        shared_dm: info.shared_dm.iter().map(ConvId::to_hex).collect(),
     };
     serde_json::to_vec(&rec).unwrap_or_default()
 }
@@ -160,13 +173,13 @@ pub(crate) fn encode(info: &HashInfo) -> Vec<u8> {
 /// the access it had.
 pub(crate) fn decode(raw: &[u8]) -> Option<HashInfo> {
     if let Ok(rec) = serde_json::from_slice::<InfoRecord>(raw) {
-        return Some(HashInfo {
-            refs: rec.refs.into_iter().filter_map(ref_from).take(MAX_REFS).collect(),
-            shared: rec.shared.iter().filter_map(|c| ConvId::from_hex(c)).take(MAX_SHARED).collect(),
-        });
+        let shared: Vec<ConvId> = rec.shared.iter().filter_map(|c| ConvId::from_hex(c)).take(MAX_SHARED).collect();
+        let shared_dm = rec.shared_dm.iter().filter_map(|c| ConvId::from_hex(c)).filter(|c| shared.contains(c)).collect();
+        return Some(HashInfo { refs: rec.refs.into_iter().filter_map(ref_from).take(MAX_REFS).collect(), shared, shared_dm });
     }
     let old = ref_from(serde_json::from_slice::<RefRecord>(raw).ok()?)?;
-    Some(HashInfo { shared: vec![old.conv], refs: vec![old] })
+    let shared_dm = if old.dm { vec![old.conv] } else { Vec::new() };
+    Some(HashInfo { shared: vec![old.conv], shared_dm, refs: vec![old] })
 }
 
 /// A map that keeps at most `cap` entries and evicts the oldest inserted key.
@@ -341,13 +354,33 @@ mod tests {
     #[test]
     fn shares_are_bounded() {
         let mut i = HashInfo::default();
-        assert!(i.share(conv(1)));
-        assert!(!i.share(conv(1)));
+        assert!(i.share(conv(1), false));
+        assert!(!i.share(conv(1), false));
         for c in 2..=(MAX_SHARED as u8 + 1) {
-            assert!(i.share(conv(c)));
+            assert!(i.share(conv(c), false));
         }
         assert_eq!(i.shared.len(), MAX_SHARED);
         assert!(!i.shared.contains(&conv(1)));
+    }
+
+    /// APP-SECURITY-4: DM shares never push out the server a file was posted in.
+    #[test]
+    fn dm_shares_go_before_server_shares() {
+        let mut i = HashInfo::default();
+        assert!(i.share(conv(1), false));
+        for c in 2..=(2 * MAX_SHARED as u8) {
+            i.share(conv(c), true);
+        }
+        assert_eq!(i.shared.len(), MAX_SHARED);
+        assert!(i.shared.contains(&conv(1)), "the server share stays");
+        assert_eq!(i.shared_dm.len(), MAX_SHARED - 1);
+        assert!(i.shared_dm.iter().all(|c| i.shared.contains(c)));
+        // With only server shares left to choose from, the oldest goes.
+        let mut j = HashInfo::default();
+        for c in 1..=(MAX_SHARED as u8 + 1) {
+            j.share(conv(c), false);
+        }
+        assert!(!j.shared.contains(&conv(1)));
     }
 
     #[test]
@@ -355,7 +388,8 @@ mod tests {
         let mut i = HashInfo::default();
         i.add_ref(r(1, true, 1));
         i.add_ref(r(2, false, 2));
-        i.share(conv(2));
+        i.share(conv(2), false);
+        i.share(conv(1), true);
         assert_eq!(decode(&encode(&i)), Some(i));
 
         let old = serde_json::json!({

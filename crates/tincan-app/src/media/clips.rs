@@ -97,8 +97,12 @@ impl Heard {
 pub(super) struct Fetch {
     /// Name to save it under.
     pub name: String,
-    /// Who played it (z32), for logs.
+    /// Who played it (z32): the first provider when the pull resumes.
     pub by: String,
+    /// The conversation it was played in (hex), the only one asked for holders when the
+    /// pull resumes. None in records from before this was kept: those are not resumed.
+    #[serde(default)]
+    pub conv: Option<String>,
 }
 
 /// Decoded clips, least recently used first.
@@ -438,16 +442,16 @@ impl Media {
             return Ok(owned_dto(&rec));
         }
         let heard = self.st.lock().heard.get(&hash).cloned().ok_or_else(|| "That sound is no longer available.".to_string())?;
+        let fetch = Fetch { name: heard.info.name.clone(), by: heard.by.to_z32(), conv: Some(heard.conv.to_hex()) };
         {
             let mut st = self.st.lock();
-            st.fetching.insert(hash, Fetch { name: heard.info.name.clone(), by: heard.by.to_z32() });
+            st.fetching.insert(hash, fetch.clone());
             save_fetches(core, &st.fetching);
         }
         if core.files.is_complete(&hash) {
             // Already held (as an attachment, or as a clip no longer in the library): tag it
             // as a clip and finish the pull here. A `Completed` event may follow the tag;
             // `finish_fetch` runs once (the second sees the pull already gone).
-            let fetch = Fetch { name: heard.info.name.clone(), by: heard.by.to_z32() };
             let tagged = match core.files.read_to_bytes(hash, MAX_CLIP_BYTES).await {
                 Ok(bytes) => core.files.import_bytes(bytes, BlobKind::Clip).await.map(|_| ()).map_err(|e| {
                     tracing::warn!(error = %e, "tagging a held clip failed");
@@ -499,6 +503,42 @@ impl Media {
         Ok(d)
     }
 
+    /// The conversation a pending clip pull of `hash` came from, if it is known.
+    pub(crate) fn clip_pull_conv(&self, hash: &BlobHash) -> Option<ConvId> {
+        self.st.lock().fetching.get(hash).and_then(|f| f.conv.as_deref()).and_then(ConvId::from_hex)
+    }
+
+    /// A partial clip with no pull to resume (no record, or a record from before its
+    /// conversation was kept): forget the pull and drop its clip tag.
+    pub(crate) async fn drop_clip_pull(&self, core: &Arc<Core>, hash: BlobHash) {
+        self.forget_fetch(core, &hash);
+        if let Err(e) = core.files.remove_kind(hash, BlobKind::Clip).await {
+            tracing::debug!(error = %e, "dropping the clip tag of a stale pull failed");
+        }
+    }
+
+    /// Resume a clip pull of `conv` a restart interrupted, like `clip_fetch`: from the player
+    /// and the holders that conversation names, nominated for it only (never by asking every
+    /// conversation).
+    pub(crate) async fn resume_clip(&self, core: &Arc<Core>, hash: BlobHash, conv: ConvId) {
+        let Some(fetch) = self.st.lock().fetching.get(&hash).cloned() else { return };
+        let mut providers: Vec<(UserId, AddrHint)> = Vec::new();
+        let by = UserId::from_z32(&fetch.by).filter(|u| *u != core.me);
+        if let Some(by) = by {
+            let addr = core.net.roster(&conv).and_then(|r| r.online.iter().find(|e| e.user == by).map(|e| e.addr.clone())).unwrap_or_default();
+            providers.push((by, addr));
+        }
+        let holders = core.net.who_has(&conv, hash).await;
+        core.nominate(hash, conv, by.into_iter().chain(holders.iter().map(|(u, _)| *u)));
+        for (u, a) in holders {
+            if u != core.me && !providers.iter().any(|(x, _)| *x == u) {
+                providers.push((u, a));
+            }
+        }
+        tracing::debug!(hash = %hash.short(), providers = providers.len(), "resuming a clip pull");
+        core.files.download(hash, BlobKind::Clip, providers);
+    }
+
     /// Where the player can be reached (roster address in rooms; DMs resolve by id).
     fn addr_of(&self, core: &Core, h: &HeardClip) -> AddrHint {
         core.net
@@ -513,11 +553,19 @@ impl Media {
         if !st.fetching.contains_key(&info.hash) && st.heard.get(&info.hash).is_none() {
             return;
         }
-        // tincan-files already stops a clip download past 5 MB (`TooLarge`); this tells
-        // the user and forgets the pull.
-        if info.state == tincan_files::TransferState::TooLarge || info.total.is_some_and(|t| t > MAX_CLIP_BYTES) {
-            tracing::warn!(hash = %info.hash.short(), total = ?info.total, "a pulled clip is too large; cancelling");
-            core.files.cancel(info.hash);
+        // tincan-files stops a clip download proven past 5 MB (`TooLarge`), or drops the clip
+        // kind from a request that is also an attachment and completes as one. This tells
+        // the user and forgets the pull. A size still being downloaded is only the
+        // provider's claim: never act on it (cancelling would end an attachment download
+        // of the same hash too).
+        let state = info.state;
+        let too_large = state == tincan_files::TransferState::TooLarge
+            || (state == tincan_files::TransferState::Complete && info.total.is_some_and(|t| t > MAX_CLIP_BYTES));
+        if too_large {
+            tracing::warn!(hash = %info.hash.short(), total = ?info.total, "a pulled clip is too large; forgetting it");
+            if state == tincan_files::TransferState::TooLarge {
+                core.files.cancel(info.hash);
+            }
             let core2 = core.clone();
             let hash = info.hash;
             tokio::spawn(async move {
