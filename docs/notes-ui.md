@@ -84,3 +84,48 @@ Display names are chosen by each peer and are not unique. When two people the UI
 - The auto-download menu stops at 25 MB, the app's attachment limit.
 - The composer empties when a send starts. A failed send puts its text back in front of anything typed since; an Enter pressed during a send is sent when it finishes.
 - The soundboard keeps at most 50 heard clips, newest last, like the app.
+
+## unslop-ui pass
+
+2026-11-23, unslop-ui with `--surface` over every screen, dialog, menu and media view in `ui/src`, checked against the mock backend with before and after screenshots (headless Edge, dark and light, 1280x800 and 900x640). Verdict: light. The copy and surface already followed design.md: no eyebrows, numbering, arrows, em dashes, gradients, glows, heavy weights or decorative motion. Spacing is on the 4px scale; transitions stay at design.md's 120 ms.
+
+| Rule | Found | Fixed | Kept |
+|---|---|---|---|
+| U3 subtitle reflex | 1 | | 1 |
+| U6 status strings | 3 | 1 | 2 |
+| U7 labeling everything | 3 | 1 | 2 |
+| U9 badges | 1 | | 1 |
+| U10 status dots | 2 | | 2 |
+| U11 decorative icons | 3 | | 3 |
+| U14 saying it twice | 1 | 1 | |
+| U18 off-scale spacing | 1 | 1 | |
+| U25 edges | 2 | 2 | |
+| unslop 11 synonym cycling | 3 | 3 | |
+
+Changed:
+
+- DM sidebar empty state: the main pane already says "No direct messages yet.", so the sidebar drops "No conversations yet." and keeps "Message someone from a server's member list, or add a contact by their ID." (unslop 11, two names for one fact shown twice).
+- Voice room context menu: "Rename channel" and "Delete channel" become "Rename voice room" and "Delete voice room"; the delete dialog's button for a room becomes "Delete voice room" (it said "Delete channel" under "The room is removed for everyone."). Text channels keep "channel" (unslop 11).
+- Your own screen on the stage: the "Your screen" label under "You're sharing your screen" is gone (U7). Someone else's share keeps its name label and its canvas name.
+- File card while downloading: "48%" next to "8.9 MB of 18.4 MB" and the bar is gone; the bar now runs to the card's edge (U14). A queued download with holders online says "2 people online have it" instead of "queued", since the disabled Queued button says that (U6).
+- Add contact: the ghost "Copy my ID" button is set back by its padding so its label starts on the dialog's text line (U25, `.btn-ghost.foot-start`).
+- Settings > Network: the rows share one set of columns (`subgrid`), so the host lines start on one edge and the statuses end on one edge (U25).
+- Rail unread dot: centred in the 8px gap under the icon (`bottom: -7px`, was 1px off; U18).
+
+Kept on purpose:
+
+- Welcome: heading "Pick a display name" over the label "Display name" (U7). The field keeps its visible label, and the heading is the first-launch screen's only heading (design.md, screen 1).
+- Profile: "People add you as a contact with this ID." (U7). The label doesn't say what the ID is for.
+- Screen picker: "Sharper, up to 15 fps" and "Smoother, up to 30 fps" (U3). They tell the two modes apart; the numbers match architecture.md.
+- Constraints: "Anyone with this invite can join for 7 days." (`DEFAULT_INVITE_TTL_MS`), "Sounds can be up to 20 seconds and 5 MB.", "Leave empty to use the public relays."
+- "3.1 MB, 2 people online have it" on file cards and "Lounge / Game night" in the call panel (U6): both facts are used.
+- Rail unread dots and avatar online dots (U10), Host and Owner tags (U9), Direct and Relayed colours: all bound to real state.
+- Icons (U11): menus of actions where every item has one, the # and speaker icons that tell text channels from voice rooms, file type icons on file cards.
+- Placeholders "tincan1...", "tincan1u...", "https://relay.example.com" and "new-channel" show a format (U7).
+
+No string that `ui/e2e` selects on changed.
+
+Tasks for the owner:
+
+- [ ] `crates/tincan-app`: the toasts and error texts the UI shows come from the app (mirrored in `src/api/mock.ts`) and were outside this pass. Check them against the same rules.
+- [ ] `docs/HANDOFF.md`: mark "unslop-ui pass on the UI" done.

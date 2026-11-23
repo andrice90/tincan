@@ -179,7 +179,8 @@
 
 .rail-unread {
   position: absolute;
-  bottom: -6px;
+  /* centred in the rail's 8px gap */
+  bottom: -7px;
   left: 50%;
   width: 6px;
   height: 6px;
@@ -696,6 +697,11 @@
   min-width: 0;
 }
 
+/* no action while downloading: the progress bar runs to the card's edge */
+.file-info:last-child {
+  grid-column: 2 / -1;
+}
+
 .file-name {
   font-weight: 600;
 }
@@ -724,14 +730,6 @@
   display: block;
   height: 100%;
   background: var(--accent);
-}
-
-.file-pct {
-  min-width: 40px;
-  font-size: var(--fs-13);
-  font-weight: 600;
-  color: var(--text-2);
-  text-align: right;
 }
 
 .image-preview {
@@ -1331,6 +1329,11 @@ button.clip-tile:hover:not(:disabled) {
   margin-right: auto;
 }
 
+/* a ghost button's box sits outside the text line, so its label starts on it */
+.btn-ghost.foot-start {
+  margin-left: calc(-1 * var(--sp-4));
+}
+
 .dialog-error {
   margin-top: var(--sp-3);
 }
@@ -1528,18 +1531,24 @@ button.clip-tile:hover:not(:disabled) {
   transform-origin: left center;
 }
 
+/* one set of columns for all rows, so host lines and statuses line up across servers */
 .conn-list {
   display: grid;
-  gap: var(--sp-1);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
+  gap: var(--sp-1) var(--sp-3);
 }
 
 .conn-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
-  gap: var(--sp-3);
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
   align-items: center;
   min-height: 32px;
   font-size: var(--fs-13);
+}
+
+.conn-row > :last-child {
+  justify-self: end;
 }
 
 /* ---------------------------------------------------------------- toasts */

@@ -339,7 +339,7 @@ export function ConfirmDeleteChannel({ serverId, channelId }: { serverId: Server
         </>
       }
       body={channel?.kind === "voice" ? "The room is removed for everyone." : "The channel is removed for everyone."}
-      label="Delete channel"
+      label={channel?.kind === "voice" ? "Delete voice room" : "Delete channel"}
       action={() => deleteChannel(serverId, channelId)}
     />
   );

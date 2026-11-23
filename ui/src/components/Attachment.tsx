@@ -36,7 +36,7 @@ function Meta({ a, t }: { a: AttachmentT; t: Transfer | undefined }) {
     case "queued":
       return (
         <span className="file-meta">
-          {formatBytes(a.size)}, {t.peers === 0 ? "waiting for someone who has it" : "queued"}
+          {formatBytes(a.size)}, {t.peers === 0 ? "waiting for someone who has it" : holders(t.peers).toLowerCase()}
         </span>
       );
     case "failed":
@@ -71,10 +71,8 @@ function Action({ a, t }: { a: AttachmentT; t: Transfer | undefined }) {
       </button>
     );
   }
-  if (state === "downloading") {
-    const pct = t && t.total > 0 ? Math.floor((t.have / t.total) * 100) : 0;
-    return <span className="file-pct">{pct}%</span>;
-  }
+  // while downloading, the bytes line and the progress bar show how far it is
+  if (state === "downloading") return null;
   if (state === "queued") {
     return (
       <button type="button" className="btn btn-sm" disabled>

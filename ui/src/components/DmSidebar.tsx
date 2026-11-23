@@ -22,7 +22,7 @@ export function DmSidebar() {
       </div>
       <div className="side-scroll">
         {sorted.length === 0 ? (
-          <p className="side-empty">No conversations yet. Message someone from a server's member list, or add a contact by their ID.</p>
+          <p className="side-empty">Message someone from a server's member list, or add a contact by their ID.</p>
         ) : (
           <ul className="dm-list">
             {sorted.map((d) => {

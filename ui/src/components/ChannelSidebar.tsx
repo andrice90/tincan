@@ -135,14 +135,15 @@ function ChannelGroup({
 function useChannelMenu(server: ServerSummary, channel: Channel): { onContextMenu?: (e: MouseEvent) => void; node: ReactNode } {
   const menu = useMenu();
   if (!server.isOwner) return { node: null };
+  const room = channel.kind === "voice";
   const items: MenuItem[] = [
     {
-      label: "Rename channel",
+      label: room ? "Rename voice room" : "Rename channel",
       icon: <Pencil size={ICON_SM} />,
       onSelect: () => openDialog({ kind: "rename-channel", serverId: server.id, channelId: channel.id }),
     },
     {
-      label: "Delete channel",
+      label: room ? "Delete voice room" : "Delete channel",
       icon: <Trash2 size={ICON_SM} />,
       danger: true,
       onSelect: () => openDialog({ kind: "delete-channel", serverId: server.id, channelId: channel.id }),

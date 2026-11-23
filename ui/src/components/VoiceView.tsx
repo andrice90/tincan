@@ -188,7 +188,6 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
   }
 
   const mine = !stagePerson || stagePerson.userId === meId;
-  const label = mine ? "Your screen" : `${stagePerson.name}'s screen`;
   return (
     <div className="stage-layout">
       <div
@@ -203,25 +202,21 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
             </button>
           </div>
         ) : (
-          stagePerson.screenTrack !== null && <ScreenView key={stagePerson.screenTrack} track={stagePerson.screenTrack} label={label} />
-        )}
-        <span className="stage-label">
-          {mine ? (
-            label
-          ) : (
-            <>
+          <>
+            {stagePerson.screenTrack !== null && (
+              <ScreenView key={stagePerson.screenTrack} track={stagePerson.screenTrack} label={`${stagePerson.name}'s screen`} />
+            )}
+            <span className="stage-label">
               <bdi>{stagePerson.name}</bdi>'s screen
-            </>
-          )}
-        </span>
-        {!mine && (
-          <IconButton
-            className="stage-full-btn"
-            label={full ? "Exit full window" : "Full window"}
-            onClick={() => setFullStage(!full)}
-          >
-            {full ? <Minimize2 size={ICON} /> : <Maximize2 size={ICON} />}
-          </IconButton>
+            </span>
+            <IconButton
+              className="stage-full-btn"
+              label={full ? "Exit full window" : "Full window"}
+              onClick={() => setFullStage(!full)}
+            >
+              {full ? <Minimize2 size={ICON} /> : <Maximize2 size={ICON} />}
+            </IconButton>
+          </>
         )}
       </div>
       <div className="strip">
