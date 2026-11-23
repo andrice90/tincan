@@ -24,6 +24,7 @@ import type {
   BlobHash,
   VoiceSession,
 } from "../api/types";
+import { buildAvatarIndex } from "../lib/avatars";
 import { buildNameIndex, sharesName, type NameIndex } from "../lib/names";
 
 /** What the main area shows. */
@@ -50,7 +51,12 @@ export type DialogState =
   | { kind: "screen-picker" }
   | { kind: "add-contact" }
   | { kind: "add-sound"; path: string }
-  | { kind: "rename-sound"; clip: Clip };
+  | { kind: "rename-sound"; clip: Clip }
+  /** Crop a picked image for my avatar or a server's icon; `back` reopens after it closes. */
+  | { kind: "crop-image"; file: File; target: CropTarget; back: DialogState | null };
+
+/** What a cropped image becomes. */
+export type CropTarget = { kind: "avatar" } | { kind: "server-icon"; serverId: ServerId };
 
 /** Messages loaded for one conversation (server channel or DM). */
 export interface ConvMessages {
@@ -188,6 +194,27 @@ function nameIndex(s: State): NameIndex {
 /** True when someone else the UI knows uses the same display name as this person. */
 export function useSharesName(userId: UserId, name: string): boolean {
   return useStore((s) => sharesName(nameIndex(s), userId, name));
+}
+
+let avatarMemo: { members: State["members"]; dms: State["dms"]; me: State["me"]; voice: State["voice"]; index: Map<UserId, string> } | null =
+  null;
+
+/**
+ * Avatar URL per user from every list that carries one (server members, DMs, voice
+ * participants, me). An image only reaches a list once the app holds and checked it.
+ */
+export function avatarIndex(s: Pick<State, "members" | "dms" | "me" | "voice">): Map<UserId, string> {
+  if (avatarMemo && avatarMemo.members === s.members && avatarMemo.dms === s.dms && avatarMemo.me === s.me && avatarMemo.voice === s.voice) {
+    return avatarMemo.index;
+  }
+  const index = buildAvatarIndex(s.members, s.dms, s.voice?.participants ?? [], s.me);
+  avatarMemo = { members: s.members, dms: s.dms, me: s.me, voice: s.voice, index };
+  return index;
+}
+
+/** The avatar URL of a user, or null to show the coloured initial. */
+export function useAvatarUrl(userId: UserId): string | null {
+  return useStore((s) => avatarIndex(s).get(userId) ?? null);
 }
 
 /** Key for the messages and typing maps. */

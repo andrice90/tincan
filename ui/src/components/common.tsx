@@ -1,10 +1,10 @@
 // Small shared building blocks: avatars, icon buttons.
 
-import { memo, type ReactNode } from "react";
+import { memo, useState, type ReactNode } from "react";
 import type { UserId } from "../api/types";
 import { hashIndex, initials } from "../lib/format";
 import { shortId } from "../lib/names";
-import { useSharesName, useSpeaking } from "../store/store";
+import { useAvatarUrl, useSharesName, useSpeaking } from "../store/store";
 
 interface AvatarProps {
   userId: UserId;
@@ -16,18 +16,42 @@ interface AvatarProps {
   speaking?: boolean;
 }
 
-/** A round avatar with initials on a colour derived from the user id. */
+/**
+ * A round avatar: the user's picture when the app has one, over initials on a colour derived
+ * from the user id (shown while the picture loads, or if it fails).
+ */
 export const Avatar = memo(function Avatar({ userId, name, size = 32, online, speaking = false }: AvatarProps) {
+  const src = useAvatarUrl(userId);
   const cls = ["avatar", `avatar-${size}`, speaking ? "is-speaking" : "", online === false ? "is-offline" : ""]
     .filter(Boolean)
     .join(" ");
   return (
     <span className={cls} style={{ background: `var(--avatar-${hashIndex(userId, 8)})` }} aria-hidden="true">
       {initials(name)}
+      {src && <AvatarImage key={src} src={src} alt={name} size={size} />}
       {online === true && <span className="avatar-online" />}
     </span>
   );
 });
+
+/** A lazily loaded picture over the initials; it hides itself if it fails to load. */
+export function AvatarImage({ src, alt, size, className = "avatar-img" }: { src: string; alt: string; size: number; className?: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return null;
+  return (
+    <img
+      className={className}
+      src={src}
+      alt={alt}
+      width={size}
+      height={size}
+      loading="lazy"
+      decoding="async"
+      draggable={false}
+      onError={() => setFailed(true)}
+    />
+  );
+}
 
 /** An avatar whose ring follows that user's live speaking flag. Only this re-renders on speaking changes. */
 export function SpeakingAvatar(props: Omit<AvatarProps, "speaking">) {

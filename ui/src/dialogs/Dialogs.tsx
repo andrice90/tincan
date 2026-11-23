@@ -1,6 +1,7 @@
 // Renders the open dialog from the store, plus the incoming call prompt.
 
 import { useStore } from "../store/store";
+import { CropImageDialog } from "./CropImageDialog";
 import { IncomingCallDialog } from "./IncomingCallDialog";
 import {
   AddContactDialog,
@@ -63,6 +64,9 @@ export function Dialogs() {
         break;
       case "add-sound":
         node = <AddSoundDialog path={d.path} />;
+        break;
+      case "crop-image":
+        node = <CropImageDialog key={d.file.name + d.file.lastModified} file={d.file} target={d.target} back={d.back} />;
         break;
       case "rename-sound":
         node = <RenameSoundDialog clip={d.clip} />;

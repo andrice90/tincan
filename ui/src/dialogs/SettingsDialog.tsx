@@ -6,7 +6,8 @@ import type { AudioDevice, AudioDevices, Settings } from "../api/types";
 import { Modal } from "../components/Modal";
 import { hostLine } from "../components/ChannelSidebar";
 import { formatBytes } from "../lib/format";
-import { closeDialog, saveSettings, setName } from "../store/actions";
+import { Avatar } from "../components/common";
+import { closeDialog, pickImageFor, saveSettings, setAvatar, setName } from "../store/actions";
 import { useStore, type SettingsTab } from "../store/store";
 import { connStatus, debounced, fetchLimitOptions } from "./settingsLogic";
 
@@ -69,8 +70,31 @@ function ProfileTab() {
     }
   };
 
+  const removeAvatar = async () => {
+    setError(null);
+    try {
+      await setAvatar(null);
+    } catch (err) {
+      setError(errorText(err));
+    }
+  };
+
   return (
     <>
+      <div className="field">
+        <span className="field-label">Avatar</span>
+        <div className="avatar-row">
+          <Avatar userId={me.userId} name={me.name} size={64} />
+          <button type="button" className="btn" onClick={() => pickImageFor({ kind: "avatar" }, { kind: "settings", tab: "profile" })}>
+            Change avatar
+          </button>
+          {me.avatar && (
+            <button type="button" className="btn btn-ghost" onClick={() => void removeAvatar()}>
+              Remove
+            </button>
+          )}
+        </div>
+      </div>
       <div className="field">
         <label className="field-label" htmlFor="profile-name">
           Display name

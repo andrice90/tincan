@@ -32,6 +32,7 @@ import {
   speakingStore,
   transferStore,
   update,
+  type CropTarget,
   type DialogState,
   type State,
   type View,
@@ -574,6 +575,49 @@ export async function setName(name: string): Promise<void> {
   if (first) {
     run(invoke("clips", {}).then((clips) => patch({ clips })));
   }
+}
+
+/** Image types the picker offers (the webview decodes them; the crop dialog re-encodes). */
+const PICK_IMAGE_TYPES = "image/png,image/jpeg,image/webp,image/gif,image/bmp";
+
+/**
+ * Opens the native file picker for an image, then the crop dialog. Call from a click
+ * handler: the picker needs the user's gesture. A file input is used rather than the dialog
+ * plugin because the webview has to read the picked file's pixels, which a path does not
+ * give it.
+ */
+export function pickImageFor(target: CropTarget, back: DialogState | null = null): void {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = PICK_IMAGE_TYPES;
+  input.hidden = true;
+  input.dataset.testid = "image-picker";
+  const done = () => input.remove();
+  input.addEventListener("change", () => {
+    const file = input.files?.[0];
+    done();
+    if (file) openDialog({ kind: "crop-image", file, target, back });
+  });
+  input.addEventListener("cancel", done);
+  document.body.append(input);
+  input.click();
+}
+
+/** Sets my avatar from encoded image bytes, or removes it (null). Rejects with error text. */
+export async function setAvatar(bytes: Uint8Array | null): Promise<void> {
+  const me = await invoke("set_avatar", { bytes: bytes ? Array.from(bytes) : null });
+  patch({ me });
+}
+
+/** Removes a server's icon; an error becomes a toast. */
+export function removeServerIcon(serverId: ServerId): void {
+  run(setServerIcon(serverId, null));
+}
+
+/** Sets or removes (null) a server's icon. Owner only; rejects with error text. */
+export async function setServerIcon(serverId: ServerId, bytes: Uint8Array | null): Promise<void> {
+  const summary = await invoke("set_server_icon", { serverId, bytes: bytes ? Array.from(bytes) : null });
+  update((s) => ({ ...s, servers: s.servers.map((x) => (x.id === serverId ? summary : x)) }));
 }
 
 function addServer(summary: ServerSummary): void {
