@@ -26,7 +26,7 @@ use crate::pump::{self, PumpCmd};
 use crate::settings;
 use crate::shell;
 use crate::transfers::{self, AutoQueue, FetchReq};
-use crate::views::{ConvView, Refresh, SentKey};
+use crate::views::{Refresh, SentKey, ViewCache};
 use crate::{AppConfig, emit::Ev};
 
 /// Queue of holder lookups, parked-download retries and resumes (served before auto-fetch).
@@ -59,7 +59,7 @@ pub(crate) struct Core {
     /// Display name (None until picked).
     pub name: RwLock<Option<String>>,
     /// Cached conversation views.
-    pub views: Mutex<HashMap<ConvId, Arc<ConvView>>>,
+    pub views: Mutex<ViewCache>,
     /// Who may fetch which blobs from me (read by the blobs provider).
     pub access: Arc<RwLock<Access>>,
     /// The hash index (references and shares), a bounded cache over kv `app/att/<hash>`.
@@ -193,7 +193,7 @@ impl Core {
             events: Emitter::new(),
             settings: RwLock::new(settings),
             name: RwLock::new(name),
-            views: Mutex::new(HashMap::new()),
+            views: Mutex::new(ViewCache::default()),
             access,
             atts: Mutex::new(Bounded::new(CACHED_HASHES)),
             holders: Mutex::new(Bounded::new(HOLDER_HASHES)),
@@ -336,10 +336,28 @@ impl Core {
         }
         let core = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = core.net.publish(server, Body::Profile { name }).await {
-                tracing::info!(server = %server.short(), error = %e, "publishing my name failed; will retry on reconnect");
+            let mut name = name;
+            loop {
+                if let Err(e) = core.net.publish(server, Body::Profile { name: name.clone() }).await {
+                    // Not retried here (it would spin while disconnected): the next
+                    // connection runs `ensure_profile` again.
+                    tracing::info!(server = %server.short(), error = %e, "publishing my name failed; will retry on reconnect");
+                    core.profile_inflight.lock().remove(&server);
+                    return;
+                }
+                // A rename made while this was in flight skipped this server: publish the
+                // current name too. Compared with what was just published, not with the
+                // view, which may not show the publish yet.
+                match core.name.read().clone() {
+                    Some(current) if current != name => name = current,
+                    _ => break,
+                }
             }
             core.profile_inflight.lock().remove(&server);
+            // A rename between the last check and the removal above was skipped too.
+            if core.name.read().as_deref() != Some(name.as_str()) {
+                core.ensure_profile(server);
+            }
         });
     }
 
@@ -381,13 +399,25 @@ impl Core {
         });
     }
 
-    /// Refresh every DM summary (online states follow rosters and DM links).
+    /// Refresh every DM summary (online states follow rosters and DM links). DMs come
+    /// from the store's conversation list, so server views are not rebuilt for this.
     pub(crate) fn refresh_dms(&self) {
-        for conv in self.net.convs() {
-            if self.view(&conv).is_some_and(|v| v.is_dm) {
-                self.refresh(&conv, Refresh { dm: true, ..Refresh::default() });
+        for c in self.storage.convs().unwrap_or_default() {
+            if c.is_dm {
+                self.refresh(&c.id, Refresh { dm: true, ..Refresh::default() });
             }
         }
+    }
+
+    /// A DM contact announced a new name: keep the contact record in step, refresh the DM
+    /// summary and any call or voice DTO showing them. Cached message pages in the UI keep
+    /// the old author name until they are read again (a peer can send names often, so no
+    /// snapshot is sent for it).
+    pub(crate) fn on_dm_name(self: &Arc<Self>, peer: UserId) {
+        if let Some(name) = self.dm_name(&peer) {
+            self.update_contact_name(&peer, &name);
+        }
+        self.media.on_name_changed(self, peer);
     }
 
     /// Test hook backing: loopback addresses of the endpoint's IPv4 sockets.

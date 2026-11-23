@@ -1,8 +1,9 @@
 //! Cached per-conversation views and the DTO builders.
 //!
-//! `Net::conv_state` clones the whole `ConvState`, message index included, so it is never
-//! called per message. Each conversation gets a small [`ConvView`] (names, channels, owner)
-//! that is rebuilt only after a non-message change (`NetEvent::ConvUpdated`).
+//! Each conversation gets a small [`ConvView`] (names, channels, owner), built from the live
+//! state under the replica lock (`Net::with_state`, no copy of the message index) and
+//! rebuilt only after a non-message change (`NetEvent::ConvUpdated`). [`ViewCache`] keeps
+//! a view built before a concurrent invalidation out of the cache.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -95,6 +96,38 @@ impl ConvView {
     pub fn is_owner(&self, user: &UserId) -> bool { self.owner.as_ref() == Some(user) }
 }
 
+/// The cached views, with a generation per conversation that every invalidation bumps.
+#[derive(Debug, Default)]
+pub(crate) struct ViewCache {
+    views: HashMap<ConvId, Arc<ConvView>>,
+    gens: HashMap<ConvId, u64>,
+}
+
+impl ViewCache {
+    /// The cached view of `conv`.
+    pub fn get(&self, conv: &ConvId) -> Option<Arc<ConvView>> { self.views.get(conv).cloned() }
+
+    /// The generation of `conv`: read it before building a view, pass it to
+    /// [`ViewCache::insert_if`].
+    pub fn generation(&self, conv: &ConvId) -> u64 { self.gens.get(conv).copied().unwrap_or(0) }
+
+    /// Cache `view` unless `conv` was invalidated since `generation` was read (the view was
+    /// built from a state older than the change). True when cached.
+    pub fn insert_if(&mut self, conv: ConvId, generation: u64, view: Arc<ConvView>) -> bool {
+        if self.generation(&conv) != generation {
+            return false;
+        }
+        self.views.insert(conv, view);
+        true
+    }
+
+    /// Drop the view of `conv` and bump its generation.
+    pub fn invalidate(&mut self, conv: &ConvId) {
+        self.views.remove(conv);
+        *self.gens.entry(*conv).or_default() += 1;
+    }
+}
+
 /// First 8 characters of the z32 id: the fallback display name.
 pub(crate) fn short_name(user: &UserId) -> String { user.to_z32().chars().take(8).collect() }
 
@@ -177,17 +210,21 @@ fn roster_current(s: ConnState) -> bool { matches!(s, ConnState::Member | ConnSt
 impl Core {
     /// The cached view of `conv` (built on first use). None for unknown conversations.
     pub(crate) fn view(&self, conv: &ConvId) -> Option<Arc<ConvView>> {
-        if let Some(v) = self.views.lock().get(conv) {
-            return Some(v.clone());
-        }
-        let st = self.net.conv_state(conv)?;
-        let v = Arc::new(ConvView::from_state(&st, &self.me));
-        self.views.lock().insert(*conv, v.clone());
+        let generation = {
+            let cache = self.views.lock();
+            if let Some(v) = cache.get(conv) {
+                return Some(v);
+            }
+            cache.generation(conv)
+        };
+        // Built under the replica lock, without holding the cache lock.
+        let v = Arc::new(self.net.with_state(conv, |st| ConvView::from_state(st, &self.me))?);
+        self.views.lock().insert_if(*conv, generation, v.clone());
         Some(v)
     }
 
     /// Drop the cached view (after a non-message change).
-    pub(crate) fn invalidate_view(&self, conv: &ConvId) { self.views.lock().remove(conv); }
+    pub(crate) fn invalidate_view(&self, conv: &ConvId) { self.views.lock().invalidate(conv); }
 
     /// A server view, or the user-facing error for an unknown server.
     pub(crate) fn server_view(&self, conv: &ConvId) -> Result<Arc<ConvView>, String> {
@@ -197,21 +234,46 @@ impl Core {
         }
     }
 
-    /// Display name of `user` for DMs and typing: my name, a server name, the contact
-    /// record, or the short id.
+    /// The name `user` announced over our DM (cleaned like every peer name), if any.
+    pub(crate) fn dm_name(&self, user: &UserId) -> Option<String> {
+        self.net.dm_peer_name(&ConvId::dm(&self.me, user)).map(|n| clean_text(&n)).filter(|n| !n.is_empty())
+    }
+
+    /// The name of `user` in any server I am in (views are rebuilt when not cached).
+    fn server_name(&self, user: &UserId) -> Option<String> {
+        self.net.convs().iter().filter_map(|c| self.view(c)).filter(|v| !v.is_dm).find_map(|v| v.display_name(user))
+    }
+
+    /// Display name of `user` for DMs, calls and typing: my name, the name they announced
+    /// over our DM, their name in a server, the contact record, or the short id.
     pub(crate) fn user_name(&self, user: &UserId) -> String {
         if *user == self.me
             && let Some(n) = self.name.read().clone()
         {
             return n;
         }
-        let views: Vec<Arc<ConvView>> = self.views.lock().values().cloned().collect();
-        if let Some(n) = views.iter().filter(|v| !v.is_dm).find_map(|v| v.display_name(user)) {
+        if let Some(n) = self.dm_name(user).or_else(|| self.server_name(user)) {
             return n;
         }
         match self.storage.get_contact(user).map(|c| c.map(|c| clean_text(&c.name))) {
             Ok(Some(name)) if !name.is_empty() => name,
             _ => short_name(user),
+        }
+    }
+
+    /// Keep the contact record's name in step with a better name learned since (their DM
+    /// announcement or a server name), so it is right where nothing else is known.
+    pub(crate) fn update_contact_name(&self, user: &UserId, name: &str) {
+        if name.is_empty() || name == short_name(user) {
+            return;
+        }
+        if let Ok(Some(c)) = self.storage.get_contact(user)
+            && c.name != name
+        {
+            let rec = tincan_store::ContactRecord { name: name.to_string(), ..c };
+            if let Err(e) = self.storage.upsert_contact(&rec) {
+                tracing::warn!(error = %e, "updating a contact name failed");
+            }
         }
     }
 
@@ -363,10 +425,12 @@ impl Core {
         let view = self.view(conv)?;
         let peer = view.peer?;
         let last = self.storage_messages(conv, None, None, 1).into_iter().next();
+        let name = self.user_name(&peer);
+        self.update_contact_name(&peer, &name);
         Some(dto::DmSummary {
             conv_id: conv.to_hex(),
             user_id: peer.to_z32(),
-            name: self.user_name(&peer),
+            name,
             online: self.net.peer_online(&peer),
             unread: self.storage.unread(conv, None, &self.me).unwrap_or(false),
             last_message_at: last.map(|e| hlc_ms(e.event.hlc)),
@@ -466,6 +530,44 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(name: &str) -> Arc<ConvView> {
+        Arc::new(ConvView {
+            conv: ConvId([1; 32]),
+            is_dm: false,
+            peer: None,
+            name: name.into(),
+            owner: None,
+            channels: Vec::new(),
+            all_channels: BTreeMap::new(),
+            members: Vec::new(),
+            names: HashMap::new(),
+        })
+    }
+
+    /// APP-CORE-07: a view built before an invalidation is returned but not cached.
+    #[test]
+    fn a_view_built_before_an_invalidation_is_not_cached() {
+        let conv = ConvId([1; 32]);
+        let mut c = ViewCache::default();
+        let g = c.generation(&conv);
+        assert!(c.insert_if(conv, g, view("old")));
+        // A command thread misses and starts building from the old state...
+        c.invalidate(&conv);
+        let g = c.generation(&conv);
+        // ...the change lands and the pump invalidates (and may rebuild) meanwhile...
+        c.invalidate(&conv);
+        assert!(c.insert_if(conv, c.generation(&conv), view("new")));
+        // ...then the stale build must not replace the fresh one.
+        assert!(!c.insert_if(conv, g, view("stale")));
+        assert_eq!(c.get(&conv).unwrap().name, "new");
+        // Same with nothing cached in between.
+        c.invalidate(&conv);
+        let g = c.generation(&conv);
+        c.invalidate(&conv);
+        assert!(!c.insert_if(conv, g, view("stale")));
+        assert!(c.get(&conv).is_none());
+    }
 
     #[test]
     fn peer_names_are_cleaned_for_display() {

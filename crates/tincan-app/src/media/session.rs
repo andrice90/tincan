@@ -485,6 +485,21 @@ impl Media {
         Some(session)
     }
 
+    /// `user`'s display name changed: re-send the call and voice DTOs that show it.
+    pub(crate) fn on_name_changed(&self, core: &Arc<Core>, user: UserId) {
+        if self.is_closed() {
+            return;
+        }
+        let call = core.net.call_info().filter(|c| c.peer == user);
+        if let Some(d) = call.as_ref().and_then(|c| call_dto(core, c)) {
+            core.events.emit(Ev::CallUpdated, d);
+        }
+        let mut st = self.st.lock();
+        if st.attached.is_some() {
+            self.emit_voice(core, &mut st);
+        }
+    }
+
     /// A server's roster changed.
     pub(super) fn on_roster(&self, core: &Arc<Core>, server: ServerId) {
         let mut st = self.st.lock();

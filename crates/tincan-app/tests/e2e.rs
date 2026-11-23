@@ -725,6 +725,19 @@ async fn direct_messages_and_offline_delivery() {
     let again = call(&a.app, "send_message", json!({ "convId": conv, "channelId": null, "text": "one more", "attachments": [] })).await;
     wait_for(&mut a.rx, "dm-updated", 5, |d| d["convId"] == conv.as_str() && d["lastMessageAt"] == again["sentAt"]).await;
 
+    // Q5: a contact who shares no server shows the name they announced over the DM, in the
+    // DM list and as the author of their messages.
+    let dm_name = |app: Arc<App>| async move { call(&app, "app_snapshot", json!({})).await["dms"][0]["name"].as_str().map(str::to_string) };
+    eventually("Bob's DM name", 10, || async { (dm_name(a.app.clone()).await.as_deref() == Some("Bob")).then_some(()) }).await;
+    let page = call(&a.app, "messages", json!({ "convId": conv, "channelId": null, "before": null, "limit": 10 })).await;
+    let from_bob: Vec<&Value> = page["messages"].as_array().unwrap().iter().filter(|m| m["authorId"] == b.user.as_str()).collect();
+    assert!(!from_bob.is_empty() && from_bob.iter().all(|m| m["authorName"] == "Bob"), "{page}");
+    // A rename reaches the contact, cleaned of bidi controls (names may contain them).
+    call(&b.app, "set_name", json!({ "name": "Bob\u{202E}by" })).await;
+    eventually("Bob's new DM name", 10, || async { (dm_name(a.app.clone()).await.as_deref() == Some("Bobby")).then_some(()) }).await;
+    call(&b.app, "set_name", json!({ "name": "Bob" })).await;
+    eventually("Bob's name back", 10, || async { (dm_name(a.app.clone()).await.as_deref() == Some("Bob")).then_some(()) }).await;
+
     // Bob goes offline; Alice's message waits in her outbox.
     b.app.shutdown().await;
     let b_user = b.user.clone();
@@ -765,7 +778,9 @@ async fn owner_changes_and_deletes_propagate() {
     all_online(&[&a, &b], &server).await;
     settle_after_join().await;
 
-    // Renaming myself publishes a Profile in every server.
+    // Renaming myself publishes a Profile in every server. APP-CORE-08: a second rename
+    // while the first one's publish is in flight reaches the server too.
+    call(&b.app, "set_name", json!({ "name": "Bob the first" })).await;
     call(&b.app, "set_name", json!({ "name": "Bobby" })).await;
     wait_for(&mut a.rx, "members-updated", 20, |m| {
         m["serverId"] == server.as_str() && m["members"].as_array().unwrap().iter().any(|x| x["userId"] == b.user.as_str() && x["name"] == "Bobby")

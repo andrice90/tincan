@@ -476,6 +476,10 @@ impl Pump {
                     core.on_connected(server);
                 }
             }
+            NetEvent::DmNameChanged { conv, peer, .. } => {
+                core.on_dm_name(peer);
+                self.mark(conv, Refresh { dm: true, ..Refresh::default() });
+            }
             NetEvent::SyncComplete { conv } => {
                 let now = Instant::now();
                 if let Some(b) = self.bulks.sync_complete(conv, now) {
