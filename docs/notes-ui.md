@@ -38,7 +38,7 @@ Used automatically outside Tauri (`window.__TAURI_INTERNALS__` missing). Loaded 
 URL flags: `?fresh` (name picker, no servers), `?noenc` (screen_start fails with `no-hardware-encoder`), `?ring` (incoming call from Alex), `?noanswer` (outgoing calls ring for 45 s, then "X didn't answer."). Console helpers on `window.tincanMock`:
 
 - `ring(name)`, `online(name)`, `offline(name)` (Riley coming online delivers pending DMs), `migrate()` (Game night host moves to Morgan), `toast(text)`.
-- For scripted checks: `state()` (the mock's voice and call), `addMember(name, server?)` (a name clash), `soundFlood(count)` (heard clips nobody owns), `snapshot()`, `delay(command, ms)`, `post(name, text, channel?)` and `typing(name, channel?)` (Game night channels), `finishQuietly(fileName)` (a download completes with its final event dropped).
+- For scripted checks: `state()` (the mock's voice and call), `addMember(name, server?)` (a name clash), `soundFlood(count)` (heard clips nobody owns), `snapshot()`, `delay(command, ms, reply?)` (latency before the command runs, or with `reply` after it ran, so events sent meanwhile arrive before its result), `post(name, text, channel?)` and `typing(name, channel?)` (Game night channels), `finishQuietly(fileName)` (a download completes with its final event dropped).
 
 The mock follows the app where it matters to the UI: a hosted server has `path: "none"` and no RTT, `settings_set` clamps volumes to 0..2 and `autoFetchLimit` to 25 MB, `clip_add` takes MP3, WAV, OGG, FLAC and M4A only, `messages` pages are at most 200, and participants carry `volume` (Jordan is saved at 30%).
 

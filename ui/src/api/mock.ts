@@ -1456,8 +1456,9 @@ const handlers: Handlers = {
 
 // ------------------------------------------------------------------ backend
 
-/** Extra latency per command, set with tincanMock.delay(). */
+/** Extra latency per command, set with tincanMock.delay(): before it runs, or after (`reply`). */
 const delays = new Map<string, number>();
+const replyDelays = new Map<string, number>();
 
 /** The mock backend used outside Tauri. */
 export const mockBackend: Backend = {
@@ -1467,7 +1468,10 @@ export const mockBackend: Backend = {
     await sleep(15 + (delays.get(name) ?? 0));
     try {
       const result = await h(structuredClone(args ?? {}));
-      return result === undefined ? null : structuredClone(result);
+      const copy = result === undefined ? null : structuredClone(result);
+      // the command ran; its result reaches the UI later (events sent meanwhile arrive first)
+      if (replyDelays.has(name)) await sleep(replyDelays.get(name) ?? 0);
+      return copy;
     } catch (err) {
       // Tauri rejects with the command's error string, so do the same.
       throw err instanceof CmdError ? err.message : String(err);
@@ -1525,8 +1529,8 @@ declare global {
       soundFlood(count: number): void;
       /** Emits a snapshot, as the app does after a lag or a bulk catch-up. */
       snapshot(): void;
-      /** Adds extra latency to one command (0 to clear). */
-      delay(command: string, ms: number): void;
+      /** Adds extra latency to one command (0 to clear), before it runs or, with `reply`, after. */
+      delay(command: string, ms: number, reply?: boolean): void;
       /** Someone posts a message in a Game night channel. */
       post(name: string, text: string, channel?: string): void;
       /** Someone types once in a Game night channel. */
@@ -1567,9 +1571,10 @@ if (typeof window !== "undefined") {
       emit("server-updated", s.summary);
     },
     snapshot: () => emit("snapshot", snapshot()),
-    delay: (command, ms) => {
-      if (ms > 0) delays.set(command, ms);
-      else delays.delete(command);
+    delay: (command, ms, reply = false) => {
+      const map = reply ? replyDelays : delays;
+      if (ms > 0) map.set(command, ms);
+      else map.delete(command);
     },
     post: (name, text, channelName = "general") => {
       const s = st.servers.find((x) => x.summary.name === "Game night");
