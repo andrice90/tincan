@@ -202,7 +202,7 @@ Admitted members and DM contacts are untrusted, and hashes are not secret: tinca
 ## Peer text
 
 - **Names in DTOs:** peer display names (members, authors, DM and call names, typing, voice participants, `sound-played`), contact names, server and channel names, attachment names and clip names have control characters and the hidden format characters above removed (`shell::clean_text`, `views::display`). Attachment names also fold whitespace runs (`views::file_display`), like the export. The attachment MIME in the DTO is the type of the cleaned file name, not the sender's claim, so the UI's icon and image preview match what `open_file` will do. Stored names stay as published, because commands compare against them.
-- Removing U+200C and U+200D also splits emoji joined with ZWJ and changes some Persian and Indic text. The task asked for the whole range.
+- The whole range U+200B-U+200F is removed from names, U+200C and U+200D included. That splits emoji joined with ZWJ and changes some Persian and Indic text; it was chosen over keeping invisible joiners that can make two names look the same.
 - **Host refusals** (`net_err`): `NetError::Rejected` text that came from a host is shown as `The host refused this: "<text>"`, with hidden characters removed, whitespace folded and the text cut to 200 characters. Exact matches of the sentences tincan-net writes itself and of an honest host's join refusals (invite not valid, revoked, used up, clock checks) are shown as they are. A tincan-net variant for peer text would replace the string match.
 
 ## Settings

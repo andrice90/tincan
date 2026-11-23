@@ -257,12 +257,16 @@ impl Core {
             if let Err(e) = self.storage.set_kv(&index::key(&hash), &index::encode(&info)) {
                 tracing::warn!(error = %e, "saving the attachment index failed");
             }
-            let shared = (info.shared != before).then(|| info.shared.clone());
+            let changed = info.shared != before;
+            if changed {
+                // Under the index lock too, so two updates cannot reach the access state
+                // out of order.
+                self.access.write().set_shared(hash, &info.shared);
+            }
             cache.insert(hash, info);
-            shared
+            changed
         };
-        if let Some(shared) = shared {
-            self.access.write().set_shared(hash, &shared);
+        if shared {
             self.announce_changed(hash);
         }
         true
@@ -375,8 +379,20 @@ impl Core {
     /// Copy the persisted shares of a held `hash` into the access state and announce it
     /// when it is shared with a server I am in.
     pub(crate) fn load_access(&self, hash: BlobHash) {
-        let shared = self.att_info(&hash).map(|i| i.shared).unwrap_or_default();
         let announces = {
+            // Read and applied under the index lock, like `update_info`.
+            let mut cache = self.atts.lock();
+            let shared = match cache.get(&hash) {
+                Some(i) => i.shared.clone(),
+                None => match self.load_info(&hash) {
+                    Some(i) => {
+                        let shared = i.shared.clone();
+                        cache.insert(hash, i);
+                        shared
+                    }
+                    None => Vec::new(),
+                },
+            };
             let mut a = self.access.write();
             a.set_shared(hash, &shared);
             a.announces(&hash)
