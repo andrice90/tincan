@@ -10,7 +10,7 @@ Crate: `crates/tincan-net`. Rustdoc: `cargo doc -p tincan-net --no-deps`. This p
    - mDNS (`"tincan1"`, cadence 5 s) when `cfg.mdns`. `Net::start` subscribes to it and dials LAN peers that are members of my servers.
 2. `Files::load(.., endpoint.clone(), ..)`.
 3. `let net = Net::start(endpoint, storage, identity, cfg, |b| b.accept(tincan_files::ALPN, files.protocol())).await?;`
-4. Forward `net.subscribe()` events to the UI. On `RecvError::Lagged`, refresh from `conv_state` or storage. During a large first sync, thousands of `EventAdded` can arrive within a second.
+4. Forward `net.subscribe()` events to the UI. On `RecvError::Lagged`, refresh from `with_state` or storage. During a large first sync, thousands of `EventAdded` can arrive within a second; `SyncComplete { conv }` follows the last of them (see below).
 5. On exit: `net.shutdown().await`. It hands off every hosted server (up to 2 s for the ack plus 1 s flush), closes DMs, then `router.shutdown()`. That closes the endpoint and runs `Files::shutdown`.
 
 `NetConfig.display_name` is new compared to the task sketch. It is needed for the owner `Profile` of `create_server` and the `Profile` inside a `JoinRequest`. Change it with `set_display_name`. Renaming inside a server is a normal `publish(server, Body::Profile { name })`.
@@ -36,6 +36,22 @@ Crate: `crates/tincan-net`. Rustdoc: `cargo doc -p tincan-net --no-deps`. This p
 - `leave(server)` publishes `MemberLeave` (best effort, 5 s), hands off if hosting, deletes the conv, its events and its peers, and emits `Left`. The own-seq floor in kv (`net/own_seq/<conv>`) is kept on purpose, so a re-join continues the seq chain.
 - An incoming DM from a stranger (someone who pasted my user code, no shared server, no stored conversation) creates the DM conversation (`DmOpened`) only when their first valid message arrives. A connection alone stores nothing. At most 8 stranger connections are held at once, new ones are limited to 10 a minute, and at most 32 conversations opened by strangers that I never answered are kept. Further first messages from strangers are ignored.
 - `create_invite(server)` makes an unlimited invite (as before). `create_invite_with(server, max_uses)` sets a use limit. Hosts rate limit joins: per invite 10 at once, then one per 10 s; per invite creator 20 at once, then one a minute. A join over the limit fails with "Too many people are joining right now. Try again in a minute." (`RejectCode::Busy`).
+- `NetEvent::SyncComplete { conv }`: the initial history sync of `conv` is in. Every event it applied came before as `EventAdded`. Once per connection:
+  - Servers: when the host's empty last page (`Events{[], more: false}`) arrives, after every (re)connect to a host, a host migration included. Never while this device hosts or is solo, and not for later resyncs (`VvDigest`), so the app still needs its own bulk detection for those.
+  - DMs: after every DM connect. At once when the contact's `DmHello` heads show nothing I lack; otherwise on their empty last page. A stranger whose first message opens the conversation gets it on that page too (or at once when the message came live). A modified client can list events in its hello and never send them; then no `SyncComplete` comes for that connection, so the app keeps its own timeout.
+- `with_state(conv, |st| ..) -> Option<R>` reads the live `ConvState` without copying it. `conv_state` clones everything (the per-message index included, O(history)). The closure runs under the conversation's lock, which is not reentrant: copy out what you need and call nothing on `Net` inside it.
+- `roster(server)` right after this device takes over as host (handoff, failover, cold-open promotion) is the new host's roster: me plus whoever is linked, never the host that just left. It is recorded (and `RosterUpdated` emitted) before the `ConnectionChanged` that says I host; the debounced broadcast follows as before.
+- DM display names: both sides send `Ctl::DmProfile { name }` once a DM connection is up, and again on every open DM connection when `set_display_name` changes the name.
+  - `dm_peer_name(conv)` is the name the contact announced (None until they did), persisted in kv `net/dm_name/<conv>` and loaded across restarts. `NetEvent::DmNameChanged { conv, peer, name }` fires when it changes.
+  - Kept only if the trimmed name passes `state::validate_name` (1-100 characters, no control characters). At most 3 changes per contact, then one per 5 s, are stored and announced. Bidi overrides and zero-width characters are not control characters: the app must clean them as it does for server display names.
+  - A stranger's name is held in memory and stored when their first message opens the conversation.
+  - It is not the `ConvRecord.name` of the DM (that stays the server name or short id it was created with), so the app can tell an announced name from a fallback.
+- DM presence for contacts who share no server (`peer_online` is then only "a DM connection is up", and an idle connection closes after 120 s):
+  - `dm_watch(peer) -> DmWatch`: while the guard lives the DM connection is kept up. It dials now (opening the DM conversation if needed, like `dm_open`), redials a lost or failed connection after 2, 5, 15, 30 s, then every minute, also at once when an address for the contact is learned or they show up in a roster. While connected it sends a `Tick` every 45 s, so the contact's side does not close the connection as idle (the idle timer runs on both ends and only counts received frames; a `DmHold` is local and does not stop the contact's side). Every version ignores a `Tick` on a DM link. Hold one while the contact's DM is on screen. Dropping it lets the connection idle out as before. A contact who has no conversation with me yet sees my watched connection as a stranger's and it takes one of their 8 stranger slots until I write to them.
+  - `dm_reachable(peer).await -> bool`: true at once while connected. Otherwise it dials and waits until the dial connects or fails (at most two dial timeouts); a connection made this way stays open as usual. After a failed probe, the next ones answer false at once for 2, 5, 15, 30 s, then a minute after each further failure. False at once for users with no DM conversation (nothing is dialed or created).
+- DM redial: an `ensure_connect` (a new address, a roster sighting, a publish, a watch) that arrives while a dial is in flight is remembered. If that dial fails and the contact's address changed since it started, the next dial goes out at once instead of after the backoff (measured on loopback: delivered 1.7 s after a restarted contact's new address arrived, with a 2 s dial timeout and a 60 s backoff). Without an address change the backoff applies, so a contact listed online but unreachable cannot cause back-to-back dials.
+- `VoiceInfo.rtt_ms`: RTT of the media path, to the host in a room and to the peer in a call; None while hosting or disconnected. Refreshed every second; `VoiceUpdated` fires only when it moves by at least 25 % and 10 ms.
+- `CallInfo.peer_short_id` is the peer's short id in the call (their voice packets carry `track_id(peer_short_id, KIND_VOICE)`). `call_short_id(me, peer)` is exported: the lower user id takes 0. `CallInfo.rtt_ms` is the DM connection's RTT, filled by `call_info()`, `call_start` and the `CallInvite`/`CallUpdated` events; None once the call ended.
 - `join(invite)` errors are user sentences:
   - "This invite has expired."
   - "This invite is not valid for this server."
@@ -71,6 +87,7 @@ Crate: `crates/tincan-net`. Rustdoc: `cargo doc -p tincan-net --no-deps`. This p
   - The host replies to a member's `SyncHave` with its own (if it lacks something) at most every 30 s, and not right after `Welcome` (it already sent one). This bounds resync ping-pong when an event is permanently rejected.
   - At most one `send_missing` runs per link (host member links, the probe link, the member's link to its host, DM links). A further `SyncHave` replaces the queued request and runs when the current one is done. Host side, full syncs per member are budgeted (burst 3, then one per 10 s, keyed by user id), never dropped. More than 30 `SyncHave` per link and minute drops the member.
   - Heads larger than 8192 authors go as `SyncHavePart{heads, more}` frames; the receiver collects them until `more == false`. `Link::send` returns false when a frame cannot be encoded (it used to report success).
+  - A received page (`Events`, on server and DM links) is stored with one `Storage::insert_events` call, so `SqliteStorage` commits once per page instead of once per event (`Replica::ingest_many`). Verdicts, equivocation checks and `EventAdded` order are unchanged; before a stale event is checked for equivocation, what the page applied so far is stored first. Measured with `tests_store::history_sync_into_sqlite` (a joiner with an on-disk SQLite file syncs 1000 messages, debug build, three joiners per run): 155-188 ms per sync before, 61-75 ms after (two runs each). The storage part alone (`tincan-store` `insert_events_is_one_commit`): about 81 ms one by one, 4-5 ms batched.
 - **Publish acks:**
   - The host answers `ok: true` for an event it already stores with the same id.
   - It answers `ok: false, reason: "gap"` without buffering when a prerequisite is missing; the member retries the same signed event up to 5 times, every 500 ms.
@@ -82,7 +99,7 @@ Crate: `crates/tincan-net`. Rustdoc: `cargo doc -p tincan-net --no-deps`. This p
   - A member keeps only current members from a host's roster (duplicates removed, at most 8 direct addresses and a 256-byte relay URL each, succession members only). Rosters with more than 256 entries are refused, and at most 4 per second are processed. A new host inherits short ids only for current members. When every short id is taken, one held by a user who is not connected is reclaimed. A duplicate is never handed out.
   - `RosterEntry.voice` of members comes from the host SFU (set only by `VoiceJoin`/`VoiceLeave`), not from the member's `Status.voice`. The host's own entry still uses its local status. Mute, deafen and sharing still come from `Status`.
   - The host broadcasts the roster at most every `roster_min_interval` (1 s, or 5 s after more than 20 broadcasts in the last minute) and skips a broadcast when nothing but `rev` changed.
-- **DM ack:** after applying at least one event, the receiver replies `SyncHave{heads}`. That is the delivery confirmation and is persisted in `net/dm_ack/<conv>`. There is no reply to an empty `Events`, and none when nothing was applied, so permanent rejects cannot ping-pong. Simultaneous dials keep the connection dialed by the lower user id. An idle DM connection closes after 120 s unless it is held (`dm_hold`) or has undelivered events.
+- **DM ack:** after applying at least one event, the receiver replies `SyncHave{heads}`. That is the delivery confirmation and is persisted in `net/dm_ack/<conv>`. There is no reply to an empty `Events`, and none when nothing was applied, so permanent rejects cannot ping-pong. Simultaneous dials keep the connection dialed by the lower user id. An idle DM connection closes after 120 s unless it is held (`dm_hold`), watched (`dm_watch`) or has undelivered events.
   - DM replicas buffer at most 64 early events (256 KiB). Strangers' early events are never buffered.
 
 ## Hardening: what a modified client cannot do
@@ -128,7 +145,8 @@ Members hold `server_secret` but are not trusted. Every limit below is far above
 
 **Wire**
 - `Ctl::within_limits` is checked on decode (names, reasons, list lengths, address hints). Frames over the limits are skipped like undecodable ones. `PublishAck` is never dropped for its reason length; the receiver cleans the text.
-- Appended: `Ctl::Attest(SignedAttestation)` (36), `Ctl::HostCompare2{claim, attests}` (37), `Ctl::SyncHavePart{heads, more}` (38), and `RejectCode::Busy` (last).
+- Appended: `Ctl::Attest(SignedAttestation)` (36), `Ctl::HostCompare2{claim, attests}` (37), `Ctl::SyncHavePart{heads, more}` (38), `Ctl::DmProfile{name}` (39), and `RejectCode::Busy` (last).
+- DM keepalive reuses `Ctl::Tick` (every version ignores it on a DM link), so a watcher keeps older contacts connected too. A contact on an older version skips `DmProfile`, so they never learn my name, and I never learn theirs.
 
 **Epochs**
 - Every peer claim (Welcome, Redirect, HostMoved, Handoff, merge compares) must be at most the epoch ceiling plus 5 min of skew: `election::epoch_plausible`, with `epoch_ceiling(now) = unix seconds + 1 000 000` (`EPOCH_SLACK`). The ceiling needs no history, so a fresh joiner, or a member that was offline for months, accepts any honest host, and `u64` never runs out. Pushing the epoch up gains nothing, since every node accepts any epoch below the ceiling. A merge win claims above the loser only within the ceiling without skew (`epoch_claimable`), so the winner's members accept it.
@@ -230,7 +248,7 @@ Events to wire:
 Idle cost:
 - Member: one 2 s tick timer per connected server.
 - Solo host: no tick, probe timer only.
-- DM: one 120 s idle timer per open connection.
+- DM: one timer per open connection, waking every 45 s (keepalive check) and at the 120 s idle deadline. A watched contact costs one `Tick` frame per 45 s while connected, and redials on the watch backoff while not.
 - No polling loops.
 
 ## Known limits
@@ -242,6 +260,7 @@ Idle cost:
 - The proactive-migration decision is unit tested (`Proactive::evaluate`). The full 10-minute migration path was not run end to end.
 - `Hello` has no address field. A host learns a member's address only from QUIC paths, and over a relay that is the relay URL.
 - DM pending state is "my head > peer's ack". A message whose signature the peer rejects stays pending forever.
+- Without a watch, a contact who shares no server shows offline as soon as the idle DM connection closes. An idle close and a quit look the same to the other side (both `CLOSE_NORMAL`), so presence is only as good as the watch or the last probe.
 - A refused event is parked, never dropped, so a host that refuses for good blocks my publishing in that server until I reach another host (it could censor me anyway).
 - Equivocation is detected and reported but not resolved: replicas keep whichever version they saw first, and the proof is not sent to others.
 - Two hosts that count each other's members differently (one lacks the other's recent admissions) may both think they won a merge; nothing moves until a later round agrees (up to 3 extra rounds after the cooldown, then the normal probes).

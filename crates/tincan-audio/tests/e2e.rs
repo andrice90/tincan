@@ -232,3 +232,27 @@ async fn custom_io_idles_without_call_and_mic_test_reports_levels() {
     assert!((6..=16).contains(&levels.len()), "{} level events", levels.len());
     assert!(levels.iter().all(|l| *l > 0.5 && *l <= 1.0), "{levels:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn is_running_turns_false_when_the_engine_thread_dies() {
+    let (e, _events) = AudioEngine::new(AudioConfig::default()).unwrap();
+    assert!(e.is_running());
+    /// A microphone that panics on the engine thread at its first read.
+    struct Panicking;
+    impl AudioSource for Panicking {
+        fn read(&mut self, _frame: &mut [f32]) {
+            panic!("test: synthetic microphone failure");
+        }
+    }
+    e.set_io(AudioIo::Custom { source: Box::new(Panicking), sink: Box::new(NullSink) });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(e.is_running(), "idle: nothing read the source yet");
+    e.mic_test(true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while e.is_running() {
+        assert!(Instant::now() < deadline, "the engine thread never stopped");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    assert!(e.start_call(4, 1, tx).is_err(), "a stopped engine refuses commands");
+}

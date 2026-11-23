@@ -26,6 +26,7 @@ What the other crates need to know beyond the doc comments. Rustdoc: `cargo doc 
 - Index events by `StoredEvent::conv()`, not `event.server`: a Genesis event carries `server = [0; 32]`.
 - `mark_deleted` must keep the signed bytes. Deleted events are still synced, because seqs are contiguous. If the body is purged, later joiners can never receive the rest of that author's history. Hide the text in queries instead.
 - `MemStorage` is the reference implementation. Its tests in `storage.rs` show the required ordering and paging semantics.
+- `Storage::insert_events(&[&StoredEvent]) -> Vec<Result<bool>>` stores a sync page: one result per event, in order, each with the `insert_event` semantics, and a refused (conflicting) event does not affect the others. The trait has a default that calls `insert_event` per event (what `MemStorage` uses); `SqliteStorage` overrides it with one transaction per page. tincan-net stores every applied batch through it (`Replica::ingest_many`).
 
 ## Sync (net)
 
@@ -67,3 +68,5 @@ None of these changes a signature.
 - Additions to existing types:
   - `state::Member` gained `admits`, `last_leave` and `admitted_hlc`.
   - `ConvState` derives `PartialEq, Eq`.
+  - `Storage::insert_events` (a provided method, so existing implementations still compile).
+  - `Ctl::DmProfile { name }`, appended as variant 39: the sender's display name on a DM connection. `within_limits` drops names over `4 * MAX_NAME_CHARS` bytes; receivers also run `state::validate_name` on the trimmed name. Peers that predate it skip the frame, since `FrameDecoder` consumes undecodable frames. Putting the name into `DmHello` instead was not done: postcard is not self-describing, so a 4-field `DmHello` cannot decode an old 3-field one.

@@ -1127,6 +1127,12 @@ impl Session {
             h.accept_member(&mut self.ctx, link, hello);
         }
         h.mark_roster(&self.ctx);
+        // Record the roster as it is now (me plus whoever is linked), before anyone hears
+        // that I host: until the debounced broadcast, `Net::roster` would still be the old
+        // host's roster, listing the host that just left. `roster_sent` stays empty, so the
+        // first broadcast is not delayed.
+        let fresh = h.build_roster(&self.ctx, false);
+        self.ctx.note_roster(&fresh);
         self.role = Role::Host(Box::new(h));
         self.ctx.update_info(&self.role);
         self.pump_publishes();
@@ -1419,13 +1425,15 @@ impl Ctx {
     /// Like `ingest_signed`; also reports whether a batch carried an event with a bad
     /// signature (honest peers only forward events they verified). Events already stored
     /// (same id at or below the author's head) are skipped before the signature check, so
-    /// replayed history costs a hash, not an ed25519 verification.
+    /// replayed history costs a hash, not an ed25519 verification. The batch is stored with
+    /// one `Storage::insert_events` call (one SQLite transaction per sync page).
     pub fn ingest_checked(&mut self, events: Vec<SignedEvent>) -> (Vec<(StoredEvent, Change)>, bool) {
         let mut applied = Vec::new();
         let mut bad = false;
         let mut conflicts = Vec::new();
         {
             let mut r = self.replica.lock();
+            let mut verified = Vec::with_capacity(events.len());
             for signed in events {
                 if let Ok(ev) = signed.decode()
                     && ev.seq <= r.state.head(&ev.author)
@@ -1444,8 +1452,10 @@ impl Ctx {
                 if stored.conv() != self.server {
                     continue;
                 }
-                let key = (stored.event.author, stored.event.seq);
-                let res = r.ingest(self.net.storage.as_ref(), &self.net.hlc, stored);
+                verified.push(stored);
+            }
+            let keys: Vec<(UserId, u64)> = verified.iter().map(|s| (s.event.author, s.event.seq)).collect();
+            for (key, res) in keys.into_iter().zip(r.ingest_many(self.net.storage.as_ref(), &self.net.hlc, verified)) {
                 if let Verdict::Reject(reason) = &res.verdict {
                     tracing::debug!(%reason, "event rejected");
                 }
@@ -1615,7 +1625,7 @@ impl Ctx {
 }
 
 /// RTT changed enough to tell the UI (25% and at least 10 ms, or appeared/disappeared).
-fn rtt_moved(a: Option<u32>, b: Option<u32>) -> bool {
+pub(crate) fn rtt_moved(a: Option<u32>, b: Option<u32>) -> bool {
     match (a, b) {
         (Some(x), Some(y)) => {
             let d = x.abs_diff(y);

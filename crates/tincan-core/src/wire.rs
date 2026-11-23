@@ -387,6 +387,14 @@ pub enum Ctl {
         /// More parts follow.
         more: bool,
     },
+    /// DM connections: the sender's display name. Sent by both sides once the DM connection
+    /// is up, and again when the name changes. Receivers keep it only if it passes
+    /// `state::validate_name` after trimming. Peers that predate this variant skip the frame
+    /// (`FrameDecoder` consumes undecodable frames).
+    DmProfile {
+        /// The sender's display name.
+        name: String,
+    },
 }
 
 /// Longest soundboard clip name, in chars (same as other names).
@@ -466,6 +474,7 @@ impl Ctl {
             Ctl::SoundPlayed { clip, .. } => clip.is_valid(),
             Ctl::HostCompare2 { attests, .. } => attests.len() <= MAX_ATTESTS,
             Ctl::SyncHave { heads } | Ctl::SyncHavePart { heads, .. } => heads.0.len() <= 4 * HEADS_PER_FRAME,
+            Ctl::DmProfile { name } => name.len() <= 4 * crate::state::MAX_NAME_CHARS,
             _ => true,
         }
     }
@@ -705,6 +714,47 @@ mod tests {
         assert_eq!(idx(&Ctl::Tick { epoch: 0, t_ms: 0 }), 13);
         assert_eq!(idx(&Ctl::CallState { call_id: 0, muted: false, deafened: false, sharing: None }), 35);
         assert_eq!(idx(&Ctl::SyncHavePart { heads: Heads::default(), more: false }), 38);
+        assert_eq!(idx(&Ctl::DmProfile { name: String::new() }), 39);
+    }
+
+    #[test]
+    fn dm_profile_round_trips_and_is_bounded() {
+        let msg = Ctl::DmProfile { name: "Bea".into() };
+        let f = encode_frame(&msg).unwrap();
+        assert_eq!(decode_body(&f[4..]).unwrap(), msg);
+        assert!(msg.within_limits());
+        assert!(!Ctl::DmProfile { name: "n".repeat(4 * crate::state::MAX_NAME_CHARS + 1) }.within_limits());
+        // A peer that predates the variant sees an unknown index: it skips the frame and keeps
+        // reading.
+        let mut unknown = f.clone();
+        unknown[4] = 0x7f;
+        let mut d = FrameDecoder::new();
+        d.push(&unknown);
+        d.push(&encode_frame(&Ctl::VoiceLeave).unwrap());
+        assert!(d.next().is_err());
+        assert_eq!(d.next().unwrap(), Some(Ctl::VoiceLeave));
+    }
+
+    /// Why the DM name is a new variant and not a field appended to `DmHello`: postcard is
+    /// not self-describing, so a reader with the extra field cannot decode an old frame.
+    #[test]
+    fn appending_a_field_would_break_old_frames() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum Old {
+            A { x: u32 },
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum New {
+            A {
+                x: u32,
+                #[serde(default)]
+                name: Option<String>,
+            },
+        }
+        let old = postcard::to_stdvec(&Old::A { x: 1 }).unwrap();
+        assert!(postcard::from_bytes::<New>(&old).is_err(), "a new reader cannot read an old frame");
+        let new = postcard::to_stdvec(&New::A { x: 1, name: Some("n".into()) }).unwrap();
+        assert_eq!(postcard::from_bytes::<Old>(&new).unwrap(), Old::A { x: 1 }, "an old reader ignores the extra bytes");
     }
 
     #[test]

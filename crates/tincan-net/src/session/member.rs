@@ -178,6 +178,7 @@ fn on_frame(s: &mut Session, ctl: Ctl) -> Next {
                 let _ = m.link.send(&Ctl::Status(status));
                 s.ctx.last_status_at = Instant::now();
                 tracing::debug!(server = %s.ctx.server.short(), "initial sync complete");
+                s.ctx.net.emit(NetEvent::SyncComplete { conv: s.ctx.server });
                 // Members I did not know before the sync may be in the roster.
                 let raw = m.raw_roster.clone();
                 if let Some(clean) = s.ctx.sanitize_roster(raw) {

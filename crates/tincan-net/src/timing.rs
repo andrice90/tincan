@@ -50,6 +50,12 @@ pub(crate) struct Timings {
     pub dm_retry: Vec<Duration>,
     /// Close an idle DM connection after this long without traffic.
     pub dm_idle: Duration,
+    /// Watched contacts (`Net::dm_watch`): redial schedule after a lost or failed DM
+    /// connection (the last value repeats), and the spacing of failed reachability probes.
+    pub dm_watch_retry: Vec<Duration>,
+    /// Watched contacts: a keepalive frame at least this often, well below the peer's
+    /// `dm_idle`, so their side does not close the connection as idle.
+    pub dm_keepalive: Duration,
     /// How often the host evaluates proactive migration.
     pub proactive_check: Duration,
     /// Proactive migration: better candidate must stay better this long.
@@ -102,6 +108,8 @@ impl Default for Timings {
                 Duration::from_secs(900),
             ],
             dm_idle: Duration::from_secs(120),
+            dm_watch_retry: vec![Duration::from_secs(2), Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(30), Duration::from_secs(60)],
+            dm_keepalive: Duration::from_secs(45),
             proactive_check: Duration::from_secs(30),
             proactive_hold: Duration::from_millis(election::PROACTIVE_HOLD_MS),
             proactive_interval: Duration::from_millis(election::PROACTIVE_MIN_INTERVAL_MS),
@@ -124,5 +132,14 @@ impl Timings {
             .or_else(|| self.dm_retry.last())
             .copied()
             .unwrap_or(Duration::from_secs(900))
+    }
+
+    /// Watched-contact redial (and probe) delay after `attempt` consecutive failures.
+    pub fn dm_watch_retry_delay(&self, attempt: usize) -> Duration {
+        self.dm_watch_retry
+            .get(attempt)
+            .or_else(|| self.dm_watch_retry.last())
+            .copied()
+            .unwrap_or(Duration::from_secs(60))
     }
 }

@@ -40,14 +40,18 @@ mod tests;
 mod tests_media;
 #[cfg(test)]
 mod tests_security;
+#[cfg(test)]
+mod tests_store;
+#[cfg(test)]
+mod tests_dm;
 
 pub use config::{MDNS_CADENCE, MDNS_SERVICE_NAME, NetConfig, RelayChoice, build_endpoint, transport_config};
-pub use dm::DmHold;
+pub use dm::{DmHold, DmWatch};
 pub use error::{NetError, Result};
 pub use events::{ConnState, ConnectionInfo, NetEvent, PathKind};
 pub use hooks::{CtlSource, ExtraCtlHandler};
 pub use media::{
     AUDIO_IN_QUEUE, AUDIO_OUT_QUEUE, CallEnd, CallInfo, CallState, HOST_UPLINK_BUDGET_BPS, MediaSession, RELAYED_SHARER_BPS,
-    RELAYED_VIEWER_BPS, SHARE_QUEUE, VIDEO_IN_QUEUE, VIDEO_MAX_BPS, VIDEO_MIN_BPS, VoiceInfo,
+    RELAYED_VIEWER_BPS, SHARE_QUEUE, VIDEO_IN_QUEUE, VIDEO_MAX_BPS, VIDEO_MIN_BPS, VoiceInfo, call_short_id,
 };
 pub use net::Net;

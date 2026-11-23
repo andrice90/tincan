@@ -209,4 +209,26 @@ pub enum NetEvent {
         /// The seq both events carry.
         seq: u64,
     },
+    /// The initial history sync of `conv` finished, once per connection:
+    /// - servers: the host's history after every (re)connect to a host (also after a host
+    ///   migration). Never while this device hosts or is solo.
+    /// - DMs: the contact's history after every DM connect; at once when they had nothing I
+    ///   lacked.
+    ///
+    /// Every event that sync applied was emitted as `EventAdded` before this.
+    SyncComplete {
+        /// Server or DM conversation.
+        conv: ConvId,
+    },
+    /// A DM contact announced a new display name over the DM connection. Also readable with
+    /// `Net::dm_peer_name`. Checked like profile names (1-100 characters after trimming, no
+    /// control characters) but still text from a peer.
+    DmNameChanged {
+        /// The DM conversation.
+        conv: ConvId,
+        /// The contact.
+        peer: UserId,
+        /// The name they announced.
+        name: String,
+    },
 }

@@ -101,6 +101,11 @@ pub struct VoiceInfo {
     pub sharing: Option<u16>,
     /// Video tracks I subscribed to.
     pub watching: Vec<u16>,
+    /// Round-trip time of the path that carries the media: to the host in a room, to the peer
+    /// in a call. None while this device hosts the room or nothing is connected. Updated
+    /// about once a second; `VoiceUpdated` fires only when it moves by at least 25 % and
+    /// 10 ms (like `ConnectionInfo::rtt_ms`).
+    pub rtt_ms: Option<u32>,
 }
 
 /// Where a 1:1 call stands.
@@ -150,7 +155,16 @@ pub struct CallInfo {
     pub peer_deafened: bool,
     /// The other side's screen-share track while they share.
     pub peer_sharing: Option<u16>,
+    /// The other side's short id in this call (`call_short_id(peer, me)`): their voice
+    /// packets carry `track_id(peer_short_id, KIND_VOICE)`.
+    pub peer_short_id: u16,
+    /// Round-trip time of the DM connection the call rides on. Filled by `Net::call_info` and
+    /// in `CallInvite` / `CallUpdated` while the call is not over; None when there is no
+    /// connection.
+    pub rtt_ms: Option<u32>,
 }
 
-/// Short ids in a call (no host hands them out): the lower user id takes 0.
-pub(crate) fn call_short_id(me: &UserId, peer: &UserId) -> u16 { if me < peer { 0 } else { 1 } }
+/// Short id of `me` in a 1:1 call with `peer` (no host hands them out): the lower user id
+/// takes 0, the other 1. Track ids follow as `track_id(short_id, kind)`; the peer's short id
+/// is `call_short_id(peer, me)`.
+pub fn call_short_id(me: &UserId, peer: &UserId) -> u16 { if me < peer { 0 } else { 1 } }

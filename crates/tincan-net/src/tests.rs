@@ -641,6 +641,133 @@ async fn leave_removes_local_copy_and_membership() {
     }
 }
 
+/// Q1: a member gets `SyncComplete` once the host's history is in: after every event of it
+/// was announced, once per connection, again after a reconnect; never as host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_complete_follows_the_hosts_history() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    wire(&[&a, &b]);
+    let mut a_ev = a.net.subscribe();
+    let server = a.net.create_server("Test server").await.unwrap();
+    let ch = text_channel(&a, &server);
+    let mut history = Vec::new();
+    for i in 0..30 {
+        history.push(say(&a, server, ch, &format!("history {i}")).await);
+    }
+    let invite = a.net.create_invite(server).await.unwrap();
+    let mut b_ev = b.net.subscribe();
+    within("join", Duration::from_secs(20), b.net.join(&invite)).await.expect("join");
+    let collect = |rx: &mut tokio::sync::broadcast::Receiver<NetEvent>| {
+        let mut seen = std::collections::HashSet::new();
+        let mut done = 0;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                NetEvent::EventAdded { conv, event, .. } if conv == server && done == 0 => {
+                    seen.insert(event.id);
+                }
+                NetEvent::SyncComplete { conv } if conv == server => done += 1,
+                _ => {}
+            }
+        }
+        (seen, done)
+    };
+    let (mut seen, mut done) = (std::collections::HashSet::new(), 0);
+    until("SyncComplete at the joiner", Duration::from_secs(10), || {
+        let (s, d) = collect(&mut b_ev);
+        if done == 0 {
+            seen.extend(s);
+        }
+        done += d;
+        done > 0
+    })
+    .await;
+    assert!(history.iter().all(|id| seen.contains(id)), "the whole history came before SyncComplete");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(collect(&mut b_ev).1, 0, "once per connection");
+    // A reconnect after a restart: one more, after the catch-up (the missed message is
+    // stored when SyncComplete is seen). Then one with nothing to catch up: the host's empty
+    // last page still ends the sync.
+    let mut b = b;
+    for missed in [Some("while bob was away"), None] {
+        let (b_id, b_store) = (b.identity.clone(), b.storage.clone());
+        b.net.shutdown().await;
+        drop(b);
+        let missed = match missed {
+            Some(text) => Some(say(&a, server, ch, text).await),
+            None => None,
+        };
+        b = start(b_id, b_store, "bob", fast()).await;
+        let mut b_ev = b.net.subscribe();
+        let mut stored_at_complete = false;
+        until("SyncComplete after the reconnect", Duration::from_secs(15), || {
+            let done = collect(&mut b_ev).1 > 0;
+            if done {
+                stored_at_complete = missed.is_none_or(|id| has_event(&b, &server, &id));
+            }
+            done
+        })
+        .await;
+        assert!(stored_at_complete, "the missed message is in when SyncComplete arrives");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(collect(&mut b_ev).1, 0, "once per connection");
+    }
+    // The host never gets one.
+    assert_eq!(collect(&mut a_ev).1, 0, "no SyncComplete while hosting");
+    for n in [a, b] {
+        n.net.shutdown().await;
+    }
+}
+
+/// Q3: `with_state` reads the live state without a copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_state_reads_the_live_state() {
+    let a = node("alice", fast()).await;
+    let server = a.net.create_server("Test server").await.unwrap();
+    let ch = text_channel(&a, &server);
+    let id = say(&a, server, ch, "hello").await;
+    let snap = a.net.conv_state(&server).unwrap();
+    let (name, channels, has) = a.net.with_state(&server, |s| (s.name.clone(), s.sorted_channels().len(), s.message_authors.contains_key(&id))).unwrap();
+    assert_eq!((name, channels, has), (snap.name.clone(), snap.sorted_channels().len(), true));
+    assert!(a.net.with_state(&ConvId([9; 32]), |_| ()).is_none());
+    a.net.shutdown().await;
+}
+
+/// Q4: a member that takes over the host role lists only who is really there from the first
+/// moment it says so: never the host that just left (the debounced broadcast comes later).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_host_roster_never_lists_the_departed_host() {
+    // A slow roster broadcast makes the stale window wide.
+    let t = Timings { roster_debounce: Duration::from_secs(2), ..fast() };
+    let a = node("alice", t.clone()).await;
+    let b = node("bob", t).await;
+    wire_to(&a, &[&b]);
+    let server = cluster(&a, &[&b]).await;
+    wait_succession(&a, &server, 1).await;
+    let mut b_ev = b.net.subscribe();
+    let leaving = a.net.clone();
+    let shutdown = tokio::spawn(async move { leaving.shutdown().await });
+    let bid = b.net.me();
+    within("bob hosts", Duration::from_secs(10), async {
+        loop {
+            if let Ok(NetEvent::ConnectionChanged { server: s, info }) = b_ev.recv().await
+                && s == server
+                && matches!(info.state, ConnState::Solo | ConnState::Hosting)
+                && info.host == Some(bid)
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    let r = b.net.roster(&server).expect("roster");
+    assert_eq!(r.host, bid, "{r:?}");
+    assert!(r.online.iter().all(|e| e.user != a.net.me()), "the departed host is still listed: {r:?}");
+    assert!(!b.net.peer_online(&a.net.me()));
+    shutdown.await.expect("shutdown");
+    b.net.shutdown().await;
+}
+
 #[test]
 fn net_is_send_sync() {
     fn check<T: Send + Sync + Clone>() {}

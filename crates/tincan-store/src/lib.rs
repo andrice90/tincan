@@ -89,7 +89,7 @@ impl SqliteStorage {
 
     fn init(mut conn: Connection, on_disk: bool) -> Result<Self> {
         conn.busy_timeout(BUSY_TIMEOUT).db()?;
-        let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).db()?;
+        let mode = set_wal(&conn, BUSY_TIMEOUT)?;
         if on_disk && !mode.eq_ignore_ascii_case("wal") {
             tracing::warn!(%mode, "sqlite refused WAL journal mode; continuing with it");
         }
@@ -108,6 +108,37 @@ impl SqliteStorage {
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock()
     }
+}
+
+/// `PRAGMA journal_mode = WAL`, retried while another connection holds a lock.
+///
+/// Switching a fresh file to WAL needs an exclusive lock, and SQLite returns `SQLITE_BUSY`
+/// for it at once instead of calling the busy handler. Two first opens of one profile at
+/// the same moment (a double launch, the tests) then failed with "database is locked".
+/// Retried with a short, growing pause until `timeout` has passed; returns the journal mode
+/// SQLite reports.
+fn set_wal(conn: &Connection, timeout: Duration) -> Result<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut pause = Duration::from_millis(2);
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)) {
+            Ok(mode) => return Ok(mode),
+            Err(e) if is_busy(&e) && std::time::Instant::now() + pause < deadline => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            Err(e) => return Err(CoreError::Storage(format!("set the WAL journal mode: {e}"))),
+        }
+    }
+}
+
+/// `SQLITE_BUSY` or `SQLITE_LOCKED`: another connection holds a lock right now.
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 /// Map a rusqlite error into the shared error type (the orphan rule forbids `From`).

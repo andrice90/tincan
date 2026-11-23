@@ -124,18 +124,61 @@ impl Replica {
             (Verdict::Stale, Some(inc)) => self.find_conflict(storage, inc),
             _ => None,
         };
-        for (e, change) in &applied {
+        for (e, _) in &applied {
             hlc.observe(e.event.hlc);
-            if let Err(err) = storage.insert_event(e) {
+        }
+        self.persist(storage, applied.iter());
+        Ingested { verdict, applied, conflict }
+    }
+
+    /// `ingest` for a batch (a sync page): same verdicts, applied events and conflicts, in
+    /// order, but everything applied is stored with one `Storage::insert_events` call (one
+    /// SQLite transaction) instead of one insert per event. Before a stale event is checked
+    /// for equivocation, what was applied so far is stored, so the check sees it.
+    pub fn ingest_many(&mut self, storage: &dyn Storage, hlc: &Hlc, evs: Vec<StoredEvent>) -> Vec<Ingested> {
+        let mut out: Vec<Ingested> = Vec::with_capacity(evs.len());
+        // First entry of `out` whose applied events are not stored yet.
+        let mut unstored = 0;
+        for ev in evs {
+            let incoming = (ev.event.seq <= self.state.head(&ev.event.author)).then(|| ev.clone());
+            let (verdict, applied) = self.pending.ingest(&mut self.state, ev, now_ms());
+            for (e, _) in &applied {
+                hlc.observe(e.event.hlc);
+            }
+            let conflict = match (&verdict, &incoming) {
+                (Verdict::Stale, Some(inc)) => {
+                    self.persist(storage, out[unstored..].iter().flat_map(|i| i.applied.iter()));
+                    unstored = out.len();
+                    self.find_conflict(storage, inc)
+                }
+                _ => None,
+            };
+            out.push(Ingested { verdict, applied, conflict });
+        }
+        self.persist(storage, out[unstored..].iter().flat_map(|i| i.applied.iter()));
+        out
+    }
+
+    /// Store applied events (one `insert_events` call), then flag deleted targets. Storage
+    /// failures are logged; the state has already advanced.
+    fn persist<'a>(&self, storage: &dyn Storage, applied: impl Iterator<Item = &'a (StoredEvent, Change)>) {
+        let applied: Vec<&(StoredEvent, Change)> = applied.collect();
+        if applied.is_empty() {
+            return;
+        }
+        let evs: Vec<&StoredEvent> = applied.iter().map(|(e, _)| e).collect();
+        for (res, e) in storage.insert_events(&evs).into_iter().zip(&evs) {
+            if let Err(err) = res {
                 tracing::error!(error = %err, id = %e.id.short(), "storing event failed");
             }
+        }
+        for (_, change) in &applied {
             if let Change::Deleted { target } = change
                 && let Err(err) = storage.mark_deleted(&self.state.conv, target)
             {
                 tracing::error!(error = %err, "marking event deleted failed");
             }
         }
-        Ingested { verdict, applied, conflict }
     }
 
     /// `ev` was Stale: is a different event stored for its (author, seq)? Then keep both as

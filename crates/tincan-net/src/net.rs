@@ -25,7 +25,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::addr::hint_from_addr;
 use crate::config::{NetConfig, take_mdns};
-use crate::dm::{self, DmHold, DmManager};
+use crate::dm::{self, DmHold, DmManager, DmWatch};
 use crate::error::{NetError, Result, capitalize};
 use crate::events::{ConnectionInfo, NetEvent};
 use crate::hooks::ExtraCtlHandler;
@@ -189,8 +189,20 @@ impl Net {
         wake(&self.inner, user);
     }
 
-    /// Display name used for new servers and joins.
-    pub fn set_display_name(&self, name: &str) { self.inner.cfg.write().display_name = name.trim().to_string(); }
+    /// Display name used for new servers and joins, and announced to DM contacts
+    /// (`Ctl::DmProfile`, sent again on every open DM connection when it changes).
+    pub fn set_display_name(&self, name: &str) {
+        let name = name.trim().to_string();
+        let changed = {
+            let mut cfg = self.inner.cfg.write();
+            let changed = cfg.display_name != name;
+            cfg.display_name = name;
+            changed
+        };
+        if changed {
+            self.inner.dm.broadcast_profile(&self.inner);
+        }
+    }
 
     /// Change the "allow hosting" setting (takes effect on the next election).
     pub fn set_allow_hosting(&self, allow: bool) {
@@ -387,8 +399,21 @@ impl Net {
         rx.await.map_err(|_| NetError::Closed)?
     }
 
-    /// Snapshot of a conversation's state.
+    /// Snapshot of a conversation's state. This clones everything, the per-message index
+    /// included (O(history)); prefer [`Net::with_state`] to read a few fields.
     pub fn conv_state(&self, conv: &ConvId) -> Option<ConvState> { self.inner.replica(conv).map(|r| r.lock().state.clone()) }
+
+    /// Read a conversation's state without copying it: `f` runs on the live state and its
+    /// result is returned (None for an unknown conversation).
+    ///
+    /// `f` runs while the conversation's lock is held, and that lock is not reentrant: keep
+    /// it short (copy out what you need) and do not call any `Net` method from inside it.
+    /// Events of that conversation wait meanwhile.
+    pub fn with_state<R>(&self, conv: &ConvId, f: impl FnOnce(&ConvState) -> R) -> Option<R> {
+        let rep = self.inner.replica(conv)?;
+        let r = rep.lock();
+        Some(f(&r.state))
+    }
 
     /// Every loaded conversation (servers and DMs).
     pub fn convs(&self) -> Vec<ConvId> { self.inner.replicas.read().keys().copied().collect() }
@@ -495,7 +520,36 @@ impl Net {
     }
 
     /// Is `user` online in any roster I know of, or connected over a DM?
+    ///
+    /// For a contact who shares no server with me this is only "a DM connection is up", and
+    /// an idle DM connection closes after 2 minutes. Use [`Net::dm_watch`] while their DM is
+    /// on screen, or [`Net::dm_reachable`] to ask once.
     pub fn peer_online(&self, user: &UserId) -> bool { self.inner.peer_online(user) }
+
+    /// DMs: the display name the contact announced over the DM connection (`DmProfile`),
+    /// kept across restarts. None until they announced one, and for servers. Checked like
+    /// profile names (1-100 characters after trimming, no control characters), but still text
+    /// from a peer. Changes arrive as `NetEvent::DmNameChanged`.
+    pub fn dm_peer_name(&self, conv: &ConvId) -> Option<String> {
+        let peer = dm::peer_of(&self.inner, conv)?;
+        self.inner.dm.peer_name(&self.inner, conv, &peer)
+    }
+
+    /// Keep the DM connection to `peer` up while the guard lives, so `peer_online` and calls
+    /// work for a contact whose DM is on screen (also one who shares no server with me).
+    ///
+    /// Dials now (opening the DM conversation if needed, like `dm_open`). A lost or failed
+    /// connection is redialed after 2, 5, 15, 30 s, then every minute. While connected, a
+    /// keepalive goes out every 45 s so the contact's side does not close the connection as
+    /// idle. Dropping the guard lets it idle out as usual (2 minutes without traffic).
+    pub fn dm_watch(&self, peer: UserId) -> DmWatch { self.inner.dm.watch(&self.inner, peer) }
+
+    /// Is `peer` reachable over a DM right now? True at once while a DM connection is up.
+    /// Otherwise dials and waits until it connects or fails (at most two dial timeouts); the
+    /// connection then stays open as usual. After a failed probe, further probes answer false
+    /// at once for a while (2, 5, 15, 30 s, then a minute after each failure), so asking
+    /// often is cheap. False for users I have no DM conversation with.
+    pub async fn dm_reachable(&self, peer: UserId) -> bool { self.inner.dm.reachable(&self.inner, peer).await }
 
     /// Clean shutdown: end the call and leave the voice room, hand off every server I host,
     /// close all connections and shut the router down (which closes the endpoint and the
