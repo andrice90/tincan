@@ -6,10 +6,12 @@ import { ChannelSidebar } from "../components/ChannelSidebar";
 import { ChannelChat, DmChat } from "../components/ChatView";
 import { DmSidebar } from "../components/DmSidebar";
 import { MemberList } from "../components/MemberList";
+import { ResizeHandle, usePanelWidth } from "../components/ResizeHandle";
 import { ServerRail } from "../components/ServerRail";
 import { Soundboard } from "../components/Soundboard";
 import { UserPanel } from "../components/UserPanel";
 import { VoiceRoomView } from "../components/VoiceView";
+import { SIDEBAR_BOUNDS, SIDEBAR_KEY } from "../lib/panelWidth";
 import { useStore, type State } from "../store/store";
 import { Home } from "./Home";
 
@@ -65,16 +67,18 @@ export function Shell() {
     return s.channels[v.serverId]?.find((c) => c.id === v.channelId)?.kind ?? null;
   });
   const soundboardOpen = useStore((s) => s.soundboardOpen && s.voice !== null);
+  const sideWidth = usePanelWidth(SIDEBAR_KEY, SIDEBAR_BOUNDS);
 
   return (
     <div className="shell">
       <ServerRail />
-      <aside className="sidebar">
+      <aside className="sidebar" style={{ width: sideWidth.width }}>
         {server ? <ChannelSidebar server={server} /> : <DmSidebar />}
         <div className="sidebar-foot">
           <CallPanel />
           <UserPanel />
         </div>
+        <ResizeHandle panel={sideWidth} bounds={SIDEBAR_BOUNDS} edge="right" label="Resize sidebar" />
       </aside>
       <main className="main">
         <MainContent />

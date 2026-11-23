@@ -28,8 +28,18 @@ Pure UI logic has dependency-free tests: from `ui/`, run `node --experimental-st
 | `lib/scroll.ts` | the load-older scroll anchor |
 | `dialogs/settingsLogic.ts` | auto-download choices, Settings > Network status, the volume slider debounce |
 | `media/screenLogic.ts` | per-track watch/unwatch ordering, decoder fallback, backpressure |
+| `lib/panelWidth.ts` | side panel width bounds, clamping, saved value, arrow keys and drag |
+| `lib/nativeMenu.ts` | when the WebView's own right-click menu may open |
+| `lib/unread.ts` | the unread badge on a sidebar row (dot or count, "99+") |
 
-`package.json` has no `test` script yet (it is outside `ui/src`).
+`pnpm test` runs the same command.
+
+## Layout and right-click
+
+- **Resizable panels.** The channel/DM sidebar (200 to 420 px, default 240) and the member list (220 to 360 px, default 220) each have a `role="separator"` grab bar (`components/ResizeHandle.tsx`) on the edge that faces the content. Arrows move the bar the way they point, Home and End jump to the bounds, double-click resets. The width is saved in `localStorage` (`tincan.sidebarWidth`, `tincan.membersWidth`) when a drag ends or a key changes it; the default is saved as no key. Nothing else in the UI used `localStorage` before. It is per profile because each profile has its own WebView2 data folder (`src-tauri/src/profile.rs`, `webview_dir`). The member list is not narrower than its old 220 px: below that the "(you)", Host and Owner tags leave no room for a name. `.app` has one `minmax(0, 1fr)` column so in a narrow window the panels shrink to their minimum before `.main` goes below 300 px; the saved width is kept.
+- **Member rows.** `.member-name` and its `.person` are `display: contents`, so the name, "(you)", the short id and the tags are flex items of the row: only the name shrinks (ellipsis, `title` with the full name), the short id only once the name is gone, and "(you)" and the tags never shrink or wrap. In the rare worst case (my own name clashes, and I host and own the server) the name is gone and the id is cut at 220 px.
+- **Right-click.** `installNativeMenuGuard` (`main.tsx`) calls `preventDefault` on `contextmenu` unless the target is a text input, textarea or contenteditable, or there is a non-empty text selection. It only prevents the default, so the app's own menus (`useMenu().openAt` from React `onContextMenu`) open as before. WebView2 has `AreDefaultContextMenusEnabled`, and wry has `with_default_context_menus`, but Tauri 2.12 does not expose it, and it is all-or-nothing: it would also remove Cut, Copy and Paste from text fields. Not used.
+- **Unread badge.** `UnreadBadge` (`components/common.tsx`) takes the result of `unreadBadge(unread, current, count?)`. The contract has an unread flag per channel, not a count or mentions, so it is always a dot today. It clears through `markCurrentRead` as before. It can go on a voice room row once voice rooms carry an unread flag.
 
 ## Mock backend
 

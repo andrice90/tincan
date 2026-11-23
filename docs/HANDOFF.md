@@ -34,7 +34,7 @@ Last checks on `main`:
 - `cargo test --workspace`: 0 failures; the real-device and live-network tests are ignored.
 - clippy `--workspace --all-targets -D warnings` is clean.
 - `pnpm typecheck` and `pnpm build` are clean.
-- `pnpm test`: 62 passed.
+- `pnpm test`: 78 passed.
 
 ## Build, run, test
 

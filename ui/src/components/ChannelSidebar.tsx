@@ -6,7 +6,8 @@ import { memo, useMemo, useRef, type MouseEvent, type ReactNode } from "react";
 import type { Channel, Connection, Member, ServerSummary, VoiceSession } from "../api/types";
 import { openDialog, selectChannel } from "../store/actions";
 import { useStore } from "../store/store";
-import { ICON_SM, IconButton, PersonName, SpeakingAvatar } from "./common";
+import { unreadBadge } from "../lib/unread";
+import { ICON_SM, IconButton, PersonName, SpeakingAvatar, UnreadBadge } from "./common";
 import { Menu, useMenu, type MenuItem } from "./Menu";
 
 /** One line of host state for the header. */
@@ -157,12 +158,12 @@ function useChannelMenu(server: ServerSummary, channel: Channel): { onContextMen
 
 const ChannelRow = memo(function ChannelRow({ channel, server, selected }: { channel: Channel; server: ServerSummary; selected: boolean }) {
   const ctx = useChannelMenu(server, channel);
-  const unread = channel.unread && !selected;
+  const badge = unreadBadge(channel.unread, selected);
   return (
     <li>
       <button
         type="button"
-        className={unread ? "channel-row is-unread" : "channel-row"}
+        className={badge ? "channel-row is-unread" : "channel-row"}
         aria-current={selected ? "page" : undefined}
         onClick={() => selectChannel(server.id, channel)}
         onContextMenu={ctx.onContextMenu}
@@ -171,7 +172,7 @@ const ChannelRow = memo(function ChannelRow({ channel, server, selected }: { cha
         <span className="truncate">
           <bdi>{channel.name}</bdi>
         </span>
-        {unread && <span className="sr-only">, unread messages</span>}
+        {badge && <UnreadBadge badge={badge} />}
       </button>
       {ctx.node}
     </li>
