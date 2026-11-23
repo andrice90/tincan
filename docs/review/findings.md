@@ -2,73 +2,75 @@
 
 Status of every confirmed finding from the two review rounds on 2026-11-23. Each finding was found by one agent and confirmed by a second agent that tried to refute it. Full scenarios, the verifier's reasoning and the proposed fixes are in `round1-net-confirmed.json` and `round2-app-confirmed.json` next to this file.
 
-Status values: `open`, `fixed` (with commit), `deferred` (with reason).
+Status values: `open`, `fixed` (with the subjects of the commits that fixed it), `deferred` (with reason). Aliases share their id's row and status.
+
+Round 2 fixes landed on 2026-11-23: four fix branches (`fix/net`, `fix/files-sec`, `fix/ui`, `fix/shell`) merged into main, then the app-side follow-ups on main. Not verified on real hardware or the real Tauri app since: the two-profile UI e2e (`ui/e2e`), the NSIS installer and its delete-data box, a real Windows logoff.
 
 ## Round 2: tincan-app, src-tauri, ui
 
 | Id (aliases) | Sev | Where | Finding | Status |
 |---|---|---|---|---|
-| APP-CORE-01 (RESOURCES-1) | high | `crates/tincan-app/src/transfers.rs:267` | Auto-fetch trusts the peer-declared attachment size; the real blob size is never checked or capped | open |
-| APP-CORE-02 (SECURITY-1, SECURITY-5) | high | `crates/tincan-app/src/shell.rs:101` | open_file shell-executes peer-named files; the name sanitizer can turn '.pdf' into '.exe' and keeps RTLO | open |
-| APP-CORE-03 (SECURITY-2) | high | `crates/tincan-app/src/app.rs:178` | Every held blob is announced to every server host and DM peer, and any member or contact may fetch any of them | open |
-| APP-MEDIA-1 (UI-LOGIC-01, SPEC-GAPS-1) | high | `ui/src/store/actions.ts:647` | Leave voice while an outgoing call rings only cancels the call; the user stays in the room with a live mic while the UI shows them as gone | open |
-| APP-CORE-05 | medium | `crates/tincan-app/src/pump.rs:225` | Bulk window has no maximum length: steady traffic (or one spamming member) suppresses all live messages in a server | open |
-| APP-MEDIA-2 | medium | `crates/tincan-app/src/media/session.rs:221` | reconcile reads voice_info/call_info before taking the state lock, so a stale read can detach a room that was just joined | open |
-| APP-MEDIA-3 (RESOURCES-4) | medium | `crates/tincan-app/src/media/clips.rs:391` | Heard clips are capped at 50 in the app but the UI appends every sound-played clip without limit; older tiles can't be saved | open |
-| RESOURCES-2 | medium | `crates/tincan-app/src/transfers.rs:278` | Every roster update redials offline providers for every parked download and floods the shared fetch queue | open |
-| SECURITY-3 | medium | `crates/tincan-app/src/shell.rs:88` | Bidi-override and zero-width characters in peer file names and display names are kept, so extensions and nearby UI text can be spoofed | open |
-| SECURITY-4 | medium | `crates/tincan-app/src/views.rs:198` | Peer display names are not unique and nothing in the UI tells two users apart, so impersonating a contact is trivial | open |
-| SHELL-1 | medium | `src-tauri/src/main.rs:99` | Windows logoff, shutdown and Restart Manager exit without App::shutdown (no host handoff, store not flushed) | open |
-| SHELL-2 | medium | `src-tauri/tauri.conf.json:48` | Uninstaller's 'Delete the application data' option leaves every Tincan profile (identity key, messages, files) on disk | open |
-| SPEC-GAPS-2 | medium | `ui/src/components/ChatView.tsx:65` | DM-only contacts look offline and can't be called once the DM link has idled out (120 s) or after a restart | open |
-| UI-LOGIC-03 | medium | `ui/src/components/Composer.tsx:51` | Composer erases text typed while a send is in flight | open |
-| APP-CORE-04 | low | `crates/tincan-app/src/pump.rs:121` | FileEvent lag is only logged: lost Completed and Transfer events are never recovered | open |
-| APP-CORE-06 (SECURITY-8, RESOURCES-12) | low | `crates/tincan-app/src/views.rs:344` | Attachment index is first-writer-wins per hash, so downloads are routed to the wrong conversation (and the index can be poisoned) | open |
-| APP-CORE-07 | low | `crates/tincan-app/src/views.rs:164` | view() cache can store a stale ConvView that was built before a concurrent invalidation | open |
-| APP-CORE-08 | low | `crates/tincan-app/src/app.rs:313` | A rename made while a Profile publish is in flight is dropped | open |
-| APP-CORE-10 (SPEC-GAPS-10) | low | `crates/tincan-app/src/pump.rs:228` | My own DM messages never refresh DmSummary.lastMessageAt, so the DM list order goes stale | open |
-| APP-CORE-11 | low | `crates/tincan-app/src/views.rs:187` | DM names and DM author names depend on which server views happen to be cached | open |
-| APP-MEDIA-4 | low | `crates/tincan-app/src/media/clips.rs:409` | clip_fetch on an already-held blob that can't be read or tagged leaves a persisted pull that never resolves and looks complete | open |
-| RESOURCES-10 | low | `crates/tincan-app/src/transfers.rs:381` | Image serving copies every blob twice, reads the whole blob for HEAD, and loads every image in the history eagerly | open |
-| RESOURCES-13 | low | `ui/src/media/ScreenView.tsx:61` | screen_unwatch can overtake an in-flight screen_watch, leaving a sink that streams frames to a dead channel until the share ends | open |
-| RESOURCES-3 | low | `crates/tincan-app/src/transfers.rs:270` | Joining a server with a large history fills the 1024 fetch queue with the oldest attachments, drops the newest for good, and starves the UI's holder lookups | open |
-| RESOURCES-6 | low | `crates/tincan-app/src/pump.rs:264` | Every Members change does a full Net::conv_state clone (the message index included), per event and peer-triggerable | open |
-| RESOURCES-8 | low | `ui/src/media/ScreenView.tsx:85` | A watched screen share keeps being received, copied over IPC and decoded while the window is minimized, with no backpressure when the decoder falls behind | open |
-| RESOURCES-9 | low | `crates/tincan-app/src/pump.rs:269` | Each roster update recomputes members, the server summary and every DM summary, even when nothing they show changed | open |
-| SECURITY-7 | low | `crates/tincan-app/src/app.rs:407` | Reject text from a host is shown to the user unchanged as Tincan's own error message | open |
-| SHELL-4 | low | `src-tauri/src/main.rs:185` | Relaunching during the close window, or a plain double launch, ends with an 'already running' dialog and nothing on screen | open |
-| SPEC-GAPS-3 | low | `crates/tincan-app/src/pump.rs:252` | Deleting a voice room leaves the people inside connected to a room nobody can see | open |
-| SPEC-GAPS-4 | low | `ui/src/components/MemberList.tsx:17` | A call started from the member list never shows the call stage, so the peer's screen share and per-user volume can't be reached | open |
-| SPEC-GAPS-8 | low | `ui/src/components/Soundboard.tsx:14` | The Add sound picker offers .opus files, which the decoder can never read | open |
-| SPEC-GAPS-9 | low | `ui/src/dialogs/SettingsDialog.tsx:371` | Settings > Network says "No peers" for a server this PC hosts, even with members connected | open |
-| UI-LOGIC-02 | low | `ui/src/store/actions.ts:195` | message-added and message-updated that arrive while a conversation's first page loads are dropped; the message is also marked read | open |
-| UI-LOGIC-04 | low | `ui/src/store/actions.ts:173` | Page responses that started before a snapshot are merged into the reloaded cache, leaving a permanent hole | open |
-| UI-LOGIC-05 | low | `ui/src/store/actions.ts:307` | Every snapshot drops the cache of the conversation on screen, which loses the reading position | open |
-| UI-LOGIC-06 | low | `ui/src/store/actions.ts:334` | Each typing event restarts the sweep timer, so a typer who stopped stays listed while someone else keeps typing | open |
-| UI-LOGIC-07 | low | `ui/src/components/MessageList.tsx:174` | The load-older scroll anchor is used up by a new message at the bottom, so the older page prepends without compensation | open |
-| UI-LOGIC-08 | low | `ui/src/media/ScreenView.tsx:137` | An unsupported codec never shows the 'can't decode' error; the decoder is rebuilt and fails again at every keyframe | open |
-| UI-LOGIC-09 | low | `ui/src/components/CallPanel.tsx:41` | No hang-up control when the call is active but no voice session is attached | open |
-| UI-LOGIC-10 | low | `ui/src/store/actions.ts:613` | The download command's result can overwrite a newer transfer-updated, leaving an attachment card stuck | open |
-| UI-LOGIC-11 | low | `ui/src/dialogs/SettingsDialog.tsx:182` | Closing Settings or switching tabs within 250 ms of moving a volume slider drops the change | open |
-| UI-LOGIC-12 (SPEC-GAPS-11) | low | `ui/src/dialogs/SettingsDialog.tsx:267` | The auto-download menu offers 50 MB and 100 MB, but the backend silently clamps to 25 MB | open |
-| UI-LOGIC-13 (SPEC-GAPS-5) | low | `ui/src/components/VoiceView.tsx:17` | After a restart the per-user volume slider shows 100% while a saved volume is applied | open |
-| UI-LOGIC-14 | low | `ui/src/store/actions.ts:292` | A lag snapshot does not resync the keyed transfer and speaking stores | open |
-| UI-LOGIC-15 (RESOURCES-5) | low | `ui/src/store/actions.ts:205` | Message caches of loaded conversations grow without limit for the whole session | open |
+| APP-CORE-01 (RESOURCES-1) | high | `crates/tincan-app/src/transfers.rs:267` | Auto-fetch trusts the peer-declared attachment size; the real blob size is never checked or capped | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file") |
+| APP-CORE-02 (SECURITY-1, SECURITY-5) | high | `crates/tincan-app/src/shell.rs:101` | open_file shell-executes peer-named files; the name sanitizer can turn '.pdf' into '.exe' and keeps RTLO | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file") |
+| APP-CORE-03 (SECURITY-2) | high | `crates/tincan-app/src/app.rs:178` | Every held blob is announced to every server host and DM peer, and any member or contact may fetch any of them | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file", "Apply blob shares to the access check under the index lock", "Announce held blobs per server; send DM contacts no Have list") |
+| APP-MEDIA-1 (UI-LOGIC-01, SPEC-GAPS-1) | high | `ui/src/store/actions.ts:647` | Leave voice while an outgoing call rings only cancels the call; the user stays in the room with a live mic while the UI shows them as gone | fixed ("Leave voice leaves the room while a call rings out (APP-MEDIA-1)") |
+| APP-CORE-05 | medium | `crates/tincan-app/src/pump.rs:225` | Bulk window has no maximum length: steady traffic (or one spamming member) suppresses all live messages in a server | fixed ("Cap bulk windows, end them on SyncComplete, skip unchanged rosters") |
+| APP-MEDIA-2 | medium | `crates/tincan-app/src/media/session.rs:221` | reconcile reads voice_info/call_info before taking the state lock, so a stale read can detach a room that was just joined | fixed ("Fix media races and gaps: reconcile under the lock, deleted rooms, unattached calls, clip pulls") |
+| APP-MEDIA-3 (RESOURCES-4) | medium | `crates/tincan-app/src/media/clips.rs:391` | Heard clips are capped at 50 in the app but the UI appends every sound-played clip without limit; older tiles can't be saved | fixed ("Composer keeps text typed during a send; cap heard clips; tell same-named people apart", "Fix media races and gaps: reconcile under the lock, deleted rooms, unattached calls, clip pulls") |
+| RESOURCES-2 | medium | `crates/tincan-app/src/transfers.rs:278` | Every roster update redials offline providers for every parked download and floods the shared fetch queue | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file") |
+| SECURITY-3 | medium | `crates/tincan-app/src/shell.rs:88` | Bidi-override and zero-width characters in peer file names and display names are kept, so extensions and nearby UI text can be spoofed | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file", "Isolate peer names in the UI, load history images lazily, add pnpm test") |
+| SECURITY-4 | medium | `crates/tincan-app/src/views.rs:198` | Peer display names are not unique and nothing in the UI tells two users apart, so impersonating a contact is trivial | fixed ("Composer keeps text typed during a send; cap heard clips; tell same-named people apart", "Fold lookalike letters when telling same-named people apart (SECURITY-4)") |
+| SHELL-1 | medium | `src-tauri/src/main.rs:99` | Windows logoff, shutdown and Restart Manager exit without App::shutdown (no host handoff, store not flushed) | fixed ("Shut down cleanly when Windows ends the session; uninstaller removes profiles", "Flush the file store alongside the host handoff on shutdown") |
+| SHELL-2 | medium | `src-tauri/tauri.conf.json:48` | Uninstaller's 'Delete the application data' option leaves every Tincan profile (identity key, messages, files) on disk | fixed ("Shut down cleanly when Windows ends the session; uninstaller removes profiles") |
+| SPEC-GAPS-2 | medium | `ui/src/components/ChatView.tsx:65` | DM-only contacts look offline and can't be called once the DM link has idled out (120 s) or after a restart | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)", "Keep the DM on screen connected; the DM Call button no longer needs presence") |
+| UI-LOGIC-03 | medium | `ui/src/components/Composer.tsx:51` | Composer erases text typed while a send is in flight | fixed ("Composer keeps text typed during a send; cap heard clips; tell same-named people apart") |
+| APP-CORE-04 | low | `crates/tincan-app/src/pump.rs:121` | FileEvent lag is only logged: lost Completed and Transfer events are never recovered | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file") |
+| APP-CORE-06 (SECURITY-8, RESOURCES-12) | low | `crates/tincan-app/src/views.rs:344` | Attachment index is first-writer-wins per hash, so downloads are routed to the wrong conversation (and the index can be poisoned) | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file", "Apply blob shares to the access check under the index lock") |
+| APP-CORE-07 | low | `crates/tincan-app/src/views.rs:164` | view() cache can store a stale ConvView that was built before a concurrent invalidation | fixed ("Show DM contacts' own names, build views without cloning, keep renames") |
+| APP-CORE-08 | low | `crates/tincan-app/src/app.rs:313` | A rename made while a Profile publish is in flight is dropped | fixed ("Show DM contacts' own names, build views without cloning, keep renames") |
+| APP-CORE-10 (SPEC-GAPS-10) | low | `crates/tincan-app/src/pump.rs:228` | My own DM messages never refresh DmSummary.lastMessageAt, so the DM list order goes stale | fixed ("Cap bulk windows, end them on SyncComplete, skip unchanged rosters") |
+| APP-CORE-11 | low | `crates/tincan-app/src/views.rs:187` | DM names and DM author names depend on which server views happen to be cached | fixed ("Show DM contacts' own names, build views without cloning, keep renames") |
+| APP-MEDIA-4 | low | `crates/tincan-app/src/media/clips.rs:409` | clip_fetch on an already-held blob that can't be read or tagged leaves a persisted pull that never resolves and looks complete | fixed ("Fix media races and gaps: reconcile under the lock, deleted rooms, unattached calls, clip pulls") |
+| RESOURCES-10 | low | `crates/tincan-app/src/transfers.rs:381` | Image serving copies every blob twice, reads the whole blob for HEAD, and loads every image in the history eagerly | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file", "Isolate peer names in the UI, load history images lazily, add pnpm test") |
+| RESOURCES-13 | low | `ui/src/media/ScreenView.tsx:61` | screen_unwatch can overtake an in-flight screen_watch, leaving a sink that streams frames to a dead channel until the share ends | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| RESOURCES-3 | low | `crates/tincan-app/src/transfers.rs:270` | Joining a server with a large history fills the 1024 fetch queue with the oldest attachments, drops the newest for good, and starves the UI's holder lookups | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file") |
+| RESOURCES-6 | low | `crates/tincan-app/src/pump.rs:264` | Every Members change does a full Net::conv_state clone (the message index included), per event and peer-triggerable | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)", "Cap bulk windows, end them on SyncComplete, skip unchanged rosters", "Show DM contacts' own names, build views without cloning, keep renames") |
+| RESOURCES-8 | low | `ui/src/media/ScreenView.tsx:85` | A watched screen share keeps being received, copied over IPC and decoded while the window is minimized, with no backpressure when the decoder falls behind | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| RESOURCES-9 | low | `crates/tincan-app/src/pump.rs:269` | Each roster update recomputes members, the server summary and every DM summary, even when nothing they show changed | fixed ("Cap bulk windows, end them on SyncComplete, skip unchanged rosters") |
+| SECURITY-7 | low | `crates/tincan-app/src/app.rs:407` | Reject text from a host is shown to the user unchanged as Tincan's own error message | fixed ("Authorize blob access per conversation, cap download sizes, harden open_file", "Tell a host's refusal text apart from tincan-net's own sentences") |
+| SHELL-4 | low | `src-tauri/src/main.rs:185` | Relaunching during the close window, or a plain double launch, ends with an 'already running' dialog and nothing on screen | fixed ("One Tincan instance per profile; a relaunch during the close waits") |
+| SPEC-GAPS-3 | low | `crates/tincan-app/src/pump.rs:252` | Deleting a voice room leaves the people inside connected to a room nobody can see | fixed ("Fix media races and gaps: reconcile under the lock, deleted rooms, unattached calls, clip pulls") |
+| SPEC-GAPS-4 | low | `ui/src/components/MemberList.tsx:17` | A call started from the member list never shows the call stage, so the peer's screen share and per-user volume can't be reached | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| SPEC-GAPS-8 | low | `ui/src/components/Soundboard.tsx:14` | The Add sound picker offers .opus files, which the decoder can never read | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| SPEC-GAPS-9 | low | `ui/src/dialogs/SettingsDialog.tsx:371` | Settings > Network says "No peers" for a server this PC hosts, even with members connected | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-02 | low | `ui/src/store/actions.ts:195` | message-added and message-updated that arrive while a conversation's first page loads are dropped; the message is also marked read | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-04 | low | `ui/src/store/actions.ts:173` | Page responses that started before a snapshot are merged into the reloaded cache, leaving a permanent hole | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-05 | low | `ui/src/store/actions.ts:307` | Every snapshot drops the cache of the conversation on screen, which loses the reading position | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings", "Snapshot refresh installs only the newest read when it can't reach the cache") |
+| UI-LOGIC-06 | low | `ui/src/store/actions.ts:334` | Each typing event restarts the sweep timer, so a typer who stopped stays listed while someone else keeps typing | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-07 | low | `ui/src/components/MessageList.tsx:174` | The load-older scroll anchor is used up by a new message at the bottom, so the older page prepends without compensation | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-08 | low | `ui/src/media/ScreenView.tsx:137` | An unsupported codec never shows the 'can't decode' error; the decoder is rebuilt and fails again at every keyframe | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-09 | low | `ui/src/components/CallPanel.tsx:41` | No hang-up control when the call is active but no voice session is attached | fixed ("Leave voice leaves the room while a call rings out (APP-MEDIA-1)", "Fix media races and gaps: reconcile under the lock, deleted rooms, unattached calls, clip pulls") |
+| UI-LOGIC-10 | low | `ui/src/store/actions.ts:613` | The download command's result can overwrite a newer transfer-updated, leaving an attachment card stuck | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-11 | low | `ui/src/dialogs/SettingsDialog.tsx:182` | Closing Settings or switching tabs within 250 ms of moving a volume slider drops the change | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-12 (SPEC-GAPS-11) | low | `ui/src/dialogs/SettingsDialog.tsx:267` | The auto-download menu offers 50 MB and 100 MB, but the backend silently clamps to 25 MB | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-13 (SPEC-GAPS-5) | low | `ui/src/components/VoiceView.tsx:17` | After a restart the per-user volume slider shows 100% while a saved volume is applied | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings", "Fix media races and gaps: reconcile under the lock, deleted rooms, unattached calls, clip pulls") |
+| UI-LOGIC-14 | low | `ui/src/store/actions.ts:292` | A lag snapshot does not resync the keyed transfer and speaking stores | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
+| UI-LOGIC-15 (RESOURCES-5) | low | `ui/src/store/actions.ts:205` | Message caches of loaded conversations grow without limit for the whole session | fixed ("Fix the low-severity UI findings: message cache holes, typing, scroll, screen player, settings") |
 
 Also queued, from the phase 2 build notes (`docs/notes-tincan-app.md`):
 
 | Id | Finding | Status |
 |---|---|---|
-| Q1 | tincan-net emits no end-of-sync event; the app guesses bulk sync with a heuristic (`session/member.rs`) | open |
-| Q2 | `dm.rs` ensure_connect drops wake-ups during an in-flight dial, so a new address waits a full backoff | open |
-| Q3 | `Net::conv_state` clones the whole conversation state on every call | open |
-| Q4 | After a clean handoff `Net::roster` lists the departed host for up to 250 ms | open |
-| Q5 | DMs carry no display name, so a DM-only contact shows as a short id | open |
-| Q6 | `call_short_id` is crate-private and calls report no RTT | open |
-| Q7 | tincan-audio has no `is_running()` probe | open |
-| Q8 | Windows logoff runs no host handoff; second launch of a profile does not focus the first window | open (see SHELL-1, SHELL-4) |
-| Q9 | `tincan-store` test `simultaneous_first_open_migrates_once` flakes under load with "database is locked": `PRAGMA journal_mode = WAL` on a fresh file (`lib.rs:92`) does not wait on the busy handler | open |
-| Q10 | Storage trait has no batch insert for sync pages (`tincan-core` `Storage`); `tincan-store` has one but net inserts one by one | open |
+| Q1 | tincan-net emits no end-of-sync event; the app guesses bulk sync with a heuristic (`session/member.rs`) | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)", "Cap bulk windows, end them on SyncComplete, skip unchanged rosters") |
+| Q2 | `dm.rs` ensure_connect drops wake-ups during an in-flight dial, so a new address waits a full backoff | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)") |
+| Q3 | `Net::conv_state` clones the whole conversation state on every call | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)", "Show DM contacts' own names, build views without cloning, keep renames") |
+| Q4 | After a clean handoff `Net::roster` lists the departed host for up to 250 ms | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)") |
+| Q5 | DMs carry no display name, so a DM-only contact shows as a short id | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)", "Show DM contacts' own names, build views without cloning, keep renames") |
+| Q6 | `call_short_id` is crate-private and calls report no RTT | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)", "Fix media races and gaps: reconcile under the lock, deleted rooms, unattached calls, clip pulls") |
+| Q7 | tincan-audio has no `is_running()` probe | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)", "Fix media races and gaps: reconcile under the lock, deleted rooms, unattached calls, clip pulls") |
+| Q8 | Windows logoff runs no host handoff; second launch of a profile does not focus the first window | fixed ("Shut down cleanly when Windows ends the session; uninstaller removes profiles", "One Tincan instance per profile; a relaunch during the close waits") |
+| Q9 | `tincan-store` test `simultaneous_first_open_migrates_once` flakes under load with "database is locked": `PRAGMA journal_mode = WAL` on a fresh file (`lib.rs:92`) does not wait on the busy handler | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)") |
+| Q10 | Storage trait has no batch insert for sync pages (`tincan-core` `Storage`); `tincan-store` has one but net inserts one by one | fixed ("Add lower-crate APIs for the app follow-ups (Q1-Q7, Q9, Q10, SPEC-GAPS-2)") |
 
 ## Round 1: tincan-net and tincan-core hardening (fixed before commit 'Harden tincan-net against malicious members')
 

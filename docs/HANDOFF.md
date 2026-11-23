@@ -4,15 +4,15 @@ Status of the Tincan build for the next session. Updated at every milestone comm
 
 ## Where it stands
 
-Work in progress (2026-11-23). Every feature in the original request is built and runs end to end between two profiles on one machine. Two review rounds found security and correctness problems. Round 1 (tincan-net and tincan-core: host takeover, DoS, trust in the host) is fixed. Round 2 (tincan-app, the shell and the UI) is being fixed now. Its status is tracked per finding in [`review/findings.md`](review/findings.md).
+Work in progress (2026-11-23). Every feature in the original request is built and runs end to end between two profiles on one machine. Two review rounds found security and correctness problems. Round 1 (tincan-net and tincan-core: host takeover, DoS, trust in the host) is fixed. Round 2 (tincan-app, the shell and the UI) is fixed in code and tests: the four fix branches are merged and the app-side follow-ups are on main. Its status is tracked per finding in [`review/findings.md`](review/findings.md). The fixes have not been run in the real Tauri app yet (two-profile e2e pending).
 
 | Step | State |
 |---|---|
 | Core crates (core, store, net, files, audio, screen) | done, tested |
 | App orchestrator (`crates/tincan-app`) and Tauri shell (`src-tauri`) | done, tested |
-| Two-profile UI end-to-end run (`ui/e2e`) | 49/49 checks passed (before the round 2 fixes) |
+| Two-profile UI end-to-end run (`ui/e2e`) | 49/49 checks passed before the round 2 fixes; to rerun |
 | Round 1 hardening of tincan-net | done |
-| Round 2 fixes (app, shell, UI) | in progress, see `review/findings.md` |
+| Round 2 fixes (app, shell, UI) | done in code and tests (`cargo test --workspace`, clippy, `pnpm typecheck`, `pnpm test`), see `review/findings.md` |
 | unslop-ui pass on the UI | pending |
 | NSIS installer (`pnpm tauri build`) | pending |
 
@@ -55,13 +55,13 @@ Profiles: `--profile <name>` or `TINCAN_PROFILE`, data in `%APPDATA%\Tincan\prof
 - `e2e.md`: the two-profile run, its timings and resource numbers.
 - `review/`: confirmed review findings and their status.
 
-## Resuming the in-flight work
+## Round 2 status
 
-The round 2 fix workflow (run `wf_3e0c42f2-14e`, script under `~/.claude/projects/D--code-projects-tincan/<session>/workflows/scripts/tincan-fix-round2-wf_3e0c42f2-14e.js`) was running when the usage limit hit. Its four fixers work in git worktrees and leave branches `fix/net`, `fix/files-sec`, `fix/ui`, `fix/shell` (check `git branch --list fix/*`). If the workflow cannot be resumed, merge those branches into main yourself, then do the remaining steps below. Also open: `ui/src/lib/names.ts` `nameKey` (on `fix/ui`) does not fold lookalike letters (Cyrillic "А" vs Latin "A"), so the duplicate-name suffix can be dodged; fold a UTS #39 confusables subset there, with a test.
+The fix branches `fix/net`, `fix/files-sec`, `fix/ui` and `fix/shell` are merged into main, followed by the app-side work (bulk windows and SyncComplete, media races, DM names and presence with `dm_watch`, per-server `Have` announcements, `NetError::RejectedByPeer`, `<bdi>` for peer names). The lookalike-letter folding in `ui/src/lib/names.ts` `nameKey` landed on `fix/ui`. Known gaps are listed in `review/findings.md` and the notes; the review of the fixes themselves is still to do.
 
 ## Next steps
 
-1. Finish the round 2 fixes, highest severity first, then run a review of the fixes.
+1. Review the round 2 fixes (they were reviewed only by their authors).
 2. unslop-ui pass on every screen (copy and surface), keeping `ui/e2e` selectors in step.
 3. Rerun the full test suite and the two-profile e2e.
 4. Build the NSIS installer, smoke-test the release exe, measure release idle memory against the 30 MB target.

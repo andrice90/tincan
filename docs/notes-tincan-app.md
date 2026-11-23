@@ -16,8 +16,8 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 | `dispatch.rs` | `App::call`: argument structs, routing, `CORE_COMMANDS` |
 | `commands.rs` | Servers, channels, messages, DMs and settings commands; cursor and id parsing |
 | `transfers.rs` | Attachment import, hash index bookkeeping (references, shares, download nominations), auto-fetch, the fetch worker, `transfer` / `download` / `open_file` / `file_url` / `file_for_url`, resume, lag recovery |
-| `views.rs` | `ConvView` (cached slice of `ConvState`), DTO builders, `refresh` with dedup |
-| `pump.rs` | The event pump: `NetEvent`/`FileEvent` to UI events, debounce and bulk coalescing |
+| `views.rs` | `ConvView` (a slice of `ConvState` built under the replica lock with `Net::with_state`), `ViewCache` (views plus a generation per conversation), DTO builders, user names, `refresh` with dedup |
+| `pump.rs` | The event pump: `NetEvent`/`FileEvent` to UI events, debounce, `Bulks` (bulk windows), `RosterSig` (roster dedup) |
 | `shell.rs` | MIME types, safe export names, peer text clean-up, unique paths, the open or reveal decision, the Mark of the Web |
 | `media/mod.rs` | `Media`: state, `COMMANDS`, command routing, the hooks the rest of the app calls, lock order |
 | `media/engine.rs` | The `AudioEngine` slot, its event forwarder, restart after the engine thread dies, the synthetic test microphone, `decode_clip` under `catch_unwind` |
@@ -30,7 +30,7 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 `tincan.db` (`SqliteStorage`, held as `Arc<SqliteStorage>`), `identity.key` (32 bytes, written through a temp file on first start), `blobs/` (`Files::load`) and `tincan.lock`.
 
 - The lock is `File::try_lock` on `tincan.lock`. It is held until `App::shutdown`, not until process exit, so a test can reopen the same profile in-process.
-- A second start fails with "Tincan is already running with this profile."
+- A second start fails with "Tincan is already running with this profile." The shell keeps that from reaching the user (`src-tauri/src/instance.rs`): a second launch of an open profile focuses the first window and exits with 0, and a launch while the profile is still closing waits for the old process.
 - The display name lives in kv `app/display_name`. It is not in the settings document, because the UI's `Settings` has no name and `settings_set` would erase it.
 - Settings are one JSON document in the store's settings table.
 - Other kv keys:
@@ -61,9 +61,8 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 `App::shutdown` runs once; concurrent callers wait (`tokio::sync::OnceCell`). Steps, each bounded:
 
 1. `media.shutdown` (3 s): marks media closed, stops my share (capture thread joined on a blocking thread), detaches the session, drops every watcher and drops the audio engine (its thread is joined on a blocking thread). The call and the room themselves end in `net.shutdown`.
-2. `net.shutdown`, which does the clean handoff and router shutdown, closing files (10 s budget; about 3 s in practice).
-3. `files.shutdown` (idempotent, 5 s).
-4. Abort the pump and the worker, release the lock.
+2. Drop the `dm_watch` guard. Then `net.shutdown` (the clean handoff and router shutdown; 10 s budget, about 3 s in practice) and `files.shutdown` (idempotent, 5 s) run together: when Windows ends the session the shell caps the whole shutdown at 4 s, and the blob store must not wait for a slow handoff.
+3. Abort the pump and the worker, release the lock.
 
 After shutdown every command returns "Tincan is shutting down." and `file_for_url` returns `None`.
 
@@ -101,16 +100,20 @@ Rules from api.md and the task:
   - "<name> is larger than 25 MB. Send a smaller file."
   - "That isn't a Tincan ID. Paste the code that starts with tincan1u."
 
-  Errors from tincan-net are passed through, except `NetError::Core` and `Endpoint`, which become generic sentences.
+  Errors from tincan-net are passed through, except `NetError::Core` and `Endpoint`, which become generic sentences, and `RejectedByPeer` (a host's words), which is quoted (see Peer text).
 
 ## Event mapping and throttling (pump.rs)
 
 | Source | UI event |
 |---|---|
-| `EventAdded` + `Change::Message` | `message-added` at once, then an unread refresh |
+| `EventAdded` + `Change::Message` | `message-added` at once, then an unread refresh (my own messages refresh the DM summary, so `lastMessageAt` and the DM order follow a send) |
 | `EventAdded` + `Change::Deleted` | `message-updated` (the stored event, `deleted: true`) |
 | `ConvUpdated` (`ServerRenamed`, `Channels`, `Members`) | view invalidated, then `server-updated` / `channels-updated` / `members-updated` after the debounce |
-| `RosterUpdated`, `ConnectionChanged` | `server-updated`, `members-updated`, DM online states; holders re-queried for parked downloads |
+| `RosterUpdated` | `server-updated`, `members-updated`, DM online states; holders re-queried for parked downloads. Skipped when nothing the UI shows changed (`RosterSig`: online users, voice room, muted, deafened, sharing, host; not RTT buckets, addresses or revisions) |
+| `ConnectionChanged` | `server-updated`, `members-updated`; on a new state or host also DM online states, a fresh roster comparison and (as member) the start of the server's history sync |
+| `SyncComplete` | ends the conversation's bulk window at once (one refresh plus the `snapshot`) |
+| `DmNameChanged` | `dm-updated`, the contact record's name, `call-updated` / `voice-updated` when they show the contact (no `snapshot`: a peer can send names often) |
+| `ConvUpdated` + `Channels` deleting my voice room | `Media::on_channels`: I leave the room ("The voice room was deleted.") |
 | `Typing` | `typing` (`channelId` null for DMs), never for my own typing |
 | `DmDelivered` | `message-updated` (`pending: false`) for my DM messages in the newly acked seq range (at most 200) |
 | `DmOpened`, `DmLinkUp/Down` | `dm-updated` |
@@ -124,21 +127,25 @@ Rules from api.md and the task:
 Throttling:
 
 - **Debounce:** non-message changes mark a conversation dirty. One flush 100 ms later recomputes the marked DTOs. Each is emitted only if its JSON differs from the last one sent (`Core::sent`, keyed per DTO and conversation).
-- **Bulk ingest:** tincan-net does not surface its sync-complete marker, so the pump detects bulk itself. A conversation goes bulk on any of:
-  - more than 8 messages of one conversation in one drained batch (the pump drains with `try_recv` after each `recv`);
-  - more than 40 messages in one second;
-  - a window armed by `join_server`: before `Net::join`, and again for 1 s after it returns, since the history sync starts right after the `Welcome`.
+- **Bulk ingest** (`Bulks`, a state machine driven with explicit times and unit-tested). A conversation goes bulk on any of:
+  - more than 8 message or deletion events of one conversation in one drained batch (the pump drains with `try_recv` after each `recv`);
+  - more than 40 in a sliding second;
+  - a window armed by `join_server`: before `Net::join`, and again for 1 s after it returns, since the history sync starts right after the `Welcome`. The re-arm is ignored when `SyncComplete` already came.
 
   While bulk:
   - No `message-added` / `message-updated` events go out.
   - The attachment index and auto-fetch still run.
   - State changes are deferred.
 
-  After 400 ms without messages, one refresh of everything for that conversation is emitted, plus one `snapshot` if anything was suppressed. The snapshot makes the UI drop and reload its message pages (actions.ts `applySnapshot`).
+  The window ends with one refresh of everything for that conversation, plus one `snapshot` if anything was suppressed (the UI keeps and re-reads the conversation on screen and drops the other message caches, actions.ts `applySnapshot`), on whichever comes first:
+  - `NetEvent::SyncComplete` for the conversation (servers: after each connection to a host; DMs: after each DM connect);
+  - 400 ms without burst messages: only a message over the rate or in a batch over 8 holds the window open, so one message every few hundred ms lets it close;
+  - its maximum: 5 s, or 60 s while a server's history sync runs (from a connection as member until `SyncComplete`). A window cut at its maximum is marked capped: until the rate stayed under 40 a second for 2 s, only a batch over 8 opens a new one. So a member who keeps posting fast cannot hold every live message back, and a host or DM peer that withholds the end of its sync costs at most one long window per connection.
 - **Measured in `history_sync_is_coalesced`:**
-  - Joining a 300-message history emits no `message-added`. Then one `channels-updated` (with the unread dot), one `members-updated`, one `server-updated` and a `snapshot` follow; the test requires each of them.
-  - A 100-message catch-up after a restart emits no `message-added` and ends in a snapshot. The count passes with room under the 40 the test allows.
-- **Trade-off:** a live message in the first second after a join reaches the UI through that snapshot, not as `message-added`.
+  - Joining a 300-message history emits no `message-added` (5 events in all). Then one `channels-updated` (with the unread dot), one `members-updated`, one `server-updated` and a `snapshot` follow; the test requires each of them.
+  - A 100-message catch-up after a restart emits no `message-added` (4 events in all) and ends in a snapshot.
+- **Trade-off:** a live message during a join's sync reaches the UI through the snapshot at `SyncComplete`, not as `message-added`.
+- **Members changes:** `update_policy` runs at once on a membership change (a new member may fetch right after joining) unless it ran within 100 ms or the conversation is bulk; then the next flush runs it. Views are built under the replica lock without copying the message index, so a peer spamming Profile events costs O(members) per event, not O(history).
 - **Lag:** if the network receiver lags, everything is marked dirty and a `snapshot` is emitted.
 - **Timers:** the only one is the debounce/quiet deadline, armed while something is pending. The UI broadcast holds 1024 events.
 
@@ -187,7 +194,7 @@ Admitted members and DM contacts are untrusted, and hashes are not secret: tinca
   - I downloaded H and the peer that delivered the last verified bytes (`FileEvent::Completed.from`) was named by C: an author of a reference to H in C, or a holder C's host listed in `who_has` (`Core::nominations`, kept per download in flight). Clip pulls nominate the player and the holders of the session's conversation.
   - Someone reposted H in C while they may already fetch H from me: they could pass the bytes on anyway.
 - **What does not:** a message in C that only references H. This is stricter than "a hash belongs to every conversation that references it", which would let a member of server S post the hash of a DM file in S and then fetch it from me.
-- **Announcements:** `Core::announce` sets the `Have` list and the clip library announcement to held blobs that are shared with a server I am in. A blob shared only with DMs is never announced (DM `who_has` always names the contact). tincan-net still sends that one list to every host and every DM peer, so a server's host also learns hashes shared with my other servers; it cannot fetch them. Per-conversation announcements need a tincan-net API.
+- **Announcements:** `Core::announce` tells each server's host only the held blobs and library clips shared with that server (`Net::set_announced`, per server); a host lists me as a holder only of those. A blob shared only with DMs is never announced (DM `who_has` always names the contact), and tincan-net sends DM contacts no `Have` list at all. Every share change, completion and clip library change recomputes the per-server lists.
 - **Known gaps:** a host is trusted to list real holders, so a host that also references H can get a blob I download from the holder it named shared with its server. A download whose bytes came from two providers is credited to the last one.
 
 ### Open or reveal (`shell::open_action`, unit-tested)
@@ -203,7 +210,7 @@ Admitted members and DM contacts are untrusted, and hashes are not secret: tinca
 
 - **Names in DTOs:** peer display names (members, authors, DM and call names, typing, voice participants, `sound-played`), contact names, server and channel names, attachment names and clip names have control characters and the hidden format characters above removed (`shell::clean_text`, `views::display`). Attachment names also fold whitespace runs (`views::file_display`), like the export. The attachment MIME in the DTO is the type of the cleaned file name, not the sender's claim, so the UI's icon and image preview match what `open_file` will do. Stored names stay as published, because commands compare against them.
 - The whole range U+200B-U+200F is removed from names, U+200C and U+200D included. That splits emoji joined with ZWJ and changes some Persian and Indic text; it was chosen over keeping invisible joiners that can make two names look the same.
-- **Host refusals** (`net_err`): `NetError::Rejected` text that came from a host is shown as `The host refused this: "<text>"`, with hidden characters removed, whitespace folded and the text cut to 200 characters. Exact matches of the sentences tincan-net writes itself and of an honest host's join refusals (invite not valid, revoked, used up, clock checks) are shown as they are. A tincan-net variant for peer text would replace the string match.
+- **Host refusals** (`net_err`): `NetError::RejectedByPeer` (text that came from a host: a publish refusal, a bad-invite join refusal) is shown as `The host refused this: "<text>"`, with hidden characters removed, whitespace folded and the text cut to 200 characters. Exact matches of an honest host's join refusals (invite not valid, revoked, used up, clock checks) are shown as they are; a host repeating one of tincan-net's own sentences is quoted. `NetError::Rejected` is always tincan-net's own sentence and is shown as is.
 
 ## Settings
 
@@ -231,7 +238,8 @@ Admitted members and DM contacts are untrusted, and hashes are not secret: tinca
   - `add_contact` accepts `tincan1u...` or a bare z32 id (`parse_user_code`), then runs `open_dm`.
   - `open_dm` calls `net.dm_open`, saves a contact record and adds the DM to the access state: the peer may open a blobs connection, and fetches only what is shared with that DM.
   - An incoming DM from a stranger arrives as `DmOpened` and gets the same treatment.
-- **`DmSummary.name`:** in order, a server display name, the contact record, or the first 8 characters of the z32 id. DMs carry no profile, so a contact you share no server with stays a short id.
+- **`DmSummary.name`** (and DM author, call and typing names, `Core::user_name`): in order, the name the contact announced over the DM (`Net::dm_peer_name`, kept across restarts, cleaned like every peer name), their display name in any server I am in (views are rebuilt when not cached), the contact record, or the first 8 characters of the z32 id. The contact record follows the best name known. `DmNameChanged` refreshes the DM summary, the call and the voice DTOs; message pages already in the UI keep the old author name until they are read again.
+- **`dm_watch { convId | null }`:** the UI names the DM on screen (null when none; the calls are chained in the UI). The app holds one `Net::dm_watch` guard for it, which dials now, redials with backoff and keeps the link from idling out, so `DmSummary.online` is right and calls work for a contact who shares no server, also after a restart. The DM view's Call button no longer depends on presence: `call_start` dials on its own.
 
 ## Media
 
@@ -262,6 +270,7 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
 - Neither `speaking` nor its changes send `members-updated` or `voice-updated`. Both DTOs read the current flags, so the UI's speaking store stays right when they are sent for other reasons.
 - **Engine death:** the engine's event sender lives only on its thread, so the forwarder seeing the channel close outside shutdown means the thread died (a panic unwound it).
   - The app drops the dead handle, lights every speaking ring off, starts a fresh engine and, if a session is attached, calls `start_call` again with the kept `audio_out`, local track and epoch. A toast says "Audio stopped working and was restarted."
+  - `AudioEngine::is_running` is checked too: a stopped engine is never handed out (`engine_handle`), and the next use (`ensure_engine`) replaces it at once, counts the death and restarts the session's call side, even before the forwarder saw the closed channel.
   - At most 3 restarts per 60 s; after that the toast asks to rejoin voice or restart Tincan.
   - The audio pump looks up the current engine per batch, so received packets go to the new engine.
   - `test_crash_audio_engine` makes the synthetic microphone panic on the engine thread; `voice_room_audio_flows_both_ways` checks the restart and that audio keeps flowing.
@@ -279,23 +288,26 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
   - a task delivers `video_in` to the `screen_watch` sinks (`ui_video_message`);
   - `files.set_upload_limit(256 KiB/s)` (128 KiB/s while I share). No uplink measurement exists, so the "50% of uplink" rule is a fixed cap.
 - Detaching stops the engine's call side and clears speaking flags, watchers, my share, the heard clips (`clips-updated`), the PCM cache and the upload limit.
-- **`reconcile`** decides attach and detach from `Net::voice_info()` and `Net::call_info()`, because net emits `VoiceUpdated` / `CallUpdated` before the command gets its session back. It runs on `VoiceUpdated`, `CallUpdated`, a lagged stream and after every session command.
+- **`reconcile`** decides attach and detach from `Net::voice_info()` and `Net::call_info()`, because net emits `VoiceUpdated` / `CallUpdated` before the command gets its session back. It runs on `VoiceUpdated`, `CallUpdated`, a lagged stream and after every session command. It reads both only while holding `st`, so a stale `None` from the middle of `Net::voice_join` cannot detach the room that was just joined.
+- **Deleted rooms:** a `Channels` change (or a lagged stream) that shows my voice room deleted makes me leave it, re-checked with `ops` held so a room switch in between is not undone.
   - An attached room is stale when `voice_info` names another conversation or channel. An attached call is stale unless `call_info` is active with the same peer (keyed by peer: glare rewrites the call id).
   - Session commands increment `switching`; while it is non-zero, reconcile does not detach (no `voice-updated: null` flicker between leaving and joining).
   - It also follows host migrations: `set_epoch` and `set_relayed` on change (`VoiceInfo.epoch` / `relayed`). The short-id map is refreshed from the roster.
 - **Calls:**
   - `call_start` returns the ringing `CallInfo`; its session waits in `pending_call` and is attached by reconcile once the call is active. If net returns an already active call (they were ringing me), it attaches at once.
-  - The peer's short id is `0` when the peer's id is lower than mine, else `1`.
+  - When the audio can't start after Net answered or connected a call (`call_accept`, `call_start` answering, the pending call in reconcile), the call is hung up, so neither side is left in a silent call nothing in the UI can end.
+  - The peer's short id is `tincan_net::call_short_id(peer, me)`.
   - `call-updated` carries the `CallInfo` while ringing or active and `null` once ended, as the mock does. A notice is shown when it is news: "X declined the call.", "X didn't answer.", "Missed call from X.", "The call with X was lost."
   - `call_decline` with an unknown id returns null.
 - **`VoiceSession`:**
   - Rooms: participants are me (local mute, deafen and share state) plus the roster entries in my room, sorted by name. The roster is used only while the server's connection is member, hosting or solo.
   - Calls: participants are me and the peer, with `peer_muted`, `peer_deafened` and `peer_sharing`.
   - `path` is `none` until media flows, then `relay` or `direct` (a member uses its connection's path). `Connection.path` is `None` while hosting, which the UI would show as "Connecting".
-  - `rttMs` is the member's host RTT. It is null when hosting and in calls (net exposes no call RTT).
+  - `rttMs` is `VoiceInfo.rtt_ms`: to the host in a room (null while I host it), to the peer in a call. Net updates it about once a second and reports only real moves.
+  - `VoiceParticipant.volume` is the saved per-user volume (0..2, 1 for me).
   - `voice-updated` is sent when the JSON changes: on `VoiceUpdated`, roster and connection changes of my server, `CallUpdated`, mute or deafen changes, share changes.
 - **Mute and deafen** follow `actions.ts`: unmuting clears deafen, deafening sets muted, undeafening leaves muted. They go to the engine (`set_muted`, `set_deafened`) and to `net.set_status`. The state persists across sessions within a run.
-- **`set_user_volume`:** 0..2, persisted in kv `app/user_volumes`. It is applied as `set_track_volume(track_id(short, KIND_VOICE))` whenever the session's short-id map changes. Members who leave the room get `remove_track`.
+- **`set_user_volume`:** 0..2, persisted in kv `app/user_volumes`, then `voice-updated` (the participant's `volume`). It is applied as `set_track_volume(track_id(short, KIND_VOICE))` whenever the session's short-id map changes. Members who leave the room get `remove_track`.
 - **`audio_devices`:** `AudioEngine::devices()` on a blocking thread; empty lists with `no_devices`.
 - **`mic_test`:** `engine.mic_test(on)`; the engine sends `mic-level` about 20 times per second.
 
@@ -315,13 +327,13 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
   - The PCM comes from the cache (at most 4 clips or 2 M samples, dropped on leaving voice) or a fresh decode.
   - `engine.play_clip`, then the clip is shared with the session's conversation (the server of the room, or the DM of the call), then `net.sound_played(ClipInfo)`. Playing works while muted.
 - **Incoming `SoundPlayed`:**
-  - Only for my attached session.
+  - Only for my attached session, and at most one per player every 250 ms (the throttle is cleared on detach).
   - Announcements over 5 MiB or about 20 s are ignored. Peer names are cleaned of control and hidden format characters and cut to 32 characters.
   - Emits `sound-played { userId, name, clip }`; `clip.owned` says whether it is in my library. A clip I don't own is remembered as heard.
   - The clip is **not** played locally: the player's engine already mixes it into its voice stream (`AF_SOUNDBOARD`), so a local copy would play it twice.
 - **`clip_fetch`:**
   - Records the pull (kv `app/clip_fetches`, so it survives a restart), then `files.download(hash, Clip, [player, ...who_has(conv)])`.
-  - A blob already held as an attachment is tagged as a clip instead of downloaded.
+  - A blob already held (as an attachment, or a clip no longer in the library) is read, tagged as a clip and finished at once. One over 5 MB (a peer announced a held attachment's hash with a small size) or one that can't be read or tagged forgets the pull and errors: "That sound is larger than 5 MB, so it wasn't saved." or "Couldn't save the sound. Try again."
   - Progress and states re-send `clips-updated`. tincan-files stops a clip download past 5 MiB (`TooLarge`); the app then forgets the pull and says so.
   - On `FileEvent::Completed { kind: Clip }` for a recorded pull, the blob is read and decoded. If it is valid it goes into the library and is announced, so I serve it while I keep it. Otherwise the clip tag is dropped and a toast says so.
   - `Completed` events of clips that were not pulled are ignored, because `clip_add`'s import fires one before its row exists.
@@ -358,6 +370,8 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
 - `App::test_fetch_from(hash, user, addrs, secs)`: fetch a blob straight from a peer over the blobs protocol, as a modified client could (no message, index or holder lookup).
 - `App::test_post_attachment_ref(conv, channel, hash, name, size)`: publish a message whose attachment claims a hash without holding the bytes.
 - `App::test_pause_file_events(paused)`: the pump drops every file event while paused; resuming runs the lag recovery.
+- `App::test_fail_audio_start(on)`: starting call audio fails while on (rooms and calls refuse to attach).
+- `App::test_sound_played(hash, name, size, ms)`: announce a clip in my session without holding it, as a modified client could.
 
 Joins need no hook, because invites carry the inviter's loopback address.
 
@@ -383,10 +397,12 @@ Joins need no hook, because invites carry the inviter's loopback address.
 - `lost_file_events_are_recovered` (c4): Bob's pump drops file events while his auto-fetch completes, so the file is not shared; after the lag recovery the UI gets `complete` and Carol can fetch it from Bob.
 - `direct_messages_and_offline_delivery` (d):
   - `add_contact` by code; DMs and DM typing both ways.
+  - My own message moves the DM's `lastMessageAt`. The contact's DM name shows in the DM list and on their messages; a rename arrives cleaned of bidi controls.
   - B shuts down; A's message is pending. B restarts on the same profile, gets the message, and A gets `message-updated` with `pending: false`.
   - The name and the DM list survive the restart.
+- `a_watched_dm_contact_shows_online`: a DM-only contact restarts on a new address with nothing pending and stays offline until `dm_watch` names the DM, then shows online.
 - `owner_changes_and_deletes_propagate` (e):
-  - A later `set_name` reaches the other member.
+  - A later `set_name` reaches the other member, also a second rename made while the first one's publish was in flight.
   - `rename_server`, create, rename and delete channel, and `delete_message` propagate.
   - Owner-only and own-message errors; `leave_server` gives a `snapshot` without the server.
 - `history_sync_is_coalesced`: the bulk measurements above.
@@ -418,7 +434,9 @@ Joins need no hook, because invites carry the inviter's loopback address.
   - `call_accept` returns a `call` session with both; the caller gets `active` and `voice-updated`.
   - `speaking` and audio both ways.
   - `call_hangup` gives `call-updated: null` and `voice-updated: null` on both sides (in either order: net emits `VoiceUpdated` first).
+  - Both sides report the call's RTT.
   - A second call is declined and the caller gets "... declined the call."
+  - A third call whose callee can't start audio ends on both sides when accepted.
 - `soundboard_clips_travel_between_members` (d):
   - `clip_add` refuses a 25 s WAV, a 5 MiB + 1 byte file, 30 kB of noise named `.mp3`, a missing file and a 40-character name, all without a panic.
   - A 2 s WAV is added (about 2000 ms).
@@ -432,6 +450,7 @@ Joins need no hook, because invites carry the inviter's loopback address.
   - B's sink gets at least 20 raw messages: the first a keyframe with the right track and an Annex-B start code, timestamps increasing.
   - `screen_stop` clears `screenTrack` and drops B's sink.
   - Re-sharing in motion mode works, `screen_unwatch` drops the sink, and leaving voice ends the share.
+- `voice_room_edges`: the saved volume comes back in `voice-updated`; a held 6 MB attachment announced as a small clip is refused when saved and its tile is gone; deleting the voice room takes both members out of it.
 - `real_screen_share_of_the_primary_display` (`#[ignore]`, run with `cargo test -p tincan-app --test media -- --ignored real_screen_share`):
   - Shares `display:0` for 2 s through tincan-screen; with no encoder it checks `no-hardware-encoder` instead.
   - Run once on this machine (hardware encoder present, 3440x1440 primary display): `screen_start` took 261 ms, and B's sink got 32 messages in 2 s (2 keyframes, 285 kB), the first an IDR with SPS `avc1.640028`.

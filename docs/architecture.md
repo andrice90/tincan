@@ -58,7 +58,14 @@ All audio and capture are native. The webview never touches the microphone or th
 
 `TOKIO_WORKER_THREADS=2` is set at the top of `main` before any thread exists (iroh-blobs' FsStore builds its own runtime sized by it). The app's own runtime is built explicitly with 3 workers and handed to Tauri via `tauri::async_runtime::set`.
 
-WebView2 does not throttle a minimized Tauri window on Windows (measured). `visibilitychange` never fires on minimize, so the UI pauses video rendering from Tauri window events (`tauri://blur`, minimized state), not Page Visibility.
+WebView2 does not throttle a minimized Tauri window on Windows (measured). `visibilitychange` never fires on minimize, so the UI follows Tauri window events (minimized state), not Page Visibility. While the window is minimized a watched screen share is unwatched (`screen_unwatch`, the decoder closed), so nothing is received, copied over IPC or decoded; it is watched again on restore and starts at a keyframe.
+
+Exit sequence:
+
+- Closing the window hides it at once, then runs `App::shutdown` (media, then the host handoff alongside the file store flush) for at most 5 s before the process exits.
+- Windows logoff, shutdown and Restart Manager end the session through `RunEvent::Exit`: the shell runs `App::shutdown` there, blocking, with a 4 s cap (`src-tauri/src/exit.rs`, `main.rs` `end_session`).
+- One instance per profile (`src-tauri/src/instance.rs`): a second launch of an open profile focuses the first window and exits with code 0. A launch while the profile is still closing waits for the old process instead of failing.
+- The uninstaller's "delete the application data" box removes `%APPDATA%\Tincan` (every profile; `src-tauri/windows/hooks.nsh`).
 
 ### Profiles (multi-instance testing)
 
@@ -152,7 +159,7 @@ Attachment { hash, size, name, mime }
 
 ## Presence and ephemeral state (host-aggregated, re-announced)
 
-Members re-announce everything ephemeral in `Hello` and on change: `Status` (uptime, AC power, voice room, sharing, muted/deafened), held blob hashes (`Have`), soundboard clips in their library. The host aggregates them into the `Roster` it broadcasts. After a migration everyone re-announces to the new host, so nothing is lost when a host dies.
+Members re-announce everything ephemeral in `Hello` and on change: `Status` (uptime, AC power, voice room, sharing, muted/deafened), held blob hashes (`Have`), soundboard clips in their library. Held blobs and clips are announced per server: a host learns only the ones shared with its server (`Net::set_announced`), and DM contacts get no `Have` list. The host aggregates them into the `Roster` it broadcasts. After a migration everyone re-announces to the new host, so nothing is lost when a host dies.
 
 `Roster { epoch, rev, online: [RosterEntry], succession: [UserId; <=4] }`
 `RosterEntry { user, short_id: u16, addr: AddrHint, since_ms, voice: Option<ChannelId>, muted, deafened, sharing }`
@@ -236,6 +243,17 @@ Partition merge (two solo hosts is the common case, given the 6 s solo timeout):
 - Eight stranger identities can hold every stranger DM slot and use up the stranger connection rate (10 a minute), delaying first contact from real strangers. Contacts and members of shared servers are not affected.
 - Blob transfer throughput under the bounded QUIC windows (16 MiB per connection, 8 bidi streams) has not been measured.
 
+### Files and peer text (tincan-app)
+
+Admitted members and DM contacts are untrusted, hashes are not secret, and peer-supplied names and text are untrusted for the app and the UI.
+
+- Blob access is decided per (peer, hash). A peer may fetch a blob from me only if it is shared with a conversation that peer is in right now. A blob becomes shared with a conversation when I send it there, play the clip in its voice room or call, download it from a peer that conversation named (an author of a reference there, or a holder its host listed), or when someone who may already fetch it from me reposts it there. A message that only references a hash grants nothing.
+- Each server's host learns only the held blobs and clips shared with that server. A host is still trusted to list real holders, so a host that also references a hash can get a blob I download from the holder it named shared with its server.
+- Size caps: attachments 25 MiB, clips 5 MiB, checked against the real size as soon as it is known (`TooLarge`, shown as a failed download). Larger declared sizes are never queued; `download` refuses them with "This file is larger than 25 MB, so Tincan won't download it."
+- Opening a file exports it under a cleaned name (no hidden format or bidi characters, the real extension kept) and writes the Mark of the Web (`Zone.Identifier`, `ZoneId=3`). Only documents, media and images whose bytes match their extension are opened with the default app; everything else is revealed in Explorer.
+- Peer names (members, DM contacts, servers, channels, files, clips) have control and hidden format characters removed before they reach the UI, which also isolates them with `<bdi>` and shows a short id next to names that look alike. A DM contact's name is the one they announced over the DM.
+- A host's refusal text (`NetError::RejectedByPeer`) is quoted as the host's words, never shown as Tincan's own sentence.
+
 ## Rendezvous record
 
 A hint for cold joiners when every cached peer is stale. Never trusted on its own (dialers verify via `Hello`, `SignedHostClaim` and the member list).
@@ -265,11 +283,11 @@ A hint for cold joiners when every cached peer is stale. Never trusted on its ow
 ## Files (attachments and soundboard clips)
 
 - iroh-blobs `FsStore` in the profile dir, `ImportMode::TryReference` for local files (no copy), named tags `att-<hash>` / `clip-<hash>` so GC keeps them.
-- Provider events: `connected: Intercept` (only members of a shared server or DM contacts may fetch), `observe: Intercept` (lets a downloader query a peer's ranges), `throttle: Intercept` (caps upload to 50% of measured uplink while in a call).
-- Holder index: members announce held hashes in `Hello`/`Have`; the host keeps `hash -> online holders` and answers `WhoHas{hash}` with `Holders{hash, users, addrs}`. Downloads use the author first, then holders from the host, then anyone in the roster (Observe before fetch where cheap).
+- Provider events: `connected: Intercept` (only members of a shared server or DM contacts may connect), then every get and observe request is checked per (peer, hash) (see "Files and peer text" in the security model). While in voice, uploads are capped at a fixed 256 KiB/s (128 KiB/s while sharing): nothing measures the uplink.
+- Holder index: members announce held hashes in `Hello`/`Have`, each server only the ones shared with it; the host keeps `hash -> online holders` and answers `WhoHas{hash}` with `Holders{hash, users, addrs}`. Downloads use the online authors first, then holders from the host, then offline authors.
 - Downloader pool `connect_timeout` 4 s. A failed download is re-queued when a new holder comes online. `router.shutdown()` on exit so partial progress survives restarts (a hard kill loses the last partial chunk).
 - Auto-prefetch: every online member fetches attachments up to 25 MB when the message arrives, so the file survives the uploader leaving first.
-- Opening a file exports it to `Downloads\Tincan\` and opens it with the shell.
+- Opening a file exports it to `Downloads\Tincan\` with the Mark of the Web, then opens it with the default app only when it is a document, media or an image whose bytes match its extension; anything else is revealed in Explorer.
 
 ## Media
 

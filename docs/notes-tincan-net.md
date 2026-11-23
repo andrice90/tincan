@@ -30,7 +30,8 @@ Crate: `crates/tincan-net`. Rustdoc: `cargo doc -p tincan-net --no-deps`. This p
   - `dm_pending(conv)` is the highest unconfirmed seq (0 when all are delivered). `DmDelivered` fires when the ack advances.
 - `typing(conv, channel)` works for servers and DMs (the task sketch had `server`).
 - `who_has(conv, hash)`:
-  - Servers: holders from the host's aggregation (`Have` announcements plus clip libraries; the host includes itself).
+  - Servers: holders from the host's aggregation (`Have` announcements plus clip libraries; the host includes itself when it announced the blob for that server).
+  - Announcements are per server once the app calls `Net::set_announced` (`HashMap<ServerId, Announced { have, clips }>`): each server's host gets only its entry, in the `Hello` and as `Have` deltas computed per session, and `set_have`, `have_add` and `set_clips` no longer change what is announced. DM peers get no `Have` list (`DmHello.have` is empty, no deltas on DM links): DM `who_has` always names the contact.
   - DMs: always the contact.
   - The result never includes me.
 - `leave(server)` publishes `MemberLeave` (best effort, 5 s), hands off if hosting, deletes the conv, its events and its peers, and emits `Left`. The own-seq floor in kv (`net/own_seq/<conv>`) is kept on purpose, so a re-join continues the seq chain.
