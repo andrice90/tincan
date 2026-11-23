@@ -76,13 +76,13 @@ export function nudge(key: string, shift: boolean): Point | null {
   const d = shift ? 16 : 4;
   switch (key) {
     case "ArrowLeft":
-      return { x: d, y: 0 };
-    case "ArrowRight":
       return { x: -d, y: 0 };
+    case "ArrowRight":
+      return { x: d, y: 0 };
     case "ArrowUp":
-      return { x: 0, y: d };
-    case "ArrowDown":
       return { x: 0, y: -d };
+    case "ArrowDown":
+      return { x: 0, y: d };
     default:
       return null;
   }

@@ -86,8 +86,19 @@ impl Core {
             None => {}
         }
         self.index_image(conv, dm, author, img);
-        if self.fetch_tx.try_send(FetchReq::Image { hash: img.hash }).is_ok() {
-            self.images.lock().insert(img.hash, ImgState::Pending);
+        {
+            // Marked before queueing, so a check that finishes first is never overwritten.
+            let mut images = self.images.lock();
+            if images.contains_key(&img.hash) {
+                return None;
+            }
+            images.insert(img.hash, ImgState::Pending);
+        }
+        if self.fetch_tx.try_send(FetchReq::Image { hash: img.hash }).is_err() {
+            let mut images = self.images.lock();
+            if images.get(&img.hash) == Some(&ImgState::Pending) {
+                images.remove(&img.hash);
+            }
         }
         None
     }
@@ -107,8 +118,17 @@ impl Core {
             self.check_image(hash).await;
             return;
         }
-        if self.files.transfer(hash).is_some() {
-            return;
+        // A download in flight or parked goes on by itself; a failed one starts again.
+        if let Some(t) = self.files.transfer(hash) {
+            use tincan_files::TransferState as S;
+            match t.state {
+                S::Queued | S::Downloading | S::Unavailable | S::Complete => return,
+                S::TooLarge => {
+                    self.images.lock().insert(hash, ImgState::Bad);
+                    return;
+                }
+                S::Failed => {}
+            }
         }
         match self.att_info(&hash).filter(|i| !i.refs.is_empty()) {
             Some(info) if info.declared_size().is_some_and(|s| s <= MAX_IMAGE_BYTES) => self.start_download(hash, &info, BlobKind::Image).await,

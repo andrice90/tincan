@@ -1187,3 +1187,42 @@ async fn avatars_and_icons_travel_and_follow_access() {
         n.app.shutdown().await;
     }
 }
+
+/// The DM avatar of a contact who shares no server: announced over the DM connection
+/// (`DmAvatar`), fetched from the contact, removed when they remove it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dm_only_contact_shows_their_avatar() {
+    let _g = serial().await;
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let x = node(dirs[0].path(), "Xena").await;
+    let b = node(dirs[1].path(), "Bob").await;
+    let avatar = png_bytes(128, 128, 3000, 9);
+    let hash = url_hash(&call(&x.app, "set_avatar", json!({ "bytes": avatar })).await["avatar"]);
+
+    x.app.test_add_addr(&b.user, &b.app.test_addrs()).unwrap();
+    b.app.test_add_addr(&x.user, &x.app.test_addrs()).unwrap();
+    let b_code = call(&b.app, "app_snapshot", json!({})).await["me"]["userCode"].as_str().unwrap().to_string();
+    let xb = call(&x.app, "add_contact", json!({ "code": b_code })).await["convId"].as_str().unwrap().to_string();
+    call(&x.app, "send_message", json!({ "convId": xb, "channelId": null, "text": "hi", "attachments": [] })).await;
+    let dm_avatar = |app: Arc<App>, conv: String| async move {
+        let s = call(&app, "app_snapshot", json!({})).await;
+        s["dms"].as_array().unwrap().iter().find(|d| d["convId"] == conv.as_str()).map(|d| d["avatar"].clone())
+    };
+    let shown = eventually("Bob's DM shows Xena's avatar", 30, || {
+        let f = dm_avatar(b.app.clone(), xb.clone());
+        async move { f.await.filter(|v| v.is_string()) }
+    })
+    .await;
+    assert_eq!(url_hash(&shown), hash);
+    assert_eq!(b.app.file_for_url(&hash).await.expect("Bob holds it").0, avatar);
+
+    call(&x.app, "set_avatar", json!({ "bytes": null })).await;
+    eventually("Bob's DM drops the avatar", 20, || {
+        let f = dm_avatar(b.app.clone(), xb.clone());
+        async move { f.await.filter(|v| v.is_null()).map(|_| ()) }
+    })
+    .await;
+    for n in [x, b] {
+        n.app.shutdown().await;
+    }
+}

@@ -67,8 +67,8 @@ test("crop: zooming keeps the focus point and stays covered", () => {
 });
 
 test("crop: arrow keys nudge, Shift moves further", () => {
-  eq(nudge("ArrowLeft", false), { x: 4, y: 0 });
-  eq(nudge("ArrowDown", true), { x: 0, y: -16 });
+  eq(nudge("ArrowLeft", false), { x: -4, y: 0 }, "the image moves the way the arrow points");
+  eq(nudge("ArrowDown", true), { x: 0, y: 16 });
   eq(nudge("Enter", false), null);
 });
 
