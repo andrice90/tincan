@@ -149,15 +149,18 @@ fn clip_name(raw: &str, fallback: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-/// A clip name from a peer: cleaned up and cut to the limit instead of refused.
+/// A clip name from a peer: control and hidden format characters removed, cut to the
+/// limit instead of refused.
 fn remote_name(raw: &str) -> String {
-    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
-    let name: String = cleaned.trim().chars().take(MAX_CLIP_NAME_CHARS).collect();
+    let cleaned = crate::shell::clean_text(raw);
+    let name: String = cleaned.chars().take(MAX_CLIP_NAME_CHARS).collect();
     if name.trim().is_empty() { "Sound".to_string() } else { name.trim().to_string() }
 }
 
+/// A library clip. Pulled clips were saved under a cleaned name; cleaning again covers
+/// rows saved before names were cleaned of hidden format characters.
 fn owned_dto(r: &ClipRecord) -> dto::Clip {
-    dto::Clip { hash: r.hash.to_hex(), name: r.name.clone(), duration_ms: r.duration_ms, size: r.size, owned: true, heard_from: None, transfer: None }
+    dto::Clip { hash: r.hash.to_hex(), name: remote_name(&r.name), duration_ms: r.duration_ms, size: r.size, owned: true, heard_from: None, transfer: None }
 }
 
 fn clip_info(r: &ClipRecord) -> ClipInfo { ClipInfo { hash: r.hash, name: r.name.clone(), size: r.size, duration_ms: r.duration_ms } }
@@ -217,18 +220,20 @@ impl Media {
         self.emit_clips_locked(core, &st);
     }
 
-    /// Tell every host which clips I hold (they count as held blobs in holder lookups).
-    pub(super) fn announce_clips(&self, core: &Core) {
-        let clips: Vec<ClipInfo> = self.library(core).iter().filter(|r| core.files.is_complete(&r.hash)).map(clip_info).collect();
+    /// Tell the hosts which clips I hold (they count as held blobs in holder lookups):
+    /// only clips shared with a server I am in, that is, played or pulled in one of its
+    /// voice rooms (see `Core::announce`).
+    pub(crate) fn announce_clips(&self, core: &Core) {
+        let lib = self.library(core);
+        let clips: Vec<ClipInfo> = {
+            let access = core.access.read();
+            lib.iter().filter(|r| core.files.is_complete(&r.hash) && access.announces(&r.hash)).map(clip_info).collect()
+        };
         core.net.set_clips(clips);
     }
 
-    /// A clip blob was dropped: re-announce the held set too (a clip that was complete at
-    /// start is also in it, from `Core::start`'s `set_have`).
-    fn reannounce_after_drop(&self, core: &Core) {
-        core.net.set_have(core.files.complete_hashes());
-        self.announce_clips(core);
-    }
+    /// A clip blob was dropped: re-announce the held set and the library.
+    fn reannounce_after_drop(&self, core: &Core) { core.announce(); }
 
     /// `clip_add`: decode-check, import, save, announce.
     pub(super) async fn clip_add(&self, core: &Arc<Core>, raw_path: &str, raw_name: &str) -> Result<dto::Clip, String> {
@@ -342,7 +347,9 @@ impl Media {
         Ok(pcm)
     }
 
-    /// `clip_play`: into the call (and locally), then announce it to the session.
+    /// `clip_play`: into the call (and locally), then announce it to the session. Playing
+    /// shares the clip with the session's conversation (the server of the room, or the DM
+    /// of the call) before anyone hears of it, so listeners may pull it from me.
     pub(super) async fn clip_play(&self, core: &Arc<Core>, hash: BlobHash) -> Result<(), String> {
         self.check_can_play()?;
         let rec = self.owned(core, &hash).ok_or_else(|| "Save that sound before playing it.".to_string())?;
@@ -357,6 +364,10 @@ impl Media {
                 "Audio isn't working right now. Try again in a moment.".to_string()
             }
         })?;
+        let conv = self.st.lock().attached.as_ref().map(|a| a.conv);
+        if let Some(conv) = conv {
+            core.share_blob(hash, conv);
+        }
         core.net.sound_played(clip_info(&rec)).await.map_err(net_err)
     }
 
@@ -419,7 +430,11 @@ impl Media {
         } else {
             let addr = self.addr_of(core, &heard);
             let mut providers: Vec<(UserId, AddrHint)> = vec![(heard.by, addr)];
-            for (u, a) in core.net.who_has(&heard.conv, hash).await {
+            let holders = core.net.who_has(&heard.conv, hash).await;
+            // The session's conversation named the player and these holders: a pull they
+            // complete shares the clip with it (`Core::on_completed`).
+            core.nominate(hash, heard.conv, std::iter::once(heard.by).chain(holders.iter().map(|(u, _)| *u)));
+            for (u, a) in holders {
                 if u != core.me && !providers.iter().any(|(x, _)| *x == u) {
                     providers.push((u, a));
                 }
@@ -447,7 +462,9 @@ impl Media {
         if !st.fetching.contains_key(&info.hash) && st.heard.get(&info.hash).is_none() {
             return;
         }
-        if info.total.is_some_and(|t| t > MAX_CLIP_BYTES) {
+        // tincan-files already stops a clip download past 5 MB (`TooLarge`); this tells
+        // the user and forgets the pull.
+        if info.state == tincan_files::TransferState::TooLarge || info.total.is_some_and(|t| t > MAX_CLIP_BYTES) {
             tracing::warn!(hash = %info.hash.short(), total = ?info.total, "a pulled clip is too large; cancelling");
             core.files.cancel(info.hash);
             let core2 = core.clone();
@@ -516,7 +533,7 @@ impl Media {
                     tracing::debug!(error = %e, "dropping a bad clip failed");
                 }
                 self.st.lock().heard.remove(&hash);
-                core.net.set_have(core.files.complete_hashes());
+                core.announce();
                 core.toast(ToastKind::Error, format!("{} couldn't be played, so it wasn't saved.", fetch.name));
             }
         }
@@ -539,6 +556,8 @@ mod tests {
         assert_eq!(remote_name(" \u{1b}[31mred "), "[31mred");
         assert_eq!(remote_name(&"b".repeat(80)).chars().count(), MAX_CLIP_NAME_CHARS);
         assert_eq!(remote_name("\n\t"), "Sound");
+        assert_eq!(remote_name("Air\u{202E}horn\u{200B}"), "Airhorn", "hidden format characters are dropped");
+        assert_eq!(remote_name("\u{2066}\u{FEFF}"), "Sound");
     }
 
     #[test]

@@ -15,38 +15,30 @@ use tincan_net::{Net, NetConfig, NetError, RelayChoice};
 use tincan_store::SqliteStorage;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::dto::{self, ToastKind};
 use crate::emit::Emitter;
+use crate::index::{self, Access, Bounded, CACHED_HASHES, HashInfo, Members, Policy};
 use crate::media::Media;
 use crate::profile::{self, BLOBS_DIR, DB_FILE, ProfileLock};
 use crate::pump::{self, PumpCmd};
 use crate::settings;
-use crate::transfers::{self, FetchReq};
+use crate::shell;
+use crate::transfers::{self, AutoQueue, FetchReq};
 use crate::views::{ConvView, Refresh, SentKey};
 use crate::{AppConfig, emit::Ev};
 
-/// The attachment index is cleared when it grows past this (it refills from messages).
-pub(crate) const MAX_INDEXED_ATTACHMENTS: usize = 50_000;
-/// Queue of background fetch and holder lookups.
+/// Queue of holder lookups, parked-download retries and resumes (served before auto-fetch).
 pub(crate) const FETCH_QUEUE: usize = 1024;
+/// Auto-fetch candidates waiting (newest first; the oldest are dropped past this).
+pub(crate) const AUTO_QUEUE: usize = 1024;
+/// Hashes whose `who_has` answer and download nominations are kept.
+pub(crate) const HOLDER_HASHES: usize = 10_000;
 /// Bound on `App::shutdown`'s network part (the handoff takes up to about 3 s).
 const NET_SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
-
-/// Where an attachment can be fetched from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AttRef {
-    /// The conversation it was posted in (who_has goes there).
-    pub conv: ConvId,
-    /// Who posted it.
-    pub author: UserId,
-    /// File name.
-    pub name: String,
-    /// Size in bytes.
-    pub size: u64,
-    /// Declared MIME type.
-    pub mime: String,
-}
+/// Longest host-supplied refusal text shown to the user.
+const MAX_HOST_TEXT_CHARS: usize = 200;
 
 /// Shared state of one running profile.
 pub(crate) struct Core {
@@ -68,12 +60,20 @@ pub(crate) struct Core {
     pub name: RwLock<Option<String>>,
     /// Cached conversation views.
     pub views: Mutex<HashMap<ConvId, Arc<ConvView>>>,
-    /// Who may fetch blobs from me (members of shared servers and DM contacts).
-    pub allowed: Arc<RwLock<HashSet<UserId>>>,
-    /// Attachment hash index (from messages seen).
-    pub atts: Mutex<HashMap<BlobHash, AttRef>>,
-    /// Holders from the last `who_has` per hash.
-    pub holders: Mutex<HashMap<BlobHash, Vec<UserId>>>,
+    /// Who may fetch which blobs from me (read by the blobs provider).
+    pub access: Arc<RwLock<Access>>,
+    /// The hash index (references and shares), a bounded cache over kv `app/att/<hash>`.
+    pub atts: Mutex<Bounded<BlobHash, HashInfo>>,
+    /// Holders from the last `who_has` round per hash.
+    pub holders: Mutex<Bounded<BlobHash, Vec<UserId>>>,
+    /// For downloads in flight: which conversation pointed me to which provider (an
+    /// author of a reference there, or a holder its host listed). The conversations that
+    /// named the peer who delivered the bytes get the blob shared with them.
+    pub nominations: Mutex<Bounded<BlobHash, Vec<(UserId, ConvId)>>>,
+    /// When each parked download was last re-queried.
+    pub requeried: Mutex<HashMap<BlobHash, Instant>>,
+    /// Auto-fetch candidates.
+    pub auto: AutoQueue,
     /// Last state seen per download (persisted on change).
     pub transfer_states: Mutex<HashMap<BlobHash, tincan_files::TransferState>>,
     /// Last DTO payload sent per key.
@@ -98,6 +98,8 @@ pub(crate) struct Core {
     lock: Mutex<Option<ProfileLock>>,
     /// Set once shutdown started.
     closed: AtomicBool,
+    /// Test hook: the pump drops file events while set (simulates a lagged receiver).
+    pub test_files_paused: AtomicBool,
     /// Shutdown runs once; later callers wait for it.
     shutdown_once: tokio::sync::OnceCell<()>,
 }
@@ -153,9 +155,9 @@ impl Core {
             Err(e) => return Err(start_err(e)),
         };
 
-        let allowed: Arc<RwLock<HashSet<UserId>>> = Arc::new(RwLock::new(HashSet::new()));
-        let check = allowed.clone();
-        let policy: Arc<dyn AccessPolicy> = Arc::new(move |u: &UserId| check.read().contains(u));
+        // Nobody may connect until `warm_up` fills in the conversations (fails closed).
+        let access: Arc<RwLock<Access>> = Arc::new(RwLock::new(Access::default()));
+        let policy: Arc<dyn AccessPolicy> = Arc::new(Policy(access.clone()));
         let files = match Files::load(&cfg.data_dir.join(BLOBS_DIR), endpoint.clone(), policy).await {
             Ok(f) => f,
             Err(e) => {
@@ -164,6 +166,7 @@ impl Core {
                 return Err("Couldn't open the Tincan file store. It may be damaged or in use.".to_string());
             }
         };
+        load_shares(storage.as_ref(), &files, &access);
         let proto = files.protocol();
         let dyn_storage: Arc<dyn Storage> = storage.clone();
         let net = match Net::start(endpoint, dyn_storage, identity.clone(), net_cfg, |b| b.accept(tincan_files::ALPN, proto)).await {
@@ -175,7 +178,7 @@ impl Core {
         };
         let net_rx = net.subscribe();
         let file_rx = files.subscribe();
-        net.set_have(files.complete_hashes());
+        // The Have list is set by `warm_up` (`update_policy` -> `announce`).
 
         let (pump_tx, pump_rx) = mpsc::channel(64);
         let (fetch_tx, fetch_rx) = mpsc::channel(FETCH_QUEUE);
@@ -191,9 +194,12 @@ impl Core {
             settings: RwLock::new(settings),
             name: RwLock::new(name),
             views: Mutex::new(HashMap::new()),
-            allowed,
-            atts: Mutex::new(HashMap::new()),
-            holders: Mutex::new(HashMap::new()),
+            access,
+            atts: Mutex::new(Bounded::new(CACHED_HASHES)),
+            holders: Mutex::new(Bounded::new(HOLDER_HASHES)),
+            nominations: Mutex::new(Bounded::new(HOLDER_HASHES)),
+            requeried: Mutex::new(HashMap::new()),
+            auto: AutoQueue::new(AUTO_QUEUE),
             transfer_states: Mutex::new(HashMap::new()),
             sent: Mutex::new(HashMap::new()),
             dm_acked: Mutex::new(HashMap::new()),
@@ -205,6 +211,7 @@ impl Core {
             tasks: Mutex::new(Vec::new()),
             lock: Mutex::new(Some(lock)),
             closed: AtomicBool::new(false),
+            test_files_paused: AtomicBool::new(false),
             shutdown_once: tokio::sync::OnceCell::new(),
         });
         core.warm_up();
@@ -265,20 +272,34 @@ impl Core {
             .await;
     }
 
-    /// Recompute who may fetch blobs from me.
+    /// Recompute who is in which conversation (the access check), then, if the set of
+    /// conversations changed, what to announce.
     pub(crate) fn update_policy(&self) {
-        let mut set = HashSet::new();
+        let mut convs = HashMap::new();
         for conv in self.net.convs() {
             if let Some(v) = self.view(&conv) {
-                if v.is_dm {
-                    set.extend(v.peer);
-                } else {
-                    set.extend(v.members.iter().copied());
-                }
+                let users: HashSet<UserId> = if v.is_dm { v.peer.into_iter().collect() } else { v.members.iter().copied().collect() };
+                convs.insert(conv, Members { dm: v.is_dm, users });
             }
         }
-        set.remove(&self.me);
-        *self.allowed.write() = set;
+        // What is announced depends on which conversations I am in, not on their members.
+        if self.access.write().set_convs(convs, &self.me) {
+            self.announce();
+        }
+    }
+
+    /// Set my `Have` list and clip library announcement to the blobs I hold that are
+    /// shared with a server I am in. tincan-net sends one list to every host and DM peer,
+    /// so a blob shared only in DMs (DM `who_has` always names the contact) or with no
+    /// conversation at all is left out.
+    pub(crate) fn announce(&self) {
+        let held = self.files.complete_hashes();
+        let have: Vec<BlobHash> = {
+            let a = self.access.read();
+            held.into_iter().filter(|h| a.announces(h)).collect()
+        };
+        self.net.set_have(have);
+        self.media.announce_clips(self);
     }
 
     /// Ask the pump to treat `conv` as bulk (history sync) until it goes quiet.
@@ -328,13 +349,19 @@ impl Core {
         self.resume_downloads();
     }
 
-    /// Queue the partial downloads found at start (once, on the first connection).
+    /// Queue the partial downloads found at start (on the first connection). Entries the
+    /// queue has no room for wait for the next connection instead of being dropped.
     pub(crate) fn resume_downloads(&self) {
-        let list = self.resume.lock().take();
-        if let Some(list) = list {
-            for (hash, kind) in list {
-                let _ = self.fetch_tx.try_send(FetchReq::Resume { hash, kind });
+        let Some(list) = self.resume.lock().take() else { return };
+        let mut left = Vec::new();
+        for (hash, kind) in list {
+            if let Err(mpsc::error::TrySendError::Full(FetchReq::Resume { hash, kind })) = self.fetch_tx.try_send(FetchReq::Resume { hash, kind }) {
+                left.push((hash, kind));
             }
+        }
+        if !left.is_empty() {
+            tracing::debug!(left = left.len(), "fetch queue full; the rest resume on the next connection");
+            self.resume.lock().get_or_insert_with(Vec::new).extend(left);
         }
     }
 
@@ -393,6 +420,21 @@ fn start_err(e: NetError) -> String {
     "Couldn't start networking. Check your connection and restart Tincan.".to_string()
 }
 
+/// Refusals shown as they are: the sentences tincan-net writes itself, and the join
+/// refusals an honest host sends (tincan-core's invite and clock checks, capitalized by
+/// tincan-net). Only exact matches; a host that sends one of these says nothing new.
+const LOCAL_REFUSALS: &[&str] = &[
+    "This invite has expired.",
+    "That server runs an incompatible Tincan version.",
+    "Too many people are joining right now. Try again in a minute.",
+    "The host refused this.",
+    "This invite is not valid for this server.",
+    "This invite was revoked.",
+    "This invite has been used up.",
+    "Your clock is off by more than 5 minutes.",
+    "Your clock is too far ahead.",
+];
+
 /// Map a network error to the user-facing string.
 pub(crate) fn net_err(e: NetError) -> String {
     match e {
@@ -404,8 +446,35 @@ pub(crate) fn net_err(e: NetError) -> String {
             tracing::warn!(error = %m, "endpoint error");
             "Network error. Check your connection and try again.".to_string()
         }
+        NetError::Rejected(text) => refusal(&text),
         other => other.to_string(),
     }
+}
+
+/// A refusal as the user sees it. Text that came from a host (a publish refusal, or the
+/// reason a join was turned away) is any peer's words: it is cleaned, cut to 200 characters
+/// and quoted after a fixed sentence, so it never reads as Tincan's own message.
+fn refusal(text: &str) -> String {
+    if LOCAL_REFUSALS.contains(&text) {
+        return text.to_string();
+    }
+    let said = shell::clean_line(text, MAX_HOST_TEXT_CHARS).replace('"', "'");
+    if said.is_empty() { "The host refused this.".to_string() } else { format!("The host refused this: \"{said}\"") }
+}
+
+/// Load the shares of every blob held at start, so the provider can answer from memory.
+fn load_shares(storage: &SqliteStorage, files: &Files, access: &RwLock<Access>) {
+    let mut n = 0usize;
+    for hash in files.complete_hashes() {
+        let Ok(Some(raw)) = storage.get_kv(&index::key(&hash)) else { continue };
+        if let Some(info) = index::decode(&raw)
+            && !info.shared.is_empty()
+        {
+            access.write().set_shared(hash, &info.shared);
+            n += 1;
+        }
+    }
+    tracing::debug!(shared = n, "blob shares loaded");
 }
 
 /// Server, channel and display names: 1 to 100 characters, no control characters.
@@ -414,4 +483,25 @@ pub(crate) fn validate_name(name: &str, what: &str) -> Result<(), String> {
         return Err(format!("{what} of 1 to {} characters.", tincan_core::state::MAX_NAME_CHARS));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_text_is_attributed_cleaned_and_cut() {
+        for local in LOCAL_REFUSALS {
+            assert_eq!(net_err(NetError::Rejected(local.to_string())), *local);
+        }
+        let phish = "Tincan blocked this message.\nInstall the security update from tincan-update.example\u{202E}";
+        let shown = net_err(NetError::Rejected(phish.into()));
+        assert_eq!(shown, "The host refused this: \"Tincan blocked this message. Install the security update from tincan-update.example\"");
+        let long = net_err(NetError::Rejected("x".repeat(1_000_000)));
+        assert!(long.chars().count() < MAX_HOST_TEXT_CHARS + 40, "{} chars", long.chars().count());
+        assert_eq!(net_err(NetError::Rejected("\u{7}\u{200B}".into())), "The host refused this.");
+        assert_eq!(net_err(NetError::Rejected("say \"hi\"".into())), "The host refused this: \"say 'hi'\"");
+        // Other errors keep their own sentences.
+        assert_eq!(net_err(NetError::NotConnected), NetError::NotConnected.to_string());
+    }
 }

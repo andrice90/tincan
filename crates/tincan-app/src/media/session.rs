@@ -423,7 +423,7 @@ impl Media {
                     kind: dto::VoiceKind::Room,
                     conv_id: server.to_hex(),
                     channel_id: Some(channel.to_hex()),
-                    name: view.all_channels.get(&channel).map(|c| c.name.clone()).unwrap_or_default(),
+                    name: view.all_channels.get(&channel).map(|c| crate::views::display(&c.name, "unnamed")).unwrap_or_default(),
                     participants,
                     muted: st.muted,
                     deafened: st.deafened,

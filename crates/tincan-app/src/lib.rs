@@ -31,6 +31,7 @@ mod app;
 mod dispatch;
 pub mod dto;
 mod emit;
+mod index;
 mod media;
 mod profile;
 mod pump;
@@ -180,4 +181,30 @@ impl App {
     /// Test hook: media counters, `{ audioIn, videoOut, engineRestarts, engineRunning }`.
     #[doc(hidden)]
     pub fn test_media_counters(&self) -> serde_json::Value { self.core.media.test_counters() }
+
+    /// Test hook: `true` makes the event pump drop every file event, as if its receiver had
+    /// lagged; `false` resumes it and runs the lag recovery (`RecvError::Lagged`).
+    #[doc(hidden)]
+    pub fn test_pause_file_events(&self, paused: bool) {
+        self.core.test_files_paused.store(paused, std::sync::atomic::Ordering::Relaxed);
+        if !paused {
+            self.core.on_files_lagged();
+        }
+    }
+
+    /// Test hook: fetch the blob `hash_hex` straight from `user_id` at `addrs` over the
+    /// blobs protocol, the way a modified client could (no message, no index, no holder
+    /// lookup). True if the whole blob arrived within `secs`.
+    #[doc(hidden)]
+    pub async fn test_fetch_from(&self, hash_hex: &str, user_id: &str, addrs: &[SocketAddr], secs: u64) -> bool {
+        self.core.test_fetch_from(hash_hex, user_id, addrs, secs).await
+    }
+
+    /// Test hook: publish a message in `conv_id` (with `channel_id` for servers) whose one
+    /// attachment claims `hash_hex`, `name` and `size`, without holding the bytes, the way
+    /// a modified client could.
+    #[doc(hidden)]
+    pub async fn test_post_attachment_ref(&self, conv_id: &str, channel_id: Option<&str>, hash_hex: &str, name: &str, size: u64) -> Result<(), String> {
+        self.core.test_post_attachment_ref(conv_id, channel_id, hash_hex, name, size).await
+    }
 }

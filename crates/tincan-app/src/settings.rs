@@ -7,8 +7,9 @@ use tincan_store::SqliteStorage;
 
 use crate::dto::{Settings, Theme};
 
-/// Attachments larger than this cannot be sent (architecture.md).
-pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+/// Attachments larger than this cannot be sent or downloaded (architecture.md; tincan-files
+/// enforces the same cap on downloads).
+pub(crate) const MAX_ATTACHMENT_BYTES: u64 = tincan_files::MAX_ATTACHMENT_BYTES;
 
 impl Default for Settings {
     fn default() -> Self {
