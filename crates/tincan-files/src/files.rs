@@ -80,6 +80,7 @@ impl fmt::Debug for Files {
 pub(crate) struct Kinds {
     attachment: bool,
     clip: bool,
+    image: bool,
 }
 
 impl Kinds {
@@ -92,24 +93,25 @@ impl Kinds {
         match kind {
             BlobKind::Attachment => self.attachment,
             BlobKind::Clip => self.clip,
+            BlobKind::Image => self.image,
+        }
+    }
+    fn slot(&mut self, kind: BlobKind) -> &mut bool {
+        match kind {
+            BlobKind::Attachment => &mut self.attachment,
+            BlobKind::Clip => &mut self.clip,
+            BlobKind::Image => &mut self.image,
         }
     }
     /// Adds `kind`; true if it was not there yet.
     pub(crate) fn insert(&mut self, kind: BlobKind) -> bool {
-        let slot = match kind {
-            BlobKind::Attachment => &mut self.attachment,
-            BlobKind::Clip => &mut self.clip,
-        };
-        !std::mem::replace(slot, true)
+        !std::mem::replace(self.slot(kind), true)
     }
     pub(crate) fn remove(&mut self, kind: BlobKind) {
-        match kind {
-            BlobKind::Attachment => self.attachment = false,
-            BlobKind::Clip => self.clip = false,
-        }
+        *self.slot(kind) = false;
     }
     pub(crate) fn is_empty(&self) -> bool {
-        !self.attachment && !self.clip
+        !self.attachment && !self.clip && !self.image
     }
     pub(crate) fn iter(self) -> impl Iterator<Item = BlobKind> {
         BlobKind::ALL.into_iter().filter(move |k| self.has(*k))
@@ -410,6 +412,12 @@ impl Files {
     /// True if `hash` is held completely (any kind).
     pub fn is_complete(&self, hash: &BlobHash) -> bool {
         self.inner.state.lock().held.contains_key(hash)
+    }
+
+    /// The size of `hash` when it is held completely (verified bytes). In memory, so the
+    /// app can check an image's real size without IO.
+    pub fn held_size(&self, hash: &BlobHash) -> Option<u64> {
+        self.inner.state.lock().held.get(hash).map(|h| h.size)
     }
 
     /// The provider that delivered the last bytes of `hash`, if it was downloaded since load

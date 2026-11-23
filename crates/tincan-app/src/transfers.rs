@@ -55,6 +55,11 @@ pub(crate) enum FetchReq {
         /// The blob.
         hash: BlobHash,
     },
+    /// An avatar or icon: download it, or check it once held (`images.rs`).
+    Image {
+        /// The blob.
+        hash: BlobHash,
+    },
     /// A partial download from before the restart.
     Resume {
         /// The blob.
@@ -161,8 +166,8 @@ pub(crate) enum ResumeTargets {
 pub(crate) fn resume_targets(kind: BlobKind, has_refs: bool, pull_conv: Option<ConvId>) -> ResumeTargets {
     match kind {
         BlobKind::Clip => pull_conv.map_or(ResumeTargets::Nothing, ResumeTargets::Conv),
-        BlobKind::Attachment if has_refs => ResumeTargets::RefConvs,
-        BlobKind::Attachment => ResumeTargets::Nothing,
+        BlobKind::Attachment | BlobKind::Image if has_refs => ResumeTargets::RefConvs,
+        BlobKind::Attachment | BlobKind::Image => ResumeTargets::Nothing,
     }
 }
 
@@ -201,6 +206,7 @@ pub(crate) async fn fetch_worker(core: Arc<Core>, mut rx: mpsc::Receiver<FetchRe
                     core.start_download(hash, &info, BlobKind::Attachment).await;
                 }
             }
+            FetchReq::Image { hash } => core.fetch_image(hash).await,
             FetchReq::Peers { hash } => {
                 if let Some(info) = core.att_info(&hash).filter(|i| !i.refs.is_empty()) {
                     core.lookup_holders(hash, &info).await;
@@ -628,6 +634,13 @@ impl Core {
                 st.insert(info.hash, info.state) != Some(info.state)
             }
         };
+        if info.kind == BlobKind::Image {
+            // Avatars and icons are not files the UI tracks: no `transfer-updated`.
+            if changed {
+                self.on_image_transfer(info);
+            }
+            return;
+        }
         let att = self.att_info(&info.hash);
         if changed && info.kind == BlobKind::Attachment {
             if info.state == FilesState::TooLarge {
@@ -923,7 +936,9 @@ mod tests {
         assert_eq!(resume_targets(BlobKind::Clip, false, None), ResumeTargets::Nothing, "an old pull record");
         assert_eq!(resume_targets(BlobKind::Clip, true, None), ResumeTargets::Nothing);
         assert_eq!(resume_targets(BlobKind::Attachment, true, None), ResumeTargets::RefConvs);
-        assert_eq!(resume_targets(BlobKind::Attachment, false, Some(s1)), ResumeTargets::Nothing, "a lost index entry");
+        assert_eq!(resume_targets(BlobKind::Image, true, None), ResumeTargets::RefConvs, "an image resumes from its references");
+        assert_eq!(resume_targets(BlobKind::Image, false, None), ResumeTargets::Nothing);
+        assert_eq!(resume_targets(BlobKind::Attachment, false, Some(s1)),ResumeTargets::Nothing, "a lost index entry");
     }
 
     #[test]

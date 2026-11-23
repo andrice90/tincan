@@ -77,6 +77,8 @@ use tincan_core::{BlobHash, UserId};
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// Largest soundboard clip a download accepts: 5 MiB.
 pub const MAX_CLIP_BYTES: u64 = 5 * 1024 * 1024;
+/// Largest avatar or server icon a download accepts: 64 KiB (`tincan_core::image`).
+pub const MAX_IMAGE_BYTES: u64 = tincan_core::image::MAX_IMAGE_BYTES;
 
 /// Decides which remote peers may fetch which blobs from this node.
 ///
@@ -114,17 +116,20 @@ pub enum BlobKind {
     Attachment,
     /// A soundboard clip (tag `clip-<hex>`).
     Clip,
+    /// An avatar or server icon (tag `img-<hex>`).
+    Image,
 }
 
 impl BlobKind {
-    /// Both kinds, in a fixed order.
-    pub const ALL: [BlobKind; 2] = [BlobKind::Attachment, BlobKind::Clip];
+    /// Every kind, in a fixed order.
+    pub const ALL: [BlobKind; 3] = [BlobKind::Attachment, BlobKind::Clip, BlobKind::Image];
 
     /// Tag name prefix for this kind, including the trailing dash.
     pub fn tag_prefix(self) -> &'static str {
         match self {
             BlobKind::Attachment => "att-",
             BlobKind::Clip => "clip-",
+            BlobKind::Image => "img-",
         }
     }
 
@@ -133,12 +138,13 @@ impl BlobKind {
         format!("{}{}", self.tag_prefix(), hash.to_hex())
     }
 
-    /// The largest blob a download of this kind accepts ([`MAX_ATTACHMENT_BYTES`] or
-    /// [`MAX_CLIP_BYTES`]).
+    /// The largest blob a download of this kind accepts ([`MAX_ATTACHMENT_BYTES`],
+    /// [`MAX_CLIP_BYTES`] or [`MAX_IMAGE_BYTES`]).
     pub fn max_size(self) -> u64 {
         match self {
             BlobKind::Attachment => MAX_ATTACHMENT_BYTES,
             BlobKind::Clip => MAX_CLIP_BYTES,
+            BlobKind::Image => MAX_IMAGE_BYTES,
         }
     }
 }

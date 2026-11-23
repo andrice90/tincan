@@ -18,7 +18,7 @@ use tokio::time::Instant;
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const VOICE_KEYS: &[&str] = &["kind", "convId", "channelId", "name", "participants", "muted", "deafened", "sharing", "path", "rttMs"];
-const PARTICIPANT_KEYS: &[&str] = &["userId", "name", "muted", "deafened", "speaking", "screenTrack", "volume"];
+const PARTICIPANT_KEYS: &[&str] = &["userId", "name", "muted", "deafened", "speaking", "avatar", "screenTrack", "volume"];
 const CLIP_KEYS: &[&str] = &["hash", "name", "durationMs", "size", "owned", "heardFrom", "transfer"];
 const CALL_KEYS: &[&str] = &["callId", "userId", "name", "state"];
 

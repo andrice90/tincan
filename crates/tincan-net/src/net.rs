@@ -204,6 +204,21 @@ impl Net {
         }
     }
 
+    /// My avatar as announced to DM contacts (`Ctl::DmAvatar`, sent on every DM connection
+    /// when it opens and again on every open one when it changes). Servers learn it from the
+    /// `ProfileImage` event the app publishes.
+    pub fn set_avatar(&self, image: Option<tincan_core::event::ImageRef>) {
+        let changed = {
+            let mut cfg = self.inner.cfg.write();
+            let changed = cfg.avatar != image;
+            cfg.avatar = image;
+            changed
+        };
+        if changed {
+            self.inner.dm.broadcast_avatar(&self.inner);
+        }
+    }
+
     /// Change the "allow hosting" setting (takes effect on the next election).
     pub fn set_allow_hosting(&self, allow: bool) {
         self.inner.cfg.write().allow_hosting = allow;
@@ -546,6 +561,14 @@ impl Net {
     pub fn dm_peer_name(&self, conv: &ConvId) -> Option<String> {
         let peer = dm::peer_of(&self.inner, conv)?;
         self.inner.dm.peer_name(&self.inner, conv, &peer)
+    }
+
+    /// DMs: the avatar the contact announced over the DM connection (`DmAvatar`), kept
+    /// across restarts. None until they announced one, after they cleared it, and for
+    /// servers. Changes arrive as `NetEvent::DmAvatarChanged`.
+    pub fn dm_peer_avatar(&self, conv: &ConvId) -> Option<tincan_core::event::ImageRef> {
+        let peer = dm::peer_of(&self.inner, conv)?;
+        self.inner.dm.peer_avatar(&self.inner, conv, &peer)
     }
 
     /// Keep the DM connection to `peer` up while the guard lives, so `peer_online` and calls

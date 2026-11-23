@@ -413,6 +413,7 @@ impl Media {
             muted: st.muted,
             deafened: st.deafened,
             speaking: st.speaking.contains(&core.me),
+            avatar: core.my_avatar_url(),
             screen_track: my_share,
             volume: 1.0,
         };
@@ -431,6 +432,7 @@ impl Media {
                             muted: e.muted,
                             deafened: e.deafened,
                             speaking: st.speaking.contains(&e.user),
+                            avatar: core.member_avatar_url(&view, &e.user),
                             screen_track: e.sharing,
                             volume: volume_of(st, &e.user),
                         });
@@ -463,6 +465,7 @@ impl Media {
                     muted: call.as_ref().is_some_and(|c| c.peer_muted),
                     deafened: call.as_ref().is_some_and(|c| c.peer_deafened),
                     speaking: st.speaking.contains(&peer),
+                    avatar: core.dm_avatar_url(&peer),
                     screen_track: call.as_ref().and_then(|c| c.peer_sharing),
                     volume: volume_of(st, &peer),
                 });

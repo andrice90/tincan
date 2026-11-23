@@ -246,6 +246,9 @@ pub(crate) struct Access {
     convs: HashMap<ConvId, Members>,
     /// For each blob shared anywhere: the conversations it is shared with.
     blobs: HashMap<BlobHash, Vec<ConvId>>,
+    /// My current avatar: published to every server and DM contact, so any peer allowed to
+    /// connect may fetch it (a share per conversation would hit `MAX_SHARED`).
+    own_avatar: Option<BlobHash>,
 }
 
 impl Access {
@@ -274,12 +277,20 @@ impl Access {
         }
     }
 
+    /// My current avatar (None: I have none). Replaces the previous one, which is then served
+    /// only by its shares like any other blob.
+    pub fn set_own_avatar(&mut self, hash: Option<BlobHash>) { self.own_avatar = hash; }
+
     /// May `peer` open a blobs connection?
     pub fn allow_peer(&self, peer: &UserId) -> bool { self.peers.contains(peer) }
 
     /// May `peer` fetch `hash`? Only if the hash is shared with a conversation the peer is
     /// in right now: a current member of that server, or the peer of that DM.
+    /// My current avatar goes to any peer in any of my conversations.
     pub fn allow_blob(&self, peer: &UserId, hash: &BlobHash) -> bool {
+        if self.own_avatar.as_ref() == Some(hash) {
+            return self.allow_peer(peer);
+        }
         self.blobs
             .get(hash)
             .is_some_and(|convs| convs.iter().any(|c| self.convs.get(c).is_some_and(|m| m.users.contains(peer))))
@@ -461,5 +472,27 @@ mod tests {
         assert!(!a.allow_blob(&carol, &server_file));
         assert!(!a.announces(&server_file));
         assert!(!a.allow_peer(&carol));
+    }
+
+    /// My current avatar is served to anyone in my conversations, and only while it is
+    /// current; any other image follows the share rule (a reference grants nothing).
+    #[test]
+    fn my_avatar_goes_to_my_peers_only() {
+        let me = user(0);
+        let (alice, bob, stranger) = (user(1), user(2), user(3));
+        let mut a = Access::default();
+        let mut convs = HashMap::new();
+        convs.insert(conv(1), Members { dm: false, users: HashSet::from([me, alice]) });
+        convs.insert(conv(2), Members { dm: true, users: HashSet::from([bob]) });
+        a.set_convs(convs, &me);
+        let (mine, old) = (BlobHash([20; 32]), BlobHash([21; 32]));
+        a.set_own_avatar(Some(old));
+        a.set_own_avatar(Some(mine));
+        assert!(a.allow_blob(&alice, &mine) && a.allow_blob(&bob, &mine));
+        assert!(!a.allow_blob(&stranger, &mine), "nobody outside my conversations");
+        assert!(!a.allow_blob(&alice, &old), "a replaced avatar is no longer open");
+        assert!(!a.announces(&mine), "not announced: peers fetch it from me as its author");
+        a.set_own_avatar(None);
+        assert!(!a.allow_blob(&alice, &mine));
     }
 }

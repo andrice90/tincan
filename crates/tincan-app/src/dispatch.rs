@@ -17,6 +17,8 @@ use crate::transfers::parse_hash;
 pub(crate) const CORE_COMMANDS: &[&str] = &[
     "app_snapshot",
     "set_name",
+    "set_avatar",
+    "set_server_icon",
     "create_server",
     "create_invite",
     "join_server",
@@ -174,6 +176,20 @@ mod args {
     }
 
     #[derive(Deserialize)]
+    pub struct Image {
+        #[serde(default)]
+        pub bytes: Option<Vec<u8>>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ServerImage {
+        pub server_id: String,
+        #[serde(default)]
+        pub bytes: Option<Vec<u8>>,
+    }
+
+    #[derive(Deserialize)]
     pub struct SettingsSet {
         pub settings: dto::Settings,
     }
@@ -192,6 +208,14 @@ pub(crate) async fn call(core: &Arc<Core>, cmd: &str, a: Value) -> Result<Value,
         "set_name" => {
             let a: args::Name = parse_args(cmd, a)?;
             ok(core.set_name(&a.name)?)
+        }
+        "set_avatar" => {
+            let a: args::Image = parse_args(cmd, a)?;
+            ok(core.cmd_set_avatar(a.bytes).await?)
+        }
+        "set_server_icon" => {
+            let a: args::ServerImage = parse_args(cmd, a)?;
+            ok(core.cmd_set_server_icon(parse_conv(&a.server_id)?, a.bytes).await?)
         }
         "create_server" => {
             let a: args::Name = parse_args(cmd, a)?;

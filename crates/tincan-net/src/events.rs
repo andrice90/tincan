@@ -231,4 +231,15 @@ pub enum NetEvent {
         /// The name they announced.
         name: String,
     },
+    /// A DM contact announced a new avatar (or cleared it) over the DM connection. Also
+    /// readable with `Net::dm_peer_avatar`. Checked with `image::validate_image_ref`; the
+    /// bytes are still the contact's claim until downloaded.
+    DmAvatarChanged {
+        /// The DM conversation.
+        conv: ConvId,
+        /// The contact.
+        peer: UserId,
+        /// The avatar they announced, or none.
+        image: Option<tincan_core::event::ImageRef>,
+    },
 }

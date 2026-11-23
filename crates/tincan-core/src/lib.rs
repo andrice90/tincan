@@ -11,6 +11,7 @@ pub mod error;
 pub mod event;
 pub mod hlc;
 pub mod ids;
+pub mod image;
 pub mod invite;
 pub mod keys;
 pub mod media;

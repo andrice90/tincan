@@ -46,7 +46,7 @@ pub(crate) fn parse_cursor(s: &str) -> Result<(u64, EventId), String> {
     Ok((hlc.parse().map_err(|_| bad())?, EventId::from_hex(id).ok_or_else(bad)?))
 }
 
-fn owner_only(view: &ConvView, me: &UserId) -> Result<(), String> {
+pub(crate) fn owner_only(view: &ConvView, me: &UserId) -> Result<(), String> {
     if view.is_owner(me) { Ok(()) } else { Err("Only the server owner can do that.".into()) }
 }
 

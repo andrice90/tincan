@@ -80,6 +80,12 @@ pub(crate) struct Core {
     pub sent: Mutex<HashMap<SentKey, serde_json::Value>>,
     /// DM delivery acks already turned into `message-updated`.
     pub dm_acked: Mutex<HashMap<ConvId, u64>>,
+    /// My avatar (kv `app/avatar`), None when I have none.
+    pub avatar: RwLock<Option<tincan_core::event::ImageRef>>,
+    /// Avatar and icon blobs: queued, checked or refused (`images.rs`).
+    pub images: Mutex<Bounded<BlobHash, crate::images::ImgState>>,
+    /// Servers with a ProfileImage publish in flight.
+    pub avatar_inflight: Mutex<HashSet<ConvId>>,
     /// Servers with a Profile publish in flight.
     pub profile_inflight: Mutex<HashSet<ConvId>>,
     /// The DM on screen and the guard that keeps its connection up (`dm_watch`).
@@ -111,7 +117,7 @@ impl std::fmt::Debug for Core {
 }
 
 /// The network configuration for this start.
-fn net_config(cfg: &AppConfig, s: &dto::Settings, name: Option<&str>) -> NetConfig {
+fn net_config(cfg: &AppConfig, s: &dto::Settings, name: Option<&str>, avatar: Option<tincan_core::event::ImageRef>) -> NetConfig {
     let offline = cfg.test.offline_network;
     let relay = if offline {
         RelayChoice::Disabled
@@ -128,6 +134,7 @@ fn net_config(cfg: &AppConfig, s: &dto::Settings, name: Option<&str>) -> NetConf
         allow_hosting: s.allow_hosting,
         bind_addr: offline.then(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
         display_name: name.unwrap_or("Anonymous").to_string(),
+        avatar,
         rendezvous: !offline,
     }
 }
@@ -143,9 +150,10 @@ impl Core {
         })?);
         let settings = settings::load(&storage);
         let name = profile::load_name(storage.as_ref());
+        let avatar = crate::images::load_avatar(storage.as_ref());
         let mut notices = Vec::new();
 
-        let mut net_cfg = net_config(&cfg, &settings, name.as_deref());
+        let mut net_cfg = net_config(&cfg, &settings, name.as_deref(), avatar.clone());
         let endpoint = match tincan_net::build_endpoint(&identity, &net_cfg).await {
             Ok(ep) => ep,
             Err(e) if matches!(net_cfg.relay, RelayChoice::Custom(_)) => {
@@ -169,6 +177,7 @@ impl Core {
             }
         };
         load_shares(storage.as_ref(), &files, &access);
+        access.write().set_own_avatar(avatar.as_ref().map(|a| a.hash));
         let proto = files.protocol();
         let dyn_storage: Arc<dyn Storage> = storage.clone();
         let net = match Net::start(endpoint, dyn_storage, identity.clone(), net_cfg, |b| b.accept(tincan_files::ALPN, proto)).await {
@@ -206,6 +215,9 @@ impl Core {
             sent: Mutex::new(HashMap::new()),
             dm_acked: Mutex::new(HashMap::new()),
             profile_inflight: Mutex::new(HashSet::new()),
+            avatar: RwLock::new(avatar),
+            images: Mutex::new(Bounded::new(crate::images::IMAGE_STATES)),
+            avatar_inflight: Mutex::new(HashSet::new()),
             dm_watch: Mutex::new(None),
             resume: Mutex::new(None),
             notices: Mutex::new(notices),
@@ -222,6 +234,10 @@ impl Core {
         let pump = tokio::spawn(pump::run(core.clone(), net_rx, file_rx, pump_rx));
         let worker = tokio::spawn(transfers::fetch_worker(core.clone(), fetch_rx));
         core.tasks.lock().extend([pump, worker]);
+        // My avatar from an earlier session is shown once its bytes are checked again.
+        if let Some(a) = core.avatar.read().clone() {
+            let _ = core.fetch_tx.try_send(FetchReq::Image { hash: a.hash });
+        }
         match core.files.partial_downloads().await {
             Ok(list) if !list.is_empty() => {
                 tracing::info!(count = list.len(), "partial downloads to resume");
@@ -385,6 +401,7 @@ impl Core {
     /// A server became connected: resume partial downloads once, fix my name there.
     pub(crate) fn on_connected(self: &Arc<Self>, server: ConvId) {
         self.ensure_profile(server);
+        self.ensure_avatar(server);
         self.resume_downloads();
     }
 

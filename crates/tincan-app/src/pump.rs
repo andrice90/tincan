@@ -549,6 +549,10 @@ impl Pump {
                 core.on_dm_name(peer);
                 self.mark(conv, Refresh { dm: true, ..Refresh::default() });
             }
+            NetEvent::DmAvatarChanged { conv, peer, .. } => {
+                self.mark(conv, Refresh { dm: true, ..Refresh::default() });
+                core.media.on_name_changed(&core, peer);
+            }
             NetEvent::SyncComplete { conv } => {
                 let now = Instant::now();
                 if let Some(b) = self.bulks.sync_complete(conv, now) {
@@ -611,7 +615,13 @@ impl Pump {
         match &ev {
             FileEvent::Transfer(info) => core.on_transfer(info),
             // Share by nomination and re-announce (only what is shared with a server).
-            FileEvent::Completed { hash, from, .. } => core.on_completed(*hash, *from),
+            FileEvent::Completed { hash, from, kind } => {
+                core.on_completed(*hash, *from);
+                if *kind == tincan_files::BlobKind::Image {
+                    // Shown only once its bytes are checked.
+                    let _ = core.fetch_tx.try_send(crate::transfers::FetchReq::Image { hash: *hash });
+                }
+            }
         }
         core.media.on_file_event(&core, &ev);
     }
