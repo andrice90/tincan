@@ -250,6 +250,11 @@ export interface Commands {
   file_url: { args: { hash: BlobHash; name: string }; result: string | null };
 
   open_dm: { args: { userId: UserId }; result: DmSummary };
+  /**
+   * The DM on screen, or null when none. The app keeps the connection to that contact up
+   * (presence, calls) until another DM or null replaces it.
+   */
+  dm_watch: { args: { convId: ConvId | null }; result: null };
   /** Accepts "tincan1u..." or a bare user id. */
   add_contact: { args: { code: string }; result: DmSummary };
 

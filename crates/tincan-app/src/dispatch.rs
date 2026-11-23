@@ -37,6 +37,7 @@ pub(crate) const CORE_COMMANDS: &[&str] = &[
     "open_file",
     "file_url",
     "open_dm",
+    "dm_watch",
     "add_contact",
     "settings_set",
 ];
@@ -68,6 +69,13 @@ mod args {
     #[serde(rename_all = "camelCase")]
     pub struct Server {
         pub server_id: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Watch {
+        #[serde(default)]
+        pub conv_id: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -273,6 +281,11 @@ pub(crate) async fn call(core: &Arc<Core>, cmd: &str, a: Value) -> Result<Value,
         "open_dm" => {
             let a: args::User = parse_args(cmd, a)?;
             ok(core.cmd_open_dm(parse_user(&a.user_id)?).await?)
+        }
+        "dm_watch" => {
+            let a: args::Watch = parse_args(cmd, a)?;
+            core.cmd_dm_watch(a.conv_id.as_deref().map(parse_conv).transpose()?)?;
+            Ok(Value::Null)
         }
         "add_contact" => {
             let a: args::Code = parse_args(cmd, a)?;

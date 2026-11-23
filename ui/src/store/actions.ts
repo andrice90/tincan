@@ -801,6 +801,17 @@ export function startCall(userId: UserId): void {
   );
 }
 
+let dmWatchChain: Promise<unknown> = Promise.resolve();
+
+/**
+ * Tells the app which DM is on screen (null when none), so it keeps the connection to that
+ * contact up: their presence stays right and calling them works after an idle or a restart.
+ * Calls run one after the other, so leaving one DM never overtakes opening the next.
+ */
+export function watchDm(convId: ConvId | null): void {
+  dmWatchChain = dmWatchChain.then(() => invoke("dm_watch", { convId })).catch(() => undefined);
+}
+
 /** Accepts the incoming call. */
 export function acceptCall(callId: string): void {
   run(

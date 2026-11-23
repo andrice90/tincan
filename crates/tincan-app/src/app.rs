@@ -82,6 +82,8 @@ pub(crate) struct Core {
     pub dm_acked: Mutex<HashMap<ConvId, u64>>,
     /// Servers with a Profile publish in flight.
     pub profile_inflight: Mutex<HashSet<ConvId>>,
+    /// The DM on screen and the guard that keeps its connection up (`dm_watch`).
+    pub dm_watch: Mutex<Option<(ConvId, tincan_net::DmWatch)>>,
     /// Partial downloads to resume once a server is connected.
     pub resume: Mutex<Option<Vec<(BlobHash, BlobKind)>>>,
     /// Notices from startup, shown after the UI asked for its first snapshot.
@@ -204,6 +206,7 @@ impl Core {
             sent: Mutex::new(HashMap::new()),
             dm_acked: Mutex::new(HashMap::new()),
             profile_inflight: Mutex::new(HashSet::new()),
+            dm_watch: Mutex::new(None),
             resume: Mutex::new(None),
             notices: Mutex::new(notices),
             pump_tx,
@@ -252,6 +255,7 @@ impl Core {
             .get_or_init(|| async {
                 self.closed.store(true, Ordering::Release);
                 tracing::info!("app shutting down");
+                self.dm_watch.lock().take();
                 if tokio::time::timeout(Duration::from_secs(3), self.media.shutdown(self)).await.is_err() {
                     tracing::warn!("media shutdown timed out");
                 }

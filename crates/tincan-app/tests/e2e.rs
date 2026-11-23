@@ -765,6 +765,46 @@ async fn direct_messages_and_offline_delivery() {
     b2.shutdown().await;
 }
 
+/// SPEC-GAPS-2: a contact who shares no server shows online again while their DM is on
+/// screen (`dm_watch`), after they restarted on a new address with nothing pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watched_dm_contact_shows_online() {
+    let _g = serial().await;
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = node(da.path(), "Alice").await;
+    let b = node(db.path(), "Bob").await;
+    a.app.test_add_addr(&b.user, &b.app.test_addrs()).unwrap();
+    b.app.test_add_addr(&a.user, &a.app.test_addrs()).unwrap();
+    let conv = call(&a.app, "add_contact", json!({ "code": b.user })).await["convId"].as_str().unwrap().to_string();
+    call(&a.app, "send_message", json!({ "convId": conv, "channelId": null, "text": "hi", "attachments": [] })).await;
+    let online = |app: Arc<App>| async move { call(&app, "app_snapshot", json!({})).await["dms"][0]["online"].as_bool() };
+    eventually("Bob online", 20, || async { (online(a.app.clone()).await == Some(true)).then_some(()) }).await;
+    eventually("Alice's message delivered", 20, || async {
+        let page = call(&a.app, "messages", json!({ "convId": conv, "channelId": null, "before": null, "limit": 10 })).await;
+        page["messages"].as_array().unwrap().iter().all(|m| m["pending"] == false).then_some(())
+    })
+    .await;
+
+    // Bob restarts on a new port. Nothing is pending, so nobody dials.
+    let b_user = b.user.clone();
+    b.app.shutdown().await;
+    drop(b);
+    eventually("Bob offline", 20, || async { (online(a.app.clone()).await == Some(false)).then_some(()) }).await;
+    let b2 = start(db.path()).await;
+    a.app.test_add_addr(&b_user, &b2.test_addrs()).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(online(a.app.clone()).await, Some(false), "nothing dialed Bob yet");
+
+    // Alice opens the DM: the app keeps the connection up, and Bob shows online.
+    call(&a.app, "dm_watch", json!({ "convId": conv })).await;
+    eventually("Bob online while watched", 20, || async { (online(a.app.clone()).await == Some(true)).then_some(()) }).await;
+    call(&a.app, "dm_watch", json!({ "convId": null })).await;
+    assert_eq!(call_err(&a.app, "dm_watch", json!({ "convId": "00" })).await, "That conversation id is not valid.");
+
+    a.app.shutdown().await;
+    b2.shutdown().await;
+}
+
 /// (e) owner changes and deletions propagate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn owner_changes_and_deletes_propagate() {

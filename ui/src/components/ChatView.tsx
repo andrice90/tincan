@@ -1,8 +1,9 @@
 // A text channel or a DM: header, history, composer.
 
+import { useEffect } from "react";
 import { Hash, Phone, Users } from "lucide-react";
 import type { Channel, DmSummary, ServerSummary } from "../api/types";
-import { startCall, toggleMembers } from "../store/actions";
+import { startCall, toggleMembers, watchDm } from "../store/actions";
 import { convKey, useStore, type TypingEntry } from "../store/store";
 import { Avatar, ICON, IconButton, PersonName } from "./common";
 import { Composer, TypingLine } from "./Composer";
@@ -51,6 +52,12 @@ export function DmChat({ dm }: { dm: DmSummary }) {
   const busy = call !== null || voice?.kind === "call";
   const typing = useStore((s) => s.typing[convKey(dm.convId, null)] ?? NO_TYPING);
 
+  // While this DM is on screen the app keeps the connection to them up.
+  useEffect(() => {
+    watchDm(dm.convId);
+    return () => watchDm(null);
+  }, [dm.convId]);
+
   return (
     <>
       <header className="main-header">
@@ -61,12 +68,7 @@ export function DmChat({ dm }: { dm: DmSummary }) {
           </span>
           <span className="main-sub">{dm.online ? "Online" : "Offline"}</span>
         </h1>
-        <IconButton
-          label={`Call ${dm.name}`}
-          tooltip={dm.online ? `Call ${dm.name}` : `${dm.name} is offline`}
-          disabled={!dm.online || busy}
-          onClick={() => startCall(dm.userId)}
-        >
+        <IconButton label={`Call ${dm.name}`} disabled={busy} onClick={() => startCall(dm.userId)}>
           <Phone size={ICON} />
         </IconButton>
       </header>

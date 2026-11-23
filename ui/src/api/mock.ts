@@ -1205,6 +1205,8 @@ const handlers: Handlers = {
     return dm;
   },
 
+  dm_watch: () => null,
+
   add_contact: ({ code }) => {
     const raw = code.trim();
     const id = raw.toLowerCase().startsWith("tincan1u") ? raw.slice(8) : raw;

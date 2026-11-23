@@ -330,6 +330,25 @@ impl Core {
         self.dm_summary(&conv).ok_or_else(|| "Couldn't open that conversation. Try again.".to_string())
     }
 
+    /// `dm_watch`: keep the connection to the contact of the DM on screen up, so their
+    /// presence is right and calls work after the link idled out or a restart (also for a
+    /// contact who shares no server). One DM at a time; null releases it.
+    pub(crate) fn cmd_dm_watch(&self, conv: Option<ConvId>) -> Result<(), String> {
+        let Some(conv) = conv else {
+            self.dm_watch.lock().take();
+            return Ok(());
+        };
+        let view = self.conv_view(&conv)?;
+        let peer = view.peer.filter(|_| view.is_dm).ok_or_else(|| "That isn't a direct message.".to_string())?;
+        let mut w = self.dm_watch.lock();
+        if !w.as_ref().is_some_and(|(c, _)| *c == conv) {
+            // Dials now and redials with backoff while held; dropping the old guard lets
+            // that link idle out as usual.
+            *w = Some((conv, self.net.dm_watch(peer)));
+        }
+        Ok(())
+    }
+
     /// `add_contact`: a `tincan1u...` code or a bare user id.
     pub(crate) async fn cmd_add_contact(&self, code: &str) -> Result<dto::DmSummary, String> {
         let user = parse_user_code(code).ok_or_else(|| "That isn't a Tincan ID. Paste the code that starts with tincan1u.".to_string())?;
