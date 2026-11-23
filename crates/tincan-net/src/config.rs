@@ -52,6 +52,11 @@ pub struct NetConfig {
     /// when `relay` is `RelayChoice::Disabled`, so tests and LAN-only setups make no
     /// rendezvous traffic at all.
     pub rendezvous: bool,
+    /// Folder that stands in for the DHT for short code records (invite and friend codes)
+    /// when the rendezvous layer is off: offline test mode and tests, where every profile on
+    /// the machine shares it. `None` with the rendezvous layer off: short codes are
+    /// unavailable and only full invites and IDs work.
+    pub code_dir: Option<std::path::PathBuf>,
 }
 
 impl NetConfig {
@@ -69,6 +74,7 @@ impl Default for NetConfig {
             bind_addr: None,
             display_name: "Anonymous".to_string(),
             rendezvous: true,
+            code_dir: None,
         }
     }
 }

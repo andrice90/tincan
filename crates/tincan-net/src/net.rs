@@ -12,6 +12,7 @@ use iroh::protocol::{Router, RouterBuilder};
 use n0_future::StreamExt;
 use parking_lot::{Mutex, RwLock};
 use tincan_core::build::{self, HelloInfo};
+use tincan_core::code::{CodeKind, ShortCode, seal_code};
 use tincan_core::election::Status;
 use tincan_core::event::{Body, StoredEvent};
 use tincan_core::hlc::Hlc;
@@ -24,6 +25,7 @@ use tincan_core::{ALPN_DM, ALPN_SERVER, BlobHash, ChannelId, ConvId, PROTOCOL_VE
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::addr::hint_from_addr;
+use crate::codes;
 use crate::config::{NetConfig, take_mdns};
 use crate::dm::{self, DmHold, DmManager, DmWatch};
 use crate::error::{NetError, Result, capitalize};
@@ -99,6 +101,11 @@ impl Net {
         let rdv_client = cfg
             .rendezvous_enabled()
             .then(|| Arc::new(crate::rdv::Rendezvous::new(&endpoint, cfg.relay == crate::config::RelayChoice::N0Default)));
+        let codes = match (&rdv_client, &cfg.code_dir) {
+            (Some(rdv), _) => Some(Arc::new(crate::codes::CodeDir::Pkarr(rdv.clone()))),
+            (None, Some(dir)) => Some(Arc::new(crate::codes::CodeDir::Local(dir.clone()))),
+            (None, None) => None,
+        };
         let inner = Arc::new(Inner {
             identity,
             me,
@@ -117,6 +124,10 @@ impl Net {
             extra: RwLock::new(None),
             media: crate::media::MediaHub::default(),
             rdv: rdv_client,
+            codes,
+            code_keys: Mutex::new(HashMap::new()),
+            friend: Mutex::new(None),
+            code_ops: tokio::sync::Mutex::new(()),
             tasks: Arc::new(Tasks::default()),
             router: Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -284,13 +295,140 @@ impl Net {
         Ok(invite.encode())
     }
 
-    /// Join a server with an invite code (or `tincan://join/` link). Dials the bootstrap
-    /// peers, follows redirects to the host, sends the JoinRequest, stores what the host
-    /// returns and starts the session on the same connection. Errors are user-presentable.
-    /// Joining a server I am already in returns its id.
-    pub async fn join(&self, invite: &str) -> Result<ServerId> {
+    /// `server`'s short invite code, if it has one (`None` until the owner made one).
+    pub async fn invite_code(&self, server: ServerId) -> Result<Option<ShortCode>> {
+        if self.inner.replica(&server).is_none() {
+            return Err(NetError::UnknownConv);
+        }
+        Ok(codes::active_invite_code(&self.inner, &server).await.map(|(c, _)| c))
+    }
+
+    /// `server`'s short invite code; when it has none and I am the owner, make one first.
+    /// `None` for other members of a server without a code.
+    pub async fn ensure_invite_code(&self, server: ServerId) -> Result<Option<ShortCode>> {
+        let _ops = self.inner.code_ops.lock().await;
+        if let Some(code) = self.invite_code(server).await? {
+            return Ok(Some(code));
+        }
+        if !self.is_owner(&server) {
+            return Ok(None);
+        }
+        self.new_invite_code(server).await.map(Some)
+    }
+
+    /// Owner only: replace `server`'s short invite code. The new code's `InviteCreate`
+    /// (`expires_ms = u64::MAX`, the code sealed into `max_uses`) is published first, then an
+    /// `InviteRevoke` for every older code, so hosts refuse the old code at once. Its record
+    /// is written now and the old record gets a tombstone (in the background).
+    pub async fn rotate_invite_code(&self, server: ServerId) -> Result<ShortCode> {
+        let _ops = self.inner.code_ops.lock().await;
+        if self.inner.replica(&server).is_none() {
+            return Err(NetError::UnknownConv);
+        }
+        if !self.is_owner(&server) {
+            return Err(NetError::Rejected("Only the server owner can change the invite code.".into()));
+        }
+        self.new_invite_code(server).await
+    }
+
+    fn is_owner(&self, server: &ServerId) -> bool { self.inner.replica(server).is_some_and(|r| r.lock().state.is_owner(&self.inner.me)) }
+
+    async fn new_invite_code(&self, server: ServerId) -> Result<ShortCode> {
         let inner = &self.inner;
-        let invite = Invite::decode(invite).map_err(NetError::from_core_user)?;
+        if inner.codes.is_none() {
+            return Err(NetError::Invalid(codes::CODES_OFF.into()));
+        }
+        let rep = inner.replica(&server).ok_or(NetError::UnknownConv)?;
+        let (skeys, old) = {
+            let r = rep.lock();
+            let k = r.keys.clone().ok_or(NetError::UnknownConv)?;
+            let old = r.state.short_code_invites(&k.code_key);
+            (k, old)
+        };
+        let code = ShortCode::random();
+        let keys = codes::code_keys(inner, CodeKind::Invite, code).await;
+        let invite_pk = keys.invite_pk(&server);
+        let max_uses = seal_code(&skeys.code_key, &invite_pk, code);
+        self.publish(server, Body::InviteCreate { invite_pk, expires_ms: u64::MAX, max_uses }).await?;
+        for (_, pk) in &old {
+            if let Err(e) = self.publish(server, Body::InviteRevoke { invite_pk: *pk }).await {
+                tracing::warn!(error = %e, "revoking the old invite code failed");
+            }
+        }
+        let shared = inner.sessions.lock().get(&server).map(|s| s.shared.clone());
+        let out = codes::publish_invite_record(inner, &server, code, shared.as_deref(), true).await;
+        tracing::debug!(server = %server.short(), ?out, "new invite code record written");
+        let weak = Arc::downgrade(inner);
+        let old_codes: Vec<ShortCode> = old.into_iter().map(|(c, _)| c).collect();
+        if !old_codes.is_empty() {
+            inner.tasks.spawn(async move {
+                for c in old_codes {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let out = codes::clear_record(&inner, CodeKind::Invite, c).await;
+                    tracing::debug!(?out, "old invite code record cleared");
+                }
+            });
+        }
+        Ok(code)
+    }
+
+    /// Publish `code` as my friend code (replacing and clearing the previous one), or stop
+    /// publishing with `None`. The record is refreshed while the network runs.
+    pub fn set_friend_code(&self, code: Option<ShortCode>) {
+        let inner = &self.inner;
+        let mut slot = inner.friend.lock();
+        if slot.as_ref().map(|(c, _)| *c) == code {
+            return;
+        }
+        if let Some((old, task)) = slot.take() {
+            task.abort();
+            let weak = Arc::downgrade(inner);
+            inner.tasks.spawn(async move {
+                if let Some(inner) = weak.upgrade() {
+                    let out = codes::clear_record(&inner, CodeKind::Friend, old).await;
+                    tracing::debug!(?out, "old friend code record cleared");
+                }
+            });
+        }
+        if let Some(code) = code
+            && inner.codes.is_some()
+        {
+            let task = inner.tasks.spawn(codes::friend_runner(Arc::downgrade(inner), code));
+            *slot = Some((code, task));
+        }
+    }
+
+    /// Who a friend code belongs to, and where to reach them (the address is remembered).
+    pub async fn resolve_friend_code(&self, code: ShortCode) -> Result<UserId> {
+        let (user, hint) = codes::resolve_friend_code(&self.inner, code).await?;
+        if user != self.inner.me {
+            self.inner.learn_hint(&user, &hint);
+        }
+        Ok(user)
+    }
+
+    /// Turn what the user typed into an invite: a 6-character code (resolved through its
+    /// record) or a full `tincan1...` code or link.
+    pub async fn resolve_invite(&self, input: &str) -> Result<Invite> {
+        match ShortCode::parse(input) {
+            Some(code) => codes::resolve_invite_code(&self.inner, code).await,
+            None => Invite::decode(input).map_err(NetError::from_core_user),
+        }
+    }
+
+    /// Join a server with a short invite code, a full invite code or a `tincan://join/`
+    /// link (see [`Net::resolve_invite`] and [`Net::join_invite`]).
+    pub async fn join(&self, invite: &str) -> Result<ServerId> {
+        let invite = self.resolve_invite(invite).await?;
+        self.join_invite(invite).await
+    }
+
+    /// Join a server with a decoded invite. Dials the bootstrap peers, follows redirects to
+    /// the host, sends the JoinRequest, stores what the host returns and starts the session
+    /// on the same connection. Errors are user-presentable. Joining a server I am already in
+    /// returns its id.
+    pub async fn join_invite(&self, invite: Invite) -> Result<ServerId> {
+        let inner = &self.inner;
         let server = invite.server;
         if inner.replica(&server).is_some() {
             return Ok(server);
