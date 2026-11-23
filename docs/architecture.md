@@ -238,6 +238,7 @@ Partition merge (two solo hosts is the common case, given the 6 s solo timeout):
 - Equivocation is detected, not resolved. Replicas may show different versions of one seq until a proof-carrying resolution exists.
 - Events arriving in bulk from a member are still signature-checked on the session actor (known events are skipped first, and a bad signature drops the sender).
 - Ex-members keep `server_secret`, so they can pass the `Hello` MAC (but not the membership check) and write the rendezvous record until secret rotation exists.
+- Short codes have 30 bits and anyone holding one can overwrite its record; see "Threat model of short codes".
 - A malicious host can push the epoch up to the ceiling. Every node accepts that, so nobody is locked out. A node whose clock is more than 5 min behind refuses such claims until its clock catches up (at most its clock error), and an honest successor just above the ceiling waits for it the same way.
 - Admission and compare budgets are per host role: they reset when a host stops and starts hosting again. Admissions held back on a probe link are not asked for again on that link; they come with a later sync (the next comparison, or the other side's members).
 - A flood of fresh identities can push real joiners and strangers out of the 32 unknown pre-auth slots before they send their first frame (members and contacts I wrote to have their own 64, and a full pool drops a waiter of the peer holding the most).
@@ -264,6 +265,40 @@ A hint for cold joiners when every cached peer is stale. Never trusted on its ow
 - Published to the n0 pkarr relay (optional accelerator) and to mainline DHT as a BEP44 mutable item. Write rule: resolve first, then `seq = max(now_us, seen_seq + 1)` with `cas = seen_seq`.
 - The host publishes on becoming host and on roster changes (30 s debounce, at least 10 s apart), refreshes the relay copy every 5 min and the DHT copy every 30 min, and re-resolves every 5 min to detect a foreign host.
 
+## Short codes
+
+Two 6-character codes replace the long strings people share: one invite code per server and one friend code per user. The long forms (`tincan1...` invites, `tincan1u...` IDs) keep working as the fallback.
+
+- Format: 6 symbols from `23456789ABCDEFGHJKLMNPQRSTUVWXYZ` (32 symbols, no 0/O/1/I lookalikes), so 30 bits. Shown as `ABC-DEF`; input is accepted in any case, with or without the dash and spaces (`tincan_core::code`).
+- KDF: argon2id, 64 MiB, 5 passes, 1 lane, 80 output bytes = record signing seed (32) || record read key (32) || invite seed (16). Fixed salts `"tincan v1 server invite code"` and `"tincan v1 friend code"`, so the two kinds never share a record. Measured on the dev machine: about 200 ms in a release build, 115 ms with the dev profile. Derived keys are cached per code; the KDF runs on a blocking thread. The parameters are protocol constants (a test pins one output).
+- Record: a pkarr `SignedPacket` signed by the derived key, the payload sealed with XChaCha20-Poly1305 under the derived read key (`nonce24 || ciphertext`), base64url TXT chunks under `_tincan` (the rendezvous record layout). Written to the n0 pkarr relay and mainline DHT with the rendezvous write rule (`seq = max(now_us, highest seen + 1)`, `cas` from the DHT). A reader takes the newest plausible packet; an unreadable newest packet means "not found", so a cleared code is never revived by an older copy.
+- Offline (`TINCAN_OFFLINE_NETWORK=1`, tests): there is no DHT, so records go to a folder every profile on the machine shares (`%APPDATA%\Tincan\profiles\.offline-codes`, `NetConfig::code_dir`) as the same signed packets. Without the rendezvous layer and without a folder, short codes are off and only the long forms work.
+
+### Server invite codes
+
+- The code is an ordinary invite: the owner authors `InviteCreate { invite_pk, expires_ms: u64::MAX, max_uses }` where `invite_pk` comes from the code's invite seed (`invite_secret(seed, server)`) and `max_uses = 0x8000_0000 | (code ^ mask)`, with `mask` = 30 bits of `keyed_blake3(code_key, invite_pk)` and `code_key = derive_key("tincan v1 invite code mask key", server_secret || server)`. The top bit makes the use cap at least 2^31, unlimited in practice. No event or wire type changed.
+- Every member reads the current code from the log: the newest owner-authored, unrevoked, never-expiring invite with the flag whose `invite_pk` matches its decoded code. Ex-members cannot learn later codes: the code is random and only in events they no longer receive.
+- Only the owner makes and rotates the code. The owner's app makes the first one when the owner opens the invite dialog; until then other members see none and use the full invite.
+- Rotation: `InviteCreate` for a new random code, then `InviteRevoke` for every older one. Hosts check revocation on every join (`ConvState::invite_status`), so the old code stops admitting at once on every host, migrations included. Members keep access: membership is in the signed log, not in the code. The owner writes the new record at once and a tombstone (empty payload, higher seq) over the old one.
+- Record content: the full `Invite` (server, name cut to 32 characters, the code's invite seed, rendezvous key and read key, up to 2 bootstrap peers with compact address hints, no expiry). The host keeps it current (host, first successor and their addresses) and fresh: checked every 30 s, rewritten when it changes, the relay copy every 5 min, the DHT copy every 30 min. A host does not overwrite a fresh (under 2 h) readable record naming another server: that is a code collision, logged, and fixed by rotating.
+- The joiner parses the code, derives the keys, resolves the record, decrypts it and joins through the normal join path with that invite.
+
+### Friend codes
+
+- A random code stored in the profile (kv `app/friend_code`), made on first use and changeable in Settings.
+- Record: `FriendRecord { v, user, addr, published_ms, sig }`, with `sig` by the user's identity key over `"tincan-friend1" || record_pk || postcard((v, user, addr, published_ms))`. Because the signature covers the code's record key, a record cannot name a user who did not sign for that code, and a valid record cannot be moved to another code.
+- The user's own app publishes it at start and keeps it fresh (address changes, relay every 5 min, DHT every 30 min). Rotating writes the new record and a tombstone over the old one.
+- "Add contact" resolves the code, verifies the signature, remembers the address and opens the DM.
+
+### Threat model of short codes
+
+- 30 bits. Online guessing costs one argon2id derivation plus a DHT lookup per guess. A hit on an invite code is a working invite (the host admits it within its budgets), and a hit on a friend code reveals a user ID.
+- A determined attacker can crawl the DHT for pkarr records and brute-force codes offline against each record key: 2^30 argon2id derivations, about 6 core-years at 200 ms, much less on many cores. Treat a code as a convenience, not a secret that resists a funded attacker. A leaked or brute-forced code is killed by rotating it.
+- Anyone who holds a code holds its record key, so they can overwrite the record: point an invite code at another server or a friend code at themselves (their own signed record), or blank it. Records are hints: joins still need the host to admit the invite, and every peer is verified through `Hello` and the member list. The owner's refresh and rotation recover the code.
+- Host admission budgets apply to code joins as to any invite: one join per 10 s per invite after a burst of 10, plus the per-creator and server-wide admission budgets. The code is the owner's invite, so a flood through a leaked code delays joins through the owner's invites until the owner rotates.
+- Collisions: two servers (or two users) draw the same code with probability about n / 2^30 for n active codes. A host or friend publisher does not overwrite another fresh record under its code; the second owner rotates.
+- The DHT and the n0 relay see the record keys and when they are refreshed, never the payload.
+
 ## Invites and joining
 
 `Invite { v, server, name_hint, invite_seed: [u8;16], rdv_pk, rdv_read_key, bootstrap: [UserId; <=2] + AddrHints, expires_ms }`, encoded `tincan1` + base32(postcard). The invite never contains `server_secret`.
@@ -271,6 +306,8 @@ A hint for cold joiners when every cached peer is stale. Never trusted on its ow
 1. Any member authors `InviteCreate{invite_pk = public(derive_key("tincan v1 invite key", seed)), expires_ms, max_uses}` and shares the code.
 2. Joiner dials bootstrap peers and resolves the rendezvous record, then sends the host `JoinRequest{server, invite_pk, profile, ts_ms, invite_sig}` where `invite_sig = ed25519(invite_sk, "tincan-join1" || server || joiner || host || ts_ms)`.
 3. Host checks the invite (exists, not revoked, not expired, uses below max_uses best-effort), authors `MemberAdmit`, replies `JoinAccepted{server_secret, genesis, admit}`. Normal `Hello` and sync follow. Joins are rate limited per invite and per invite creator (refused with `RejectCode::Busy`).
+
+People normally share the server's 6-character invite code instead (see "Short codes"); it resolves to an `Invite` and joins the same way. The full `tincan1...` invite (7 days) stays as the fallback.
 
 `Hello { server, nonce, mac = keyed_blake3(hello_key, server || client || host || nonce), epoch_seen, next_seq_hint, status, have_hashes }` proves membership to any host.
 

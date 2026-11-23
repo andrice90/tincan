@@ -70,3 +70,12 @@ None of these changes a signature.
   - `ConvState` derives `PartialEq, Eq`.
   - `Storage::insert_events` (a provided method, so existing implementations still compile).
   - `Ctl::DmProfile { name }`, appended as variant 39: the sender's display name on a DM connection. `within_limits` drops names over `4 * MAX_NAME_CHARS` bytes; receivers also run `state::validate_name` on the trimmed name. Peers that predate it skip the frame, since `FrameDecoder` consumes undecodable frames. Putting the name into `DmHello` instead was not done: postcard is not self-describing, so a 4-field `DmHello` cannot decode an old 3-field one.
+
+## Short codes (`code.rs`)
+
+- `ShortCode`: 30 bits over `CODE_ALPHABET` (32 symbols). `parse` takes 6 alphabet characters in any case and skips whitespace and dashes; `Display` is `ABC-DEF`, `compact()` is the KDF input.
+- `CodeKeys::derive(kind, code)`: argon2id (`KDF_MEMORY_KIB` 64 MiB, `KDF_PASSES` 5, 1 lane), salt per `CodeKind`. About 200 ms in release; call it off async executors (tincan-net uses `spawn_blocking` and a cache). A test pins one output: changing parameters or salts breaks every published code.
+- `seal_code` / `open_code`: the invite code inside `InviteCreate.max_uses` (flag bit 31, code XOR a mask keyed by `ServerKeys::code_key`, a new sub-key). `ConvState::short_code_invites` lists the owner's unrevoked, never-expiring flagged invites newest first; callers must still check each `invite_pk` against `CodeKeys::invite_pk` (the net layer does).
+- `InviteState` gained `created_hlc`.
+- Records: `code_invite` cuts an `Invite` down to fit a pkarr packet (name 32 chars, 2 peers, relay URLs up to 96 chars, 2 direct addresses each); `seal_invite` / `open_invite`; `FriendRecord::new/seal/open` (the signature covers the record key).
+- New dependency: `argon2` 0.5 (pure Rust, `alloc` only).

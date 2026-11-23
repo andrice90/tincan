@@ -79,6 +79,7 @@ Profiles: `--profile <name>` or `TINCAN_PROFILE`, data in `%APPDATA%\Tincan\prof
 
 ## Since the last handoff
 
+- Short codes: each server has a 6-character invite code (owner rotates it) and each user a 6-character friend code, resolved through argon2id-derived pkarr records (a shared folder offline). Four new commands; see api.md and architecture.md "Short codes". The long forms still work.
 - Round 2 fixes merged, then round 3: a review of those fixes found 17 more issues, and all are fixed. The main ones were sybil admissions growing a server without bound, an attestation merge takeover, Events and DM floods, pre-auth and stranger-slot lockouts, and unproven blob sizes.
 - The contract gained one command: `dm_watch` (hold a DM connection open while it is on screen). See `api.md`.
 - The e2e run found one UI race, E2E-R3-1 (the header kept the host's short id after joining). It is fixed.
