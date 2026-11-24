@@ -3,3 +3,6 @@ node_modules/
 dist/
 *.log
 .vite/
+
+# Third-party voice cue sounds (Ovani Sound license): kept locally, never committed
+crates/tincan-app/assets/*.wav

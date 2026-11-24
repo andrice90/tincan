@@ -18,7 +18,7 @@ Tincan is a Discord-style app where each channel's members **are** the network. 
 - **Short codes:** 6-character server invite codes and friend codes. The owner rotates an invite code without current members losing access.
 - **Owner tools:** remove a member (they can rejoin only with an invite that still works), rename and delete channels.
 - **Avatars and server icons**, with a crop window.
-- **Join and leave sounds** in voice rooms.
+- **Join and leave sounds** in voice rooms, if you add the sound files when you build (see [License](#license)).
 - **Two layouts:** Floating (the default: rounded cards with animated panels) and Classic (flat panels), set in Settings > Appearance.
 
 ## Install
@@ -91,10 +91,4 @@ Version 0.1.0 is an early test build:
 
 Tincan is licensed under the [Apache License, Version 2.0](LICENSE).
 
-The join and leave sounds in `crates/tincan-app/assets/` (`voice-join.wav`, `voice-leave.wav`) are not covered by that license. They are from Ovani Sound's Player Status Sound FX Pack, used under Ovani Sound's [Royalty-Free License](https://ovanisound.com/policies/terms-of-service):
-
-- They may ship inside Tincan.
-- They may not be redistributed on their own, apart from the app.
-- They may not be used to train AI systems.
-
-If you fork Tincan, replace them or check those terms first. If this repository becomes public, move them out of it and supply them at build time instead.
+The repository and the release contain no third-party sounds, so the join and leave cues in voice rooms are silent by default. To hear them, put your own sounds in `crates/tincan-app/assets/` as `voice-join.wav` and `voice-leave.wav` (WAV, up to 10 seconds) before building. The build embeds them when both files are present; that folder is git-ignored.

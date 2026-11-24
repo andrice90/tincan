@@ -8,8 +8,15 @@ use std::sync::{Arc, OnceLock};
 
 use tincan_audio::{AudioEngine, ClipPcm};
 
-static JOIN_WAV: &[u8] = include_bytes!("../../assets/voice-join.wav");
-static LEAVE_WAV: &[u8] = include_bytes!("../../assets/voice-leave.wav");
+// The sound files are not in the repository (see build.rs): a build without them has no cues.
+#[cfg(tincan_cues)]
+static JOIN_WAV: Option<&[u8]> = Some(include_bytes!("../../assets/voice-join.wav"));
+#[cfg(tincan_cues)]
+static LEAVE_WAV: Option<&[u8]> = Some(include_bytes!("../../assets/voice-leave.wav"));
+#[cfg(not(tincan_cues))]
+static JOIN_WAV: Option<&[u8]> = None;
+#[cfg(not(tincan_cues))]
+static LEAVE_WAV: Option<&[u8]> = None;
 
 /// Playback gain of the cues: they sit under voices and soundboard clips.
 const CUE_GAIN: f32 = 0.5;
@@ -44,7 +51,8 @@ pub(super) fn cue_for(prev: &Seen, next: &Seen) -> Option<Cue> {
     }
 }
 
-/// The decoded cue, decoded once per process (None if the bundled file fails to decode).
+/// The decoded cue, decoded once per process (None in a build without the sound files, or
+/// if a bundled file fails to decode).
 pub(super) fn pcm(cue: Cue) -> Option<Arc<ClipPcm>> {
     static JOIN: OnceLock<Option<Arc<ClipPcm>>> = OnceLock::new();
     static LEAVE: OnceLock<Option<Arc<ClipPcm>>> = OnceLock::new();
@@ -52,6 +60,7 @@ pub(super) fn pcm(cue: Cue) -> Option<Arc<ClipPcm>> {
         Cue::Join => (&JOIN, JOIN_WAV),
         Cue::Leave => (&LEAVE, LEAVE_WAV),
     };
+    let bytes = bytes?;
     cell.get_or_init(|| match AudioEngine::decode_clip(bytes, 10_000) {
         Ok(c) => Some(Arc::new(ClipPcm::from_samples(c.samples().iter().map(|s| s * CUE_GAIN).collect()))),
         Err(e) => {
@@ -81,6 +90,13 @@ mod tests {
         assert_eq!(cue_for(&seen("r", &["bob"]), &seen("r", &["eve"])), Some(Cue::Join), "one in, one out");
     }
 
+    #[cfg(not(tincan_cues))]
+    #[test]
+    fn a_build_without_the_sound_files_has_silent_cues() {
+        assert!(pcm(Cue::Join).is_none() && pcm(Cue::Leave).is_none());
+    }
+
+    #[cfg(tincan_cues)]
     #[test]
     fn bundled_cues_decode() {
         for c in [Cue::Join, Cue::Leave] {
