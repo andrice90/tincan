@@ -20,7 +20,7 @@ import type {
 } from "../api/types";
 import { browserStorage, saveLayout, type Layout } from "../lib/layout";
 import { leaveCommand } from "./calls";
-import { shownChat } from "./chatView";
+import { roomChatClick, shownChat } from "./chatView";
 import { addPlayedClip } from "./clips";
 import { withCreatedServer } from "./servers";
 import { staleTransfers, takeTransfer } from "./transfers";
@@ -489,7 +489,10 @@ export function selectServer(serverId: ServerId): void {
   afterViewChange();
 }
 
-/** Opens a channel. Opening a voice room joins it when you are not already talking. */
+/**
+ * Opens a channel. A voice room opens its view only: who is inside, its chat panel and a
+ * Join button. It never joins; only that button sends `voice_join`.
+ */
 export function selectChannel(serverId: ServerId, channel: Channel): void {
   update((s) => ({
     ...s,
@@ -497,18 +500,22 @@ export function selectChannel(serverId: ServerId, channel: Channel): void {
     lastChannel: { ...s.lastChannel, [serverId]: channel.id },
   }));
   afterViewChange();
-  if (channel.kind === "voice") {
-    const s = getState();
-    if (!s.voice && !s.call) joinVoice(serverId, channel.id);
-  }
 }
 
-/** Opens a voice room's chat as the whole page, without joining voice. */
-export function openRoomChat(serverId: ServerId, channel: Channel): void {
-  update((s) => ({
-    ...s,
-    view: { kind: "server", serverId, channelId: channel.id, chat: true },
-    lastChannel: { ...s.lastChannel, [serverId]: channel.id },
+/**
+ * The chat button on a voice room's sidebar row: on the room on screen it toggles the chat
+ * panel like the header's Chat button; on another room it opens that room with the panel open.
+ */
+export function roomChatButton(serverId: ServerId, channel: Channel): void {
+  const s = getState();
+  const { open, navigate } = roomChatClick(s.view, channel, s.roomChatPanel);
+  update((st) => ({
+    ...st,
+    roomChatPanel: open,
+    ...(navigate && {
+      view: { kind: "server", serverId, channelId: channel.id },
+      lastChannel: { ...st.lastChannel, [serverId]: channel.id },
+    }),
   }));
   afterViewChange();
 }

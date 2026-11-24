@@ -1,6 +1,6 @@
 import type { CallInfo, VoiceSession } from "../api/types";
 import { eq, test } from "../test/harness";
-import { callPanelParts, initialVolume, leaveCommand, shouldSend } from "./calls";
+import { callPanelParts, initialVolume, leaveCommand, roomStage, shouldSend } from "./calls";
 
 function voice(kind: "room" | "call"): VoiceSession {
   return {
@@ -65,4 +65,21 @@ test("REGRESSION-4: releasing the slider without a change sends nothing", () => 
   eq(shouldSend(1, 1), false);
   eq(shouldSend(0.3, 0.35), true);
   eq(shouldSend(0.3000001, 0.3), false, "the same percent");
+});
+
+test("room view: a room I'm not in is viewed with a Join button, never joined", () => {
+  eq(roomStage(null, null, "lounge", false), { joined: false, join: true, joinDisabled: false });
+  const other = { ...voice("room"), channelId: "den" };
+  eq(roomStage(other, null, "lounge", false), { joined: false, join: true, joinDisabled: false }, "in another room: Join moves me");
+  eq(roomStage(voice("call"), call("active"), "lounge", false), { joined: false, join: true, joinDisabled: true }, "in a DM call");
+  eq(roomStage(null, call("ringing-out"), "lounge", false).joinDisabled, true, "a call ringing out");
+});
+
+test("room view: the room I'm in shows its stage and no Join button", () => {
+  eq(roomStage(voice("room"), null, "lounge", false), { joined: true, join: false, joinDisabled: false });
+  eq(roomStage(voice("room"), call("ringing-out"), "lounge", false).joined, true);
+});
+
+test("room view: no Join on a server I was removed from", () => {
+  eq(roomStage(null, null, "lounge", true).join, false);
 });

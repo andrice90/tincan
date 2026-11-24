@@ -112,7 +112,9 @@
 .content-card,
 .composer-slot,
 .composer-slot-inner,
-.right-card {
+.right-col,
+.right-card,
+.right-composer {
   display: contents;
 }
 

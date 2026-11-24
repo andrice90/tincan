@@ -1,9 +1,9 @@
-// A text channel, a voice room's chat, or a DM: header, history, composer.
+// A text channel, a voice room's chat panel, or a DM: header, history, composer.
 
 import { useEffect } from "react";
-import { Hash, Phone, Users, Volume2 } from "lucide-react";
+import { Hash, Phone, Users } from "lucide-react";
 import type { Channel, DmSummary, ServerSummary } from "../api/types";
-import { joinVoice, openDialog, startCall, toggleMembers, watchDm } from "../store/actions";
+import { openDialog, startCall, toggleMembers, watchDm } from "../store/actions";
 import type { ComposerSpot } from "../store/dock";
 import { convKey, useStore } from "../store/store";
 import { Avatar, ICON, IconButton, PersonName } from "./common";
@@ -13,9 +13,9 @@ import { VoiceStage } from "./VoiceView";
 
 
 /**
- * History of a server channel, with its composer unless `composer` is
- * false (a channel page: the shell's composer slot has them). A voice room's chat panel
- * keeps its own.
+ * History of a server channel, with its composer unless `composer` is false (a text
+ * channel, and a voice room's chat in Floating: the shell's composer cards have them).
+ * A voice room's chat panel in Classic keeps its own.
  */
 export function ChannelMessages({ server, channel, composer = true }: { server: ServerSummary; channel: Channel; composer?: boolean }) {
   const meId = useStore((s) => s.me?.userId ?? "");
@@ -42,30 +42,22 @@ export function ChannelMessages({ server, channel, composer = true }: { server: 
 }
 
 /**
- * A server text channel, or a voice room's chat as the whole page (opened from the sidebar,
- * without joining voice). Mount with key = channel id so local state resets per channel.
+ * A server text channel (a voice room's chat is only ever the panel beside its tiles).
+ * Mount with key = channel id so local state resets per channel.
  */
 export function ChannelChat({ server, channel }: { server: ServerSummary; channel: Channel }) {
   const showMembers = useStore((s) => s.showMembers);
-  const room = channel.kind === "voice";
-  const joined = useStore((s) => s.voice?.kind === "room" && s.voice.channelId === channel.id);
-  const inCall = useStore((s) => s.call !== null);
 
   return (
     <>
       <header className="main-header">
         <h1 className="main-title">
-          {room ? <Volume2 size={ICON} aria-hidden="true" className="faint" /> : <Hash size={ICON} aria-hidden="true" className="faint" />}
+          <Hash size={ICON} aria-hidden="true" className="faint" />
           <span className="truncate">
             <bdi>{channel.name}</bdi>
           </span>
         </h1>
         <div className="main-actions">
-          {room && !joined && !server.removed && (
-            <button type="button" className="btn btn-primary btn-sm" disabled={inCall} onClick={() => joinVoice(server.id, channel.id)}>
-              Join voice
-            </button>
-          )}
           <IconButton label={showMembers ? "Hide members" : "Show members"} pressed={showMembers} onClick={toggleMembers}>
             <Users size={ICON} />
           </IconButton>

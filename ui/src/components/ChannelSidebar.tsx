@@ -4,8 +4,8 @@
 import { ChevronDown, Hash, HeadphoneOff, Image as ImageIcon, ImageOff, LogOut, MessageSquare, MicOff, Monitor, Pencil, Plus, Trash2, UserPlus, Volume2 } from "lucide-react";
 import { memo, useMemo, useRef, type MouseEvent, type ReactNode } from "react";
 import type { Channel, Connection, Member, ServerSummary, VoiceSession } from "../api/types";
-import { openDialog, openRoomChat, pickImageFor, removeServerIcon, selectChannel } from "../store/actions";
-import { roomChatMode } from "../store/chatView";
+import { openDialog, pickImageFor, removeServerIcon, roomChatButton, selectChannel } from "../store/actions";
+import { roomChatShown } from "../store/chatView";
 import { useStore } from "../store/store";
 import { unreadBadge } from "../lib/unread";
 import { ICON_SM, IconButton, PersonName, SpeakingAvatar, UnreadBadge } from "./common";
@@ -210,7 +210,7 @@ function VoiceRoomRow({
 }) {
   const ctx = useChannelMenu(server, channel);
   // the dot stays until the room's chat itself is on screen (its tiles alone don't count)
-  const chatShown = useStore((s) => roomChatMode(s.view, channel, s.roomChatPanel) !== null);
+  const chatShown = useStore((s) => roomChatShown(s.view, channel, s.roomChatPanel));
   const people: RoomPerson[] = useMemo(() => {
     if (voice?.kind === "room" && voice.channelId === channel.id) {
       return voice.participants.map((p) => ({
@@ -245,7 +245,13 @@ function VoiceRoomRow({
           </span>
           {badge && <UnreadBadge badge={badge} />}
         </button>
-        <IconButton small className="room-chat-btn" label={`Open chat for ${channel.name}`} onClick={() => openRoomChat(server.id, channel)}>
+        <IconButton
+          small
+          className="room-chat-btn"
+          label={`Chat in ${channel.name}`}
+          pressed={chatShown}
+          onClick={() => roomChatButton(server.id, channel)}
+        >
           <MessageSquare size={ICON_SM} />
         </IconButton>
       </div>

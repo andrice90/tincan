@@ -11,11 +11,9 @@ const channels = { s1: [text, room], s2: [bookText] };
 const dm = { convId: "d1", userId: "u1", name: "Alex" } as DmSummary;
 const servers = [server, removed];
 
-test("dock: the composer goes with a text channel, a room's chat page and a DM", () => {
+test("dock: the composer goes with a text channel and a DM", () => {
   const t = composerSpot({ kind: "server", serverId: "s1", channelId: "general" }, servers, channels, [dm]);
   eq(t && [t.convId, t.channelId, t.placeholder, t.removed], ["s1", "general", "Message #general", false]);
-  const page = composerSpot({ kind: "server", serverId: "s1", channelId: "lounge", chat: true }, servers, channels, [dm]);
-  eq(page && [page.channelId, page.placeholder], ["lounge", "Message Lounge"]);
   const d = composerSpot({ kind: "dms", convId: "d1" }, servers, channels, [dm]);
   eq(d && [d.convId, d.channelId, d.placeholder], ["d1", null, "Message Alex"]);
 });
@@ -44,21 +42,32 @@ test("dock: a removed server's composer becomes the removed note, and the sig te
   eq(a?.sig === renamed?.sig, false, "a rename changes the placeholder");
 });
 
-test("dock: the member list goes with chat pages when shown", () => {
-  const onText = rightPanel({ kind: "server", serverId: "s1", channelId: "general" }, channels, true, false, "classic");
+test("dock: the member list goes with text channels when shown", () => {
+  const onText = rightPanel({ kind: "server", serverId: "s1", channelId: "general" }, servers, channels, true, false, "classic");
   eq(onText?.kind, "members");
-  eq(rightPanel({ kind: "server", serverId: "s1", channelId: "general" }, channels, false, false, "floating"), null);
-  const page = rightPanel({ kind: "server", serverId: "s1", channelId: "lounge", chat: true }, channels, true, true, "floating");
-  eq(page?.kind, "members", "a room's chat page shows members, not a second chat");
-  eq(rightPanel({ kind: "dms", convId: "d1" }, channels, true, true, "floating"), null);
-  eq(rightPanel({ kind: "home" }, channels, true, true, "floating"), null);
+  eq(rightPanel({ kind: "server", serverId: "s1", channelId: "general" }, servers, channels, false, false, "floating"), null);
+  eq(rightPanel({ kind: "dms", convId: "d1" }, servers, channels, true, true, "floating"), null);
+  eq(rightPanel({ kind: "home" }, servers, channels, true, true, "floating"), null);
 });
 
-test("dock: a room's chat panel is the right card in Floating only", () => {
+test("chat panel: a room's chat is the right card in Floating only, open while its panel is", () => {
   const tiles = { kind: "server", serverId: "s1", channelId: "lounge" } as const;
-  eq(rightPanel(tiles, channels, true, true, "classic"), null, "Classic keeps it under the room header");
-  eq(rightPanel(tiles, channels, true, false, "floating"), null, "closed panel");
-  const chat = rightPanel(tiles, channels, false, true, "floating");
+  eq(rightPanel(tiles, servers, channels, true, true, "classic"), null, "Classic keeps it beside the tiles");
+  eq(rightPanel(tiles, servers, channels, true, false, "floating"), null, "closed panel");
+  const chat = rightPanel(tiles, servers, channels, false, true, "floating");
   eq(chat && chat.kind === "room-chat" ? [chat.serverId, chat.channelId] : null, ["s1", "lounge"]);
-  eq(rightPanel(tiles, channels, true, false, "classic"), null, "no members beside the tiles");
+  eq(rightPanel(tiles, servers, channels, true, false, "classic"), null, "no members beside the tiles");
+  eq(rightPanel(tiles, servers, channels, true, false, "floating"), null, "no members beside the tiles in Floating either");
+});
+
+test("chat panel: the room's chat brings its own composer card", () => {
+  const tiles = { kind: "server", serverId: "s1", channelId: "lounge" } as const;
+  const chat = rightPanel(tiles, servers, channels, false, true, "floating");
+  const c = chat?.kind === "room-chat" ? chat.composer : null;
+  eq(c && [c.convId, c.channelId, c.placeholder, c.removed], ["s1", "lounge", "Message Lounge", false]);
+  const renamed = rightPanel(tiles, servers, { ...channels, s1: [text, { ...room, name: "Den" }] }, false, true, "floating");
+  eq(chat?.sig === renamed?.sig, false, "a rename gives a new composer");
+  const gone = { ...removed, id: "s1" };
+  const r = rightPanel(tiles, [gone], channels, false, true, "floating");
+  eq(r?.kind === "room-chat" && r.composer.removed, true, "removed: the note in place of the composer");
 });
