@@ -7463,7 +7463,7 @@ dependencies = [
 
 [[package]]
 name = "tincan"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -7481,7 +7481,7 @@ dependencies = [
 
 [[package]]
 name = "tincan-app"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "parking_lot",
@@ -7500,7 +7500,7 @@ dependencies = [
 
 [[package]]
 name = "tincan-audio"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7527,7 +7527,7 @@ dependencies = [
 
 [[package]]
 name = "tincan-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "blake3",
@@ -7545,7 +7545,7 @@ dependencies = [
 
 [[package]]
 name = "tincan-files"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7563,7 +7563,7 @@ dependencies = [
 
 [[package]]
 name = "tincan-net"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -7593,7 +7593,7 @@ dependencies = [
 
 [[package]]
 name = "tincan-screen"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7609,7 +7609,7 @@ dependencies = [
 
 [[package]]
 name = "tincan-store"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "parking_lot",

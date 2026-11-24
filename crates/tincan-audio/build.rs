@@ -10,5 +10,7 @@ fn main() {
     println!("cargo::rerun-if-changed={}", path.display());
     if path.is_file() {
         println!("cargo::rustc-cfg=dpdfnet_model");
+    } else if std::env::var("PROFILE").as_deref() == Ok("release") {
+        println!("cargo::warning=no DPDFNet model: this build has no AI noise suppression (run scripts/fetch-dpdfnet.ps1)");
     }
 }

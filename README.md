@@ -51,11 +51,13 @@ cd ui && pnpm install && pnpm typecheck && pnpm test && pnpm build
 # Dev run: Vite plus the debug app, using a separate "dev" profile
 cd ui && TINCAN_PROFILE=dev pnpm tauri dev
 
-# Release exe and NSIS installer
+# Release exe and NSIS installer (downloads the noise suppression model first)
 cd ui && pnpm tauri build
 # target/release/tincan.exe
-# target/release/bundle/nsis/Tincan_0.1.0_x64-setup.exe
+# target/release/bundle/nsis/Tincan_0.2.1_x64-setup.exe
 ```
+
+- **AI noise suppression model:** `scripts/fetch-dpdfnet.ps1` downloads DPDFNet (10 MB, pinned version, checked against its sha256) into `crates/tincan-audio/models/`, which is git-ignored, and the build embeds it. `pnpm tauri build` runs the script; for other builds run it yourself. Without the model the app builds and keeps WebRTC noise suppression only.
 
 - **Profiles:** pass `--profile <name>` or set `TINCAN_PROFILE`. Each profile keeps its own data in `%APPDATA%\Tincan\profiles\<name>`.
 - **Log file:** each run writes `logs\tincan.log` in its profile folder. `TINCAN_LOG=<filter>` changes what is logged and also prints the log to the console.
@@ -90,5 +92,7 @@ Version 0.1.0 is an early test build:
 ## License
 
 Tincan is licensed under the [Apache License, Version 2.0](LICENSE).
+
+Builds made with the model include DPDFNet by Ceva (`dpdfnet2_48khz_hr`, [github.com/ceva-ip/DPDFNet](https://github.com/ceva-ip/DPDFNet), [huggingface.co/Ceva-IP/DPDFNet](https://huggingface.co/Ceva-IP/DPDFNet)), also under the Apache License, Version 2.0.
 
 The repository and the release contain no third-party sounds, so the join and leave cues in voice rooms are silent by default. To hear them, put your own sounds in `crates/tincan-app/assets/` as `voice-join.wav` and `voice-leave.wav` (WAV, up to 10 seconds) before building. The build embeds them when both files are present; that folder is git-ignored.

@@ -6,7 +6,7 @@
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "pnpm --dir ../ui dev",
-    "beforeBuildCommand": "pnpm --dir ../ui build"
+    "beforeBuildCommand": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/fetch-dpdfnet.ps1 && pnpm --dir ../ui build"
   },
   "app": {
     "windows": [],
