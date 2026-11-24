@@ -513,6 +513,15 @@ async function flowE(a, b) {
   await pop.waitFor({ timeout: 5000 });
   check("stage right click opens the share volume", (await pop.getByLabel("Screen share volume").count()) === 1);
   await b.page.keyboard.press("Escape");
+  // While Alice shares, her tile menu and her member list menu have all three volumes.
+  const volumes = ["Volume", "Soundboard volume", "Screen share volume"];
+  const hasAll = async (scope) => (await Promise.all(volumes.map((l) => scope.getByLabel(l, { exact: true }).count()))).every((n) => n === 1);
+  await b.page.getByRole("button", { name: "Watch Alice's screen" }).click({ button: "right" });
+  const tileMenu = b.page.getByRole("dialog", { name: "Alice options" });
+  await tileMenu.waitFor({ timeout: 5000 });
+  await tileMenu.getByLabel("Volume", { exact: true }).waitFor({ timeout: 5000 });
+  check("tile menu has volume, soundboard and share volume", await hasAll(tileMenu));
+  await b.page.keyboard.press("Escape");
   await sleep(1500);
 
   // read the colours from a CDP screenshot of B's window
@@ -542,6 +551,17 @@ async function flowE(a, b) {
   check("B's canvas shows blue bottom left", near(samples.blue, [0, 0, 255]), JSON.stringify(samples.blue));
   check("B's canvas shows yellow bottom right", near(samples.yellow, [255, 255, 0]), JSON.stringify(samples.yellow));
   check("canvas has the window's aspect", Math.abs(geo.cw / geo.ch - 656 / 519) < 0.12, `${geo.cw}x${geo.ch}`);
+
+  // The member list (beside a text channel; a voice room has none) has them too while
+  // Alice shares in B's voice session.
+  await openChannel(b, "general");
+  await b.page.locator("aside.members button.member-row", { hasText: "Alice" }).click({ button: "right" });
+  const memberMenu = b.page.getByLabel("Alice menu");
+  await memberMenu.getByLabel("Volume", { exact: true }).waitFor({ timeout: 5000 });
+  check("member menu has volume, soundboard and share volume", await hasAll(memberMenu));
+  await b.page.keyboard.press("Escape");
+  await openChannel(b, "Lounge");
+  await b.page.waitForSelector(`canvas[aria-label="Alice's screen"]`, { timeout: 15000 });
 
   // stop sharing; B's stage goes back to tiles
   t = now();

@@ -19,7 +19,7 @@ Status of the Tincan build for the next session. Updated at every milestone comm
 - **Volumes:** right-click a member or a voice tile for Volume and Soundboard volume; right-click a voice room for its Soundboard volume. All saved on this PC.
 - **Names:** display names only. The short id shows only when two names look alike (SECURITY-4).
 - The soundboard closes on a click outside it.
-- Not verified: the two-profile UI e2e was not run for this change, and nothing on real audio hardware.
+- Verified after the screen share audio merge: the two-profile UI e2e (55 checks, docs/e2e.md). Not verified: nothing on real audio hardware.
 
 ### Third round (2026-11-24)
 
