@@ -349,7 +349,7 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
   - The PCM comes from the cache (at most 4 clips or 2 M samples, dropped on leaving voice) or a fresh decode.
   - `engine.play_clip` (under `st`, so its `ClipFinished(id)` can't be handled before the id is recorded in `State.playing`), then `voice-updated` with the hash in `VoiceSession.playingClips`, then the clip is shared with the session's conversation (the server of the room, or the DM of the call), then `net.sound_played(ClipInfo)`. Playing works while muted.
   - `AudioEvent::ClipFinished(id)` removes the id and re-sends `voice-updated`. `playingClips` is cleared on detach and when the engine dies (its ids and clips die with it).
-- **`clip_stop { hash }`:** `engine.stop_clip(id)` for every play of that hash of mine. The engine fades the local and the sent copy out over 5 ms; `ClipFinished` then drops it from `playingClips`. Nothing playing is a no-op.
+- **`clip_stop { hash }`:** `engine.stop_clip(id)` for every play of that hash of mine. The engine fades the local and the sent copy out over 5 ms. The ids leave `playingClips` at once (and `voice-updated` follows), so the tile can't stay lit if no `ClipFinished` comes. Nothing playing is a no-op.
 - **Incoming `SoundPlayed`:**
   - Only for my attached session, and at most one per player every 250 ms (the throttle is cleared on detach).
   - Announcements over 5 MiB or about 20 s are ignored. Peer names are cleaned of control and hidden format characters and cut to 32 characters.

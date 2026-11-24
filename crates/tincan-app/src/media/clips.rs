@@ -407,14 +407,23 @@ impl Media {
 
     /// `clip_stop`: stop every play of `hash` of mine, here and in the call at once.
     /// `VoiceSession.playingClips` drops it when the engine reports the clips over.
-    pub(super) fn clip_stop(&self, _core: &Arc<Core>, hash: BlobHash) {
-        let st = self.st.lock();
+    pub(super) fn clip_stop(&self, core: &Arc<Core>, hash: BlobHash) {
+        let mut st = self.st.lock();
         let ids: Vec<u64> = st.playing.iter().filter(|(_, h)| **h == hash).map(|(id, _)| *id).collect();
+        if ids.is_empty() {
+            return;
+        }
         if let Some(e) = self.engine_handle() {
-            for id in ids {
-                e.stop_clip(id);
+            for id in &ids {
+                e.stop_clip(*id);
             }
         }
+        // Dropped here, not on ClipFinished: the tile must not stay lit if that never comes
+        // (an engine replaced in between). A late ClipFinished then finds nothing to remove.
+        for id in ids {
+            st.playing.remove(&id);
+        }
+        self.emit_voice(core, &mut st);
     }
 
     fn check_can_play(&self) -> Result<(), String> {
