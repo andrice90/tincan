@@ -1,0 +1,94 @@
+<p align="center">
+  <img src="src-tauri/icons/icon.svg" width="128" height="128" alt="Tincan logo: a tin can sending out sound waves">
+</p>
+
+<h1 align="center">Tincan</h1>
+
+<p align="center">Peer-to-peer group chat, voice and screen share for Windows. No accounts, and no server to run.</p>
+
+Tincan is a Discord-style app where the people in a server host it themselves. The most stable member online acts as host. When the host leaves, another member takes over, and voice or screen share drops for a moment while that happens. Messages and files are stored on each member's PC and sync between them.
+
+## Features
+
+- **Servers:** text channels and voice rooms. Every voice room also has its own text chat.
+- **Direct messages:** one-to-one, plus 1:1 voice calls.
+- **Screen sharing:** share a screen or a window in a voice room or a call.
+- **File attachments:** files travel peer to peer and keep downloading from other members who have them after the sender goes offline.
+- **Soundboard:** play short clips into a call. Others pull a clip peer to peer and become a source for it.
+- **Short codes:** 6-character server invite codes and friend codes. The owner rotates an invite code without current members losing access.
+- **Owner tools:** remove a member (they can rejoin only with an invite that still works), rename and delete channels.
+- **Avatars and server icons**, with a crop window.
+- **Join and leave sounds** in voice rooms.
+- **Two layouts:** Floating (the default: rounded cards with animated panels) and Classic (flat panels), set in Settings > Appearance.
+
+## Install
+
+Download `Tincan_0.1.0_x64-setup.exe` from the [latest release](../../releases/latest) and run it.
+
+- Windows 10 or 11, 64-bit. Screen sharing needs Windows 10 version 2004 or newer.
+- The installer is per user and needs no admin rights. It is not code-signed, so SmartScreen may warn about it: choose **More info**, then **Run anyway**.
+- Every member of a server needs the same version. Older builds can't read events added in newer ones.
+
+## Using it
+
+1. Pick a display name.
+2. Create a server, then open **Invite people** and share its 6-character code. Or join someone else's server with their code.
+3. To message someone directly, add them by their friend code (Settings shows yours).
+
+By default Tincan uses n0's public iroh relays to find peers and as a fallback when a direct connection isn't possible. Those relays are rate-limited and come with no guarantee. A custom relay URL can be set in Settings > Network.
+
+## Build from source
+
+You need Rust (1.91 or newer), Node 22 and pnpm 10. Run these from the repository root unless noted.
+
+```sh
+# Rust tests (all crates)
+cargo test --workspace
+
+# UI checks
+cd ui && pnpm install && pnpm typecheck && pnpm test && pnpm build
+
+# Dev run: Vite plus the debug app, using a separate "dev" profile
+cd ui && TINCAN_PROFILE=dev pnpm tauri dev
+
+# Release exe and NSIS installer
+cd ui && pnpm tauri build
+# target/release/tincan.exe
+# target/release/bundle/nsis/Tincan_0.1.0_x64-setup.exe
+```
+
+- **Profiles:** pass `--profile <name>` or set `TINCAN_PROFILE`. Each profile keeps its own data in `%APPDATA%\Tincan\profiles\<name>`.
+- **Log file:** each run writes `logs\tincan.log` in its profile folder. `TINCAN_LOG=<filter>` changes what is logged and also prints the log to the console.
+
+## How it works
+
+- **Stack:** a Rust core (iroh QUIC, SQLite, Opus, Windows Graphics Capture and Media Foundation H.264) inside a Tauri 2 shell, with a React UI. All audio and capture is native; the webview only draws the UI and decoded video.
+- **History:** each server's history is a signed, append-only event log that every member keeps.
+- **Hosting:** the host orders events, relays voice and video for the members, and is elected again whenever it leaves.
+- **Encryption:** media is not end-to-end encrypted in this version, so the host can read voice and video passing through it.
+
+The docs in [`docs/`](docs) go further:
+
+- [`architecture.md`](docs/architecture.md): design and the security model.
+- [`api.md`](docs/api.md): the UI-to-app contract.
+- [`design.md`](docs/design.md): screens and visual tokens.
+- [`e2e.md`](docs/e2e.md): the two-profile end-to-end run.
+- [`review/`](docs/review): security review findings and their status.
+- [`HANDOFF.md`](docs/HANDOFF.md): current status and open questions.
+
+## Status
+
+Version 0.1.0 is an early test build:
+
+- **Tested:** two profiles on one PC (offline and online), plus Rust and UI test suites.
+- **Not tested yet:**
+  - hole punching across networks;
+  - relay throughput for voice and video;
+  - echo cancellation in a real room;
+  - the installer on a clean machine.
+
+## License
+
+Tincan is licensed under the [Apache License, Version 2.0](LICENSE).
+
+The join and leave sounds in `crates/tincan-app/assets/` (`voice-join.wav`, `voice-leave.wav`) are not covered by that license. They come from a third-party royalty-free sound pack and keep that pack's terms. Replace them before redistributing Tincan outside those terms.
