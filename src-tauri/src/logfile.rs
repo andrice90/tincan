@@ -44,10 +44,16 @@ pub struct CappedFile {
 impl CappedFile {
     fn write_line(&self, buf: &[u8]) -> io::Result<usize> {
         let n = buf.len() as u64;
-        if self.written.fetch_add(n, Ordering::Relaxed) + n > self.cap {
+        let before = self.written.fetch_add(n, Ordering::Relaxed);
+        let mut f = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        if before + n > self.cap {
+            // say once that the rest of this run is not logged, so a short log is not
+            // mistaken for a quiet run
+            if before <= self.cap {
+                f.write_all(b"--- log cap reached; nothing more is written this run ---\n")?;
+            }
             return Ok(buf.len());
         }
-        let mut f = self.file.lock().unwrap_or_else(|p| p.into_inner());
         f.write_all(buf)?;
         Ok(buf.len())
     }
@@ -75,7 +81,8 @@ mod tests {
         (&capped).write_all(b"12345678").unwrap();
         (&capped).write_all(b"abcdef").unwrap();
         (&capped).flush().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"12345678");
+        (&capped).write_all(b"more").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"12345678--- log cap reached; nothing more is written this run ---\n");
     }
 
     #[test]
