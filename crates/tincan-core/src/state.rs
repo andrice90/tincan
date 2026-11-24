@@ -73,9 +73,14 @@
 //!   re-admitting each other, and a removed user from coming back through a fresh key it
 //!   admitted at a void seq (a puppet): such a key is `unrooted`, no member, all its events
 //!   void.
+//! - An admit through an invite whose creator was removed after creating it (the invite's
+//!   seq is at or below the cut) and before the admit, by (hlc, id), is never trusted
+//!   ([`ConvState::invite_cut`]): it neither admits anyone nor clears a removal, and the
+//!   invite stays dead even after the creator is re-admitted. Admits through it from before
+//!   the removal are unaffected, so a removal never cascades onto those its invites let in.
 //! - A void event is stored and synced, with no effect: void messages are hidden
-//!   ([`ConvState::event_valid`]), a void Profile does not name anyone, an invite created at
-//!   a void seq admits nobody ([`ConvState::invite_status`]), and a void admit does not clear
+//!   ([`ConvState::event_valid`]), a void Profile or ProfileImage changes nothing, an invite
+//!   created at a void seq admits nobody ([`ConvState::invite_status`]), and a void admit does not clear
 //!   a removal. `is_member` is false while a removal is uncleared.
 //! - Still applied from void events: a Delete of the author's own message, InviteRevoke,
 //!   MemberLeave, and a MemberAdmit of someone else (whose admittee stays unrooted unless a
@@ -223,6 +228,8 @@ pub struct AdmitRecord {
     pub by: UserId,
     /// The signer's seq for it.
     pub by_seq: u64,
+    /// The invite it used.
+    pub invite_pk: [u8; 32],
 }
 
 /// One `MemberRemove` naming a member.
@@ -373,7 +380,8 @@ pub struct InviteState {
     /// hlc of the `InviteCreate` (orders the owner's short-code invites, newest first).
     pub created_hlc: u64,
     /// The creator's seq for the InviteCreate. An invite created at a void seq (its creator
-    /// had been removed) admits nobody: `ConvState::invite_status` calls it Revoked.
+    /// had been removed), or before a removal of its creator, admits nobody:
+    /// `ConvState::invite_status` calls it Revoked (see [`ConvState::invite_cut`]).
     pub created_seq: u64,
 }
 
@@ -578,7 +586,7 @@ impl ConvState {
     /// `MemberAdmit` (revocation and `max_uses` are not part of event validation).
     pub fn invite_status(&self, invite_pk: &[u8; 32], now_ms: u64) -> Result<&InviteState, InviteProblem> {
         let inv = self.invites.get(invite_pk).ok_or(InviteProblem::Unknown)?;
-        if inv.revoked || !self.event_valid(&inv.creator, inv.created_seq) {
+        if inv.revoked || self.invite_cut(inv, None) || !self.event_valid(&inv.creator, inv.created_seq) {
             Err(InviteProblem::Revoked)
         } else if now_ms > inv.expires_ms {
             Err(InviteProblem::Expired)
@@ -587,6 +595,20 @@ impl ConvState {
         } else {
             Ok(inv)
         }
+    }
+
+    /// Was `inv` created before a removal of its creator (at or below that removal's cut)?
+    /// Such an invite is dead for every admit after the removal by (hlc, id), and for
+    /// [`ConvState::invite_status`] (`before: None`, i.e. now). It stays dead after the
+    /// creator is re-admitted: only invites the creator makes after that work. Together with
+    /// the void-seq rule this covers every invite of a creator who is removed now, so a
+    /// removed member cannot come back, or bring a fresh key in, through an invite it made
+    /// while still a member. Admits through it from before the removal are untouched. Owner
+    /// invites (short codes included) are never cut: the owner cannot be removed.
+    pub fn invite_cut(&self, inv: &InviteState, before: Option<(u64, EventId)>) -> bool {
+        self.members.get(&inv.creator).is_some_and(|m| {
+            m.removals.iter().any(|r| r.last_seq >= inv.created_seq && before.is_none_or(|k| (r.hlc, r.id) < k))
+        })
     }
 
     /// Short-code invites the owner created that are still usable, newest first, as
@@ -995,7 +1017,7 @@ impl ConvState {
                 }
                 let m = self.members.entry(*user).or_insert_with(|| Member::new(*user, ev.hlc));
                 m.add_admit(*from_seq, ev.hlc);
-                let rec = AdmitRecord { hlc: ev.hlc, id: *id, from_seq: *from_seq, by: ev.author, by_seq: ev.seq };
+                let rec = AdmitRecord { hlc: ev.hlc, id: *id, from_seq: *from_seq, by: ev.author, by_seq: ev.seq, invite_pk: *invite_pk };
                 let pos = m.admit_log.partition_point(|a| (a.hlc, a.id) < (rec.hlc, rec.id));
                 m.admit_log.insert(pos, rec);
                 self.refresh_removals();
@@ -1041,7 +1063,9 @@ impl ConvState {
     /// seqs are void, who is removed or unrooted, and the affected display names.
     ///
     /// An admit is trusted when its signer is the owner, or holds a trusted admit from at or
-    /// before the admit's seq and was valid at that seq. So trust chains back to the owner,
+    /// before the admit's seq and was valid at that seq, and its invite passes the same test
+    /// for the invite's creator and was not cut by a removal of that creator before the admit
+    /// ([`ConvState::invite_cut`]). So trust chains back to the owner,
     /// and nobody admitted by a removed member at a void seq (a puppet) can vouch for anyone.
     /// A re-admit clears a removal only if it is trusted, comes after the removal by
     /// (hlc, id) and has `from_seq > last_seq`. Trust and clearing depend on each other, so
@@ -1069,6 +1093,19 @@ impl ConvState {
                 let Some(m) = self.members.get(u) else { continue };
                 for a in &m.admit_log {
                     if trusted.contains(&a.id) {
+                        continue;
+                    }
+                    // The invite must hold too: not cut by a removal of its creator before
+                    // this admit (never trusted then), and made by the owner or by a rooted
+                    // creator at a valid seq (like the signer). Unknown: only a forced rebuild.
+                    let invite_ok = self.invites.get(&a.invite_pk).is_none_or(|i| {
+                        !self.invite_cut(i, Some((a.hlc, a.id)))
+                            && (Some(i.creator) == owner
+                                || self.members.get(&i.creator).is_some_and(|c| {
+                                    c.seq_valid(i.created_seq) && c.admit_log.iter().any(|b| b.from_seq <= i.created_seq && trusted.contains(&b.id))
+                                }))
+                    });
+                    if !invite_ok {
                         continue;
                     }
                     let ok = Some(a.by) == owner

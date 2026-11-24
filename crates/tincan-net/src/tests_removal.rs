@@ -191,7 +191,7 @@ async fn r4_rejoin_needs_a_current_invite() {
     let mut rx = m.net.subscribe();
     within("remove", Duration::from_secs(10), a.net.remove_member(server, mid)).await.expect("remove");
     removed_event(&mut rx, server).await;
-    // Back through the same invite (removal revokes nothing).
+    // Back through the same invite (the owner's: a removal cuts only the removed member's own).
     let back = within("rejoin", Duration::from_secs(20), m.net.join(&invite)).await.expect("rejoin");
     assert_eq!(back, server);
     assert!(!m.net.is_removed(&server));
@@ -211,6 +211,43 @@ async fn r4_rejoin_needs_a_current_invite() {
     let refused = within("rejoin refused", Duration::from_secs(30), m.net.join(&invite)).await;
     assert!(refused.is_err(), "a revoked invite does not let a removed member back");
     assert!(!member(&a, &server, &mid));
+    for n in [a, b, m] {
+        n.net.shutdown().await;
+    }
+}
+
+/// A removed member cannot come back through an invite it made while still a member: the
+/// host refuses it, and the admit would not count anyway. Another member's current invite
+/// brings it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r7_own_invite_does_not_undo_a_removal() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    let m = node("mallory", fast()).await;
+    wire(&[&a, &b, &m]);
+    let server = a.net.create_server("Test server").await.expect("create");
+    let invite = a.net.create_invite(server).await.expect("invite");
+    for n in [&b, &m] {
+        within("join", Duration::from_secs(20), n.net.join(&invite)).await.expect("join");
+    }
+    let mid = m.net.me();
+    until("mallory connected", Duration::from_secs(10), || host_of(&m, &server) == Some(a.net.me())).await;
+    until("history synced", Duration::from_secs(10), || m.net.conv_state(&server).is_some_and(|s| !s.sorted_channels().is_empty())).await;
+    let own = within("mallory's invite", Duration::from_secs(20), m.net.create_invite(server)).await.expect("invite");
+    let own_pk = tincan_core::invite::Invite::decode(&own).unwrap().invite_pk();
+    until("alice has it", Duration::from_secs(10), || a.net.conv_state(&server).is_some_and(|s| s.invite_status(&own_pk, now_ms()).is_ok())).await;
+    let mut rx = m.net.subscribe();
+    within("remove", Duration::from_secs(10), a.net.remove_member(server, mid)).await.expect("remove");
+    removed_event(&mut rx, server).await;
+    let refused = within("rejoin refused", Duration::from_secs(30), m.net.join(&own)).await;
+    assert!(refused.is_err(), "a removed member came back through its own invite");
+    assert!(m.net.is_removed(&server));
+    assert!(!member(&a, &server, &mid) && !member(&b, &server, &mid));
+    // Bob's current invite works.
+    let bobs = within("bob's invite", Duration::from_secs(20), b.net.create_invite(server)).await.expect("invite");
+    let back = within("rejoin", Duration::from_secs(30), m.net.join(&bobs)).await.expect("rejoin");
+    assert_eq!(back, server);
+    until("a member again", Duration::from_secs(10), || member(&a, &server, &mid) && member(&b, &server, &mid)).await;
     for n in [a, b, m] {
         n.net.shutdown().await;
     }

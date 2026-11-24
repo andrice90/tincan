@@ -577,7 +577,8 @@ impl Net {
 
     /// Remove `user` from `server` (owner only): publishes `MemberRemove` with my head for
     /// them as the cut. The host then drops their connection and refuses them until a
-    /// re-admit; they can come back only through an invite that still works.
+    /// re-admit; they can come back only through someone else's invite that still works
+    /// (their own invites from before the removal are dead, `ConvState::invite_cut`).
     pub async fn remove_member(&self, server: ServerId, user: UserId) -> Result<StoredEvent> {
         let ok = self.inner.replica(&server).map(|r| {
             let r = r.lock();

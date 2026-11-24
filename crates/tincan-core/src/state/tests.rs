@@ -524,6 +524,62 @@ fn a_late_removal_hides_an_avatar_set_after_its_cut() {
 }
 
 #[test]
+fn a_removed_members_own_invites_stay_dead() {
+    let mut fx = Fx::new();
+    let host = fx.member("host");
+    let m = fx.member("m");
+    let mine = [40; 32];
+    fx.ok(&m, Body::InviteCreate { invite_pk: mine, expires_ms: NEVER, max_uses: 0 });
+    assert!(fx.state.invite_status(&mine, NOW).is_ok());
+    // x joined through m's invite before the removal: unaffected by it.
+    let x = Identity::generate();
+    fx.ok(&host, Body::MemberAdmit { user: x.user(), invite_pk: mine, from_seq: 1 });
+    remove(&mut fx, &m);
+    assert_eq!(fx.state.invite_status(&mine, NOW).err(), Some(InviteProblem::Revoked), "made before the cut");
+    assert!(fx.state.is_member(&x.user()), "no cascade onto those it let in before");
+    // A host that admits through it anyway (stale, or relaying on purpose) clears nothing.
+    let from = fx.next_seq(&m);
+    fx.ok(&host, Body::MemberAdmit { user: m.user(), invite_pk: mine, from_seq: from });
+    assert!(fx.state.is_removed(&m.user()), "m came back through its own invite");
+    // Nor can it bring a fresh key in.
+    let y = Identity::generate();
+    fx.ok(&host, Body::MemberAdmit { user: y.user(), invite_pk: mine, from_seq: 1 });
+    assert!(!fx.state.is_member(&y.user()) && fx.state.is_removed(&y.user()));
+    // An owner's or another member's current invite brings m back.
+    let hosts = [41; 32];
+    fx.ok(&host, Body::InviteCreate { invite_pk: hosts, expires_ms: NEVER, max_uses: 0 });
+    assert!(fx.state.invite_status(&hosts, NOW).is_ok());
+    fx.ok(&host, Body::MemberAdmit { user: m.user(), invite_pk: hosts, from_seq: from });
+    assert!(fx.state.is_member(&m.user()));
+    // The old invite stays dead after the re-admit; a new one of m's works.
+    assert_eq!(fx.state.invite_status(&mine, NOW).err(), Some(InviteProblem::Revoked));
+    assert!(!fx.state.is_member(&y.user()));
+    let fresh = [42; 32];
+    fx.ok(&m, Body::InviteCreate { invite_pk: fresh, expires_ms: NEVER, max_uses: 0 });
+    assert!(fx.state.invite_status(&fresh, NOW).is_ok());
+    // The owner's invites are never cut.
+    assert!(fx.state.invite_status(&fx.invite, NOW).is_ok());
+}
+
+#[test]
+fn a_kick_leaves_the_short_code_alone() {
+    use crate::code::marker_max_uses;
+    let mut fx = Fx::new();
+    let o = fx.owner.clone();
+    let m = fx.member("m");
+    let code = [61u8; 32];
+    fx.ok(&o, Body::InviteCreate { invite_pk: code, expires_ms: NEVER, max_uses: marker_max_uses(1) });
+    let before = fx.state.short_code_invites();
+    remove(&mut fx, &m);
+    assert_eq!(fx.state.short_code_invites(), before);
+    assert!(fx.state.invite_status(&code, NOW).is_ok());
+    // The removed member rejoins through it.
+    let from = fx.next_seq(&m);
+    fx.ok(&o, Body::MemberAdmit { user: m.user(), invite_pk: code, from_seq: from });
+    assert!(fx.state.is_member(&m.user()));
+}
+
+#[test]
 fn removal_ignores_an_earlier_concurrent_readmit() {
     // m left and was re-admitted; the owner, not having seen that yet, removes m with an
     // older cut. The re-admit came before the removal, so it does not undo it.
@@ -1000,15 +1056,24 @@ fn scenario() -> (ConvId, Vec<StoredEvent>, ConvState) {
     fx.ok(&r, named("r"));
     fx.ok(&r, text(fx.general, "before the removal"));
     fx.ok(&r, Body::ProfileImage { image: Some(img(5)) });
+    let r_inv = [5; 32];
+    fx.ok(&r, Body::InviteCreate { invite_pk: r_inv, expires_ms: NEVER, max_uses: 0 });
+    let e = Identity::generate();
+    fx.ok(&host, Body::MemberAdmit { user: e.user(), invite_pk: r_inv, from_seq: 1 });
+    fx.ok(&e, named("e"));
     let cut = fx.next_seq(&r) - 1;
     fx.ok(&r, text(fx.general, "concurrent with the removal"));
     fx.ok(&o, Body::MemberRemove { user: r.user(), last_seq: cut });
     fx.ok(&r, named("void name"));
     fx.ok(&r, Body::ProfileImage { image: Some(img(6)) });
     fx.ok(&r, Body::InviteCreate { invite_pk: [4; 32], expires_ms: NEVER, max_uses: 0 });
+    let late = Identity::generate();
+    fx.ok(&host, Body::MemberAdmit { user: late.user(), invite_pk: r_inv, from_seq: 1 });
+    fx.ok(&late, named("late"));
     let self_from = fx.next_seq(&r) + 1;
     fx.ok(&r, Body::MemberAdmit { user: r.user(), invite_pk: fx.invite, from_seq: self_from });
     let back = fx.next_seq(&r);
+    fx.ok(&host, Body::MemberAdmit { user: r.user(), invite_pk: r_inv, from_seq: back });
     fx.ok(&host, Body::MemberAdmit { user: r.user(), invite_pk: fx.invite, from_seq: back });
     fx.ok(&r, named("r back"));
     fx.ok(&r, text(fx.general, "back again"));
@@ -1029,6 +1094,9 @@ fn scenario() -> (ConvId, Vec<StoredEvent>, ConvState) {
     assert_eq!(st.invite_status(&[4; 32], NOW).err(), Some(InviteProblem::Revoked));
     assert!(st.is_removed(&d.user()) && !st.is_member(&d.user()));
     assert_eq!(st.display_name(&d.user()), "d");
+    assert!(st.is_member(&e.user()), "joined through r's invite before the removal");
+    assert!(st.is_removed(&late.user()) && !st.is_member(&late.user()), "joined through r's invite after it");
+    assert_eq!(st.invite_status(&r_inv, NOW).err(), Some(InviteProblem::Revoked));
     assert_eq!(st.members[&r.user()].avatar, Some(img(5)), "r's void avatar never shows");
     assert_eq!(st.members[&d.user()].avatar, Some(img(7)));
     for u in [host.user(), a.user(), b.user(), c.user()] {
