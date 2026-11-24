@@ -6,8 +6,9 @@
 //! - `TINCAN_PROFILE`: profile name when `--profile` is not given (default `default`).
 //! - `TINCAN_OFFLINE_NETWORK=1`, `TINCAN_NO_DEVICES=1`: set the matching `TestOptions`
 //!   (end-to-end runs of several profiles on one machine). Unset in normal use.
-//! - `TINCAN_LOG=<filter>`: diagnostics to stderr, an `EnvFilter` such as `info` or
-//!   `warn,tincan_audio=info`. Off when unset (no subscriber, no cost).
+//! - `TINCAN_LOG=<filter>`: an `EnvFilter` such as `info` or `warn,tincan_audio=info`, for
+//!   the log file and also stderr. Unset: the log file only, with `logfile::DEFAULT_FILTER`.
+//!   The log is `%APPDATA%\Tincan\profiles\<profile>\logs\tincan.log`.
 //!
 //! Running: the Tauri CLI must start in the repository root (it finds `src-tauri` below
 //! it), so `ui/package.json` has `"tauri": "cd .. && tauri"`. From `ui/`:
@@ -26,6 +27,7 @@ mod events;
 mod exit;
 mod gate;
 mod instance;
+mod logfile;
 mod profile;
 mod protocol;
 
@@ -85,8 +87,6 @@ fn main() {
     // SAFETY: first statement of the process; no other thread exists yet, so nothing can read
     // the environment concurrently. iroh-blobs' FsStore sizes its own runtime from this.
     unsafe { std::env::set_var("TOKIO_WORKER_THREADS", "2") };
-    init_logging();
-
     let profile = profile::select(std::env::args_os().skip(1), std::env::var_os(profile::PROFILE_ENV));
     // Before the runtime and the window: a launch of a profile that is already open ends here.
     let primary = match &profile {
@@ -100,6 +100,8 @@ fn main() {
         },
         Err(_) => None,
     };
+    // After the instance check: only the instance that runs the profile writes its log.
+    init_logging(profile.as_ref().ok().map(String::as_str));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(3)
         .thread_name("tincan-rt")
@@ -144,21 +146,42 @@ fn main() {
     drop(runtime);
 }
 
-/// Environment variable with an optional tracing filter for stderr diagnostics.
+/// Environment variable with an optional tracing filter.
 const LOG_ENV: &str = "TINCAN_LOG";
 
-/// Opt-in diagnostics (`TINCAN_LOG`): tracing output of every crate to stderr, filtered by
-/// the variable's `EnvFilter` directives. Nothing is installed when it is unset.
-fn init_logging() {
-    let Some(filter) = std::env::var_os(LOG_ENV).and_then(|v| v.into_string().ok()) else {
-        return;
-    };
-    match tracing_subscriber::EnvFilter::try_new(&filter) {
-        Ok(f) => {
-            let _ = tracing_subscriber::fmt().with_env_filter(f).with_writer(std::io::stderr).with_ansi(false).try_init();
+/// Diagnostics: always to `<profile>/logs/tincan.log` (`logfile.rs`), filtered by
+/// `TINCAN_LOG` or [`logfile::DEFAULT_FILTER`]; also to stderr when `TINCAN_LOG` is set.
+fn init_logging(profile: Option<&str>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer, fmt};
+
+    let env = std::env::var_os(LOG_ENV).and_then(|v| v.into_string().ok());
+    let filter = |s: &str| match EnvFilter::try_new(s) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("tincan: ignoring {LOG_ENV}={s}: {e}");
+            EnvFilter::new(logfile::DEFAULT_FILTER)
         }
-        Err(e) => eprintln!("tincan: ignoring {LOG_ENV}={filter}: {e}"),
-    }
+    };
+    let directives = env.clone().unwrap_or_else(|| logfile::DEFAULT_FILTER.to_string());
+    let file = profile.zip(std::env::var_os("APPDATA")).and_then(|(name, roaming)| {
+        let path = logfile::log_path(&profile::data_dir(std::path::Path::new(&roaming), name));
+        match logfile::open(&path) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("tincan: no log file at {}: {e}", path.display());
+                None
+            }
+        }
+    });
+    let file_layer = file.map(|f| {
+        let f: &'static logfile::CappedFile = Box::leak(Box::new(f));
+        fmt::layer().with_ansi(false).with_writer(move || f).with_filter(filter(&directives))
+    });
+    let stderr_layer = env.map(|d| fmt::layer().with_ansi(false).with_writer(std::io::stderr).with_filter(filter(&d)));
+    let _ = tracing_subscriber::registry().with(file_layer).with(stderr_layer).try_init();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "tincan started");
 }
 
 /// Creates the window at once and starts the App in the background.
