@@ -985,13 +985,17 @@ html:has(.resize-handle.is-dragging) {
   font-size: var(--fs-13);
 }
 
+/* Under the newest message, lined up with the message text. Its height is kept while
+   nobody types, so the history does not jump when someone starts. */
 .typing-line {
-  flex: none;
-  height: 24px;
-  padding: 0 var(--sp-4);
-  line-height: 24px;
+  height: 20px;
+  padding: 0 var(--sp-4) 0 calc(var(--sp-4) + 32px + var(--sp-3));
+  line-height: 20px;
   font-size: var(--fs-12);
   color: var(--text-2);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 /* ---------------------------------------------------------------- member list */

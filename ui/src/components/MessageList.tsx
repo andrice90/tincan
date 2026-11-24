@@ -11,6 +11,7 @@ import { loadOlder, openDialog } from "../store/actions";
 import { convKey, useStore } from "../store/store";
 import { Attachment } from "./Attachment";
 import { Avatar, ICON_SM, PersonName } from "./common";
+import { TypingLine } from "./Composer";
 
 const GROUP_MS = 5 * 60_000;
 const LOAD_OLDER_PX = 400;
@@ -134,9 +135,12 @@ interface ListProps {
   startText: string;
 }
 
+const NO_TYPING: readonly { name: string }[] = [];
+
 export function MessageList({ convId, channelId, meId, canModerate, pendingName, startText }: ListProps) {
   const key = convKey(convId, channelId);
   const conv = useStore((s) => s.messages[key]);
+  const typing = useStore((s) => s.typing[key] ?? NO_TYPING);
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -269,6 +273,8 @@ export function MessageList({ convId, channelId, meId, canModerate, pendingName,
             />
           ),
         )}
+        {/* Under the newest message; the content's ResizeObserver keeps a pinned view at the bottom. */}
+        <TypingLine names={typing.map((t) => t.name)} />
       </div>
     </div>
   );

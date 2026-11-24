@@ -5,22 +5,20 @@ import { Hash, Phone, Users, Volume2 } from "lucide-react";
 import type { Channel, DmSummary, ServerSummary } from "../api/types";
 import { joinVoice, openDialog, startCall, toggleMembers, watchDm } from "../store/actions";
 import type { ComposerSpot } from "../store/dock";
-import { convKey, useStore, type TypingEntry } from "../store/store";
+import { convKey, useStore } from "../store/store";
 import { Avatar, ICON, IconButton, PersonName } from "./common";
-import { Composer, TypingLine } from "./Composer";
+import { Composer } from "./Composer";
 import { MessageList } from "./MessageList";
 import { VoiceStage } from "./VoiceView";
 
-const NO_TYPING: TypingEntry[] = [];
 
 /**
- * History of a server channel, with its composer and typing line unless `composer` is
+ * History of a server channel, with its composer unless `composer` is
  * false (a channel page: the shell's composer slot has them). A voice room's chat panel
  * keeps its own.
  */
 export function ChannelMessages({ server, channel, composer = true }: { server: ServerSummary; channel: Channel; composer?: boolean }) {
   const meId = useStore((s) => s.me?.userId ?? "");
-  const typing = useStore((s) => s.typing[convKey(server.id, channel.id)] ?? NO_TYPING);
   const room = channel.kind === "voice";
   return (
     <>
@@ -37,7 +35,6 @@ export function ChannelMessages({ server, channel, composer = true }: { server: 
       ) : (
         <>
           <Composer convId={server.id} channelId={channel.id} placeholder={room ? `Message ${channel.name}` : `Message #${channel.name}`} />
-          <TypingLine names={typing.map((t) => t.name)} />
         </>
       )}
     </>
@@ -79,16 +76,10 @@ export function ChannelChat({ server, channel }: { server: ServerSummary; channe
   );
 }
 
-/** The composer slot's content: the composer and typing line of the conversation on screen. */
+/** The composer slot's content: the composer of the conversation on screen. */
 export function DockedComposer({ spot }: { spot: ComposerSpot }) {
-  const typing = useStore((s) => s.typing[convKey(spot.convId, spot.channelId)] ?? NO_TYPING);
   if (spot.removed) return <RemovedNote />;
-  return (
-    <>
-      <Composer key={convKey(spot.convId, spot.channelId)} convId={spot.convId} channelId={spot.channelId} placeholder={spot.placeholder} />
-      <TypingLine names={typing.map((t) => t.name)} />
-    </>
-  );
+  return <Composer key={convKey(spot.convId, spot.channelId)} convId={spot.convId} channelId={spot.channelId} placeholder={spot.placeholder} />;
 }
 
 /** In place of the composer once the owner removed me: the history stays readable. */
