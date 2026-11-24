@@ -144,8 +144,16 @@ export interface VoiceParticipant {
   avatar: string | null;
   /** Present while they share their screen. */
   screenTrack: number | null;
-  /** How loud they are for me (0..2, saved per user; 1 for me). */
+  /** How loud they are for me (0..2, saved per user; 1 for me). Their clips follow it too. */
   volume: number;
+  /** How loud their soundboard clips are for me, on top of `volume` (0..2, saved per user; 1 for me). */
+  soundboardVolume: number;
+}
+
+/** `user_volume`: both saved volumes of a person (1 when never changed). */
+export interface UserVolume {
+  volume: number;
+  soundboardVolume: number;
 }
 
 export interface VoiceSession {
@@ -160,6 +168,8 @@ export interface VoiceSession {
   sharing: boolean;
   path: PathKind;
   rttMs: number | null;
+  /** Hashes of my clips playing now: from `clip_play` until they end or `clip_stop`. */
+  playingClips: BlobHash[];
 }
 
 export type CallState = "ringing-out" | "ringing-in" | "active" | "ended";
@@ -309,6 +319,13 @@ export interface Commands {
   set_muted: { args: { muted: boolean }; result: null };
   set_deafened: { args: { deafened: boolean }; result: null };
   set_user_volume: { args: { userId: UserId; volume: number }; result: null };
+  /** How loud someone's soundboard clips are for me, on top of their volume (0..2, saved). */
+  set_user_soundboard_volume: { args: { userId: UserId; volume: number }; result: null };
+  /** Both saved volumes of anyone, also outside voice (for the member menu). */
+  user_volume: { args: { userId: UserId }; result: UserVolume };
+  /** The soundboard volume of a voice room: a local multiplier on every clip I hear there (0..2, saved). */
+  room_soundboard_volume: { args: { channelId: ChannelId }; result: number };
+  set_room_soundboard_volume: { args: { channelId: ChannelId; volume: number }; result: null };
 
   screen_sources: { args: {}; result: ScreenSource[] };
   /** Error string "no-hardware-encoder" when unsupported on this machine. */
@@ -326,6 +343,8 @@ export interface Commands {
   clip_remove: { args: { hash: BlobHash }; result: null };
   clip_rename: { args: { hash: BlobHash; name: string }; result: null };
   clip_play: { args: { hash: BlobHash }; result: null };
+  /** Stops my plays of the clip, here and in the call, at once. */
+  clip_stop: { args: { hash: BlobHash }; result: null };
   /** Pull a heard clip into my library. */
   clip_fetch: { args: { hash: BlobHash }; result: Clip };
 

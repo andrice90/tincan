@@ -8,6 +8,7 @@ import { messageUser, openDialog, startCall } from "../store/actions";
 import { useStore } from "../store/store";
 import { ICON_SM, PersonId, PersonName, SpeakingAvatar } from "./common";
 import { Menu, useMenu, type MenuItem } from "./Menu";
+import { PersonVolumes } from "./VolumeSliders";
 
 const EMPTY: Member[] = [];
 
@@ -76,6 +77,7 @@ const MemberRow = memo(function MemberRow({
             <>
               <bdi className="menu-head-name truncate">{m.name}</bdi>
               <PersonId userId={m.userId} />
+              <PersonVolumes userId={m.userId} />
             </>
           }
         />

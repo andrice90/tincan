@@ -1452,6 +1452,27 @@ button.clip-tile:hover:not(:disabled) {
   padding-right: 36px;
 }
 
+.clip-cell {
+  position: relative;
+  display: grid;
+}
+
+.clip-stop {
+  position: absolute;
+  top: 50%;
+  right: var(--sp-1);
+  margin-top: -14px;
+  color: var(--accent-fg);
+}
+
+.volume-sliders .field-label:not(:first-child) {
+  margin-top: var(--sp-2);
+}
+
+.menu-head .volume-sliders {
+  margin-top: var(--sp-2);
+}
+
 .clip-save {
   position: absolute;
   top: 50%;

@@ -2,15 +2,16 @@
 // someone shares a screen, that share on the stage with tiles in a strip.
 
 import { HeadphoneOff, Maximize2, MessageSquare, MicOff, Minimize2, Monitor, Volume2 } from "lucide-react";
-import { memo, useEffect, useRef, useState, type MouseEvent } from "react";
-import type { Channel, ChannelId, Member, ServerId, ServerSummary, UserId, VoiceParticipant, VoiceSession } from "../api/types";
+import { memo, useEffect, useState, type MouseEvent } from "react";
+import type { Channel, ChannelId, Member, ServerId, ServerSummary, VoiceParticipant, VoiceSession } from "../api/types";
 import { ScreenView } from "../media/ScreenView";
-import { joinVoice, messageUser, setFullStage, setUserVolume, stopShare, toggleRoomChat } from "../store/actions";
-import { initialVolume, shouldSend, type TilePerson } from "../store/calls";
+import { joinVoice, messageUser, setFullStage, stopShare, toggleRoomChat } from "../store/actions";
+import type { TilePerson } from "../store/calls";
 import { useStore } from "../store/store";
 import { ChannelMessages } from "./ChatView";
 import { ICON, ICON_SM, IconButton, PersonId, PersonName, SpeakingAvatar } from "./common";
 import { Popover, useMenu } from "./Menu";
+import { PersonVolumes } from "./VolumeSliders";
 import { tileGrid } from "../lib/tileGrid";
 import type { CSSProperties } from "react";
 
@@ -20,53 +21,11 @@ function gridStyle(n: number): CSSProperties {
   return { "--cols": cols, "--rows": rows } as CSSProperties;
 }
 
-/** Per-user playback volume picked in this session (0..2); the app's saved value seeds it. */
-const volumes = new Map<UserId, number>();
-
-function VolumeSlider({ p, start }: { p: TilePerson; start: number }) {
-  const [v, setV] = useState(start);
-  // The value last sent (the one shown at open until then): a release or key that changed
-  // nothing sends nothing.
-  const sent = useRef(start);
-  const id = `vol-${p.userId}`;
-  const commit = () => {
-    if (!shouldSend(sent.current, v)) return;
-    sent.current = v;
-    setUserVolume(p.userId, v);
-  };
-  return (
-    <>
-      <label className="field-label" htmlFor={id}>
-        Volume for <bdi>{p.name}</bdi>
-      </label>
-      <div className="volume-row">
-        <input
-          id={id}
-          type="range"
-          min={0}
-          max={200}
-          step={5}
-          value={Math.round(v * 100)}
-          onChange={(e) => {
-            const next = Number(e.target.value) / 100;
-            setV(next);
-            volumes.set(p.userId, next);
-          }}
-          onPointerUp={commit}
-          onKeyUp={commit}
-        />
-        <span className="volume-value">{Math.round(v * 100)}%</span>
-      </div>
-    </>
-  );
-}
-
 function VolumePopover({ p, anchor, onClose }: { p: TilePerson; anchor: NonNullable<ReturnType<typeof useMenu>["anchor"]>; onClose: () => void }) {
-  const start = initialVolume(volumes.get(p.userId), p);
   return (
     <Popover anchor={anchor} onClose={onClose} label={`${p.name} options`} className="volume-pop">
       <PersonId userId={p.userId} />
-      {start !== null && <VolumeSlider p={p} start={start} />}
+      <PersonVolumes userId={p.userId} known={p} />
       <button
         type="button"
         className="menu-item"
@@ -163,6 +122,7 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
             avatar: me.avatar,
             screenTrack: null,
             volume: 1,
+            soundboardVolume: 1,
           },
           ...voice.participants,
         ]
@@ -296,7 +256,7 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
               {inside.map((m) => (
                 <Tile
                   key={m.userId}
-                  p={{ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, speaking: m.speaking, avatar: m.avatar, screenTrack: null, volume: null }}
+                  p={{ userId: m.userId, name: m.name, muted: m.muted, deafened: m.deafened, speaking: m.speaking, avatar: m.avatar, screenTrack: null, volume: null, soundboardVolume: null }}
                   isMe={false}
                   sharing={m.sharing}
                 />

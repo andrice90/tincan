@@ -1,6 +1,6 @@
 import type { CallInfo, VoiceSession } from "../api/types";
 import { eq, test } from "../test/harness";
-import { callPanelParts, initialVolume, leaveCommand, shouldSend } from "./calls";
+import { callPanelParts, initialVolume, isMyClipPlaying, leaveCommand, shouldSend } from "./calls";
 
 function voice(kind: "room" | "call"): VoiceSession {
   return {
@@ -14,6 +14,7 @@ function voice(kind: "room" | "call"): VoiceSession {
     sharing: false,
     path: "direct",
     rttMs: null,
+    playingClips: [],
   };
 }
 
@@ -48,16 +49,20 @@ test("UI-LOGIC-09: an active call without a voice session still gets a Hang up p
 });
 
 test("UI-LOGIC-13: the volume slider starts at the saved volume, not 100%", () => {
-  const p = { userId: "alex", name: "Alex", muted: false, deafened: false, speaking: false, avatar: null, screenTrack: null, volume: 0.3 };
-  eq(initialVolume(undefined, p), 0.3, "saved by the app");
-  eq(initialVolume(0.8, p), 0.8, "moved in this session");
-  eq(initialVolume(undefined, { ...p, volume: 1 }), 1, "never changed");
+  eq(initialVolume(undefined, 0.3), 0.3, "saved by the app");
+  eq(initialVolume(0.8, 0.3), 0.8, "moved in this session");
+  eq(initialVolume(undefined, 1), 1, "never changed");
 });
 
 test("REGRESSION-4: a tile whose saved volume is not known shows no slider", () => {
-  const p = { userId: "jordan", name: "Jordan", muted: false, deafened: false, speaking: false, avatar: null, screenTrack: null, volume: null };
-  eq(initialVolume(undefined, p), null, "a room you have not joined: no made-up 100%");
-  eq(initialVolume(0.5, p), 0.5, "moved in this session");
+  eq(initialVolume(undefined, null), null, "not known yet: no made-up 100%");
+  eq(initialVolume(0.5, null), 0.5, "moved in this session");
+});
+
+test("the stop icon follows the app's list of my playing clips", () => {
+  eq(isMyClipPlaying(null, "h1"), false, "not in voice");
+  eq(isMyClipPlaying({ ...voice("room"), playingClips: ["h1"] }, "h1"), true);
+  eq(isMyClipPlaying({ ...voice("room"), playingClips: ["h1"] }, "h2"), false);
 });
 
 test("REGRESSION-4: releasing the slider without a change sends nothing", () => {

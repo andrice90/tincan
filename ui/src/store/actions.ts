@@ -904,6 +904,16 @@ export function setUserVolume(userId: UserId, volume: number): void {
   run(invoke("set_user_volume", { userId, volume }));
 }
 
+/** Sets how loud one person's soundboard clips are for me (0..2, on top of their volume). */
+export function setUserSoundboardVolume(userId: UserId, volume: number): void {
+  run(invoke("set_user_soundboard_volume", { userId, volume }));
+}
+
+/** Sets a voice room's soundboard volume (0..2), for every clip I hear in it. */
+export function setRoomSoundboardVolume(channelId: ChannelId, volume: number): void {
+  run(invoke("set_room_soundboard_volume", { channelId, volume }));
+}
+
 // ------------------------------------------------------------------ soundboard
 
 const playTimers = new Map<BlobHash, ReturnType<typeof setTimeout>>();
@@ -924,10 +934,14 @@ function markPlaying(hash: BlobHash, durationMs: number): void {
 
 /** Plays a clip into the call. */
 export function playClip(clip: Clip): void {
-  invoke("clip_play", { hash: clip.hash }).then(
-    () => markPlaying(clip.hash, clip.durationMs),
-    (err: unknown) => pushToast("error", errorText(err)),
-  );
+  // The tile lights from `VoiceSession.playingClips`, which the app keeps until the clip ends.
+  invoke("clip_play", { hash: clip.hash }).catch((err: unknown) => pushToast("error", errorText(err)));
+}
+
+/** Stops my clip here and in the call. */
+export function stopClip(clip: Clip): void {
+  playingStore.delete(clip.hash);
+  run(invoke("clip_stop", { hash: clip.hash }));
 }
 
 /** Pulls a heard clip into the library. */

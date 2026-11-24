@@ -108,6 +108,8 @@ interface MenuProps {
 export function Menu({ anchor, items, onClose, label, header }: MenuProps) {
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    // A slider in the header keeps its own arrow keys.
+    if (e.target instanceof HTMLInputElement) return;
     e.preventDefault();
     const buttons = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
     if (buttons.length === 0) return;
