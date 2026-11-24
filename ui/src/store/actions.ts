@@ -842,15 +842,23 @@ export function setDeafened(deafened: boolean): void {
   });
 }
 
-/** Starts sharing a screen or window. Rejects with the raw error (callers map it). */
-export async function startShare(sourceId: string, mode: ShareMode): Promise<void> {
-  await invoke("screen_start", { sourceId, mode });
+/**
+ * Starts sharing a screen or window, with its sound when `audio`. Rejects with the raw error
+ * (callers map it). The app's voice-updated says whether sound is really shared.
+ */
+export async function startShare(sourceId: string, mode: ShareMode, audio: boolean): Promise<void> {
+  await invoke("screen_start", { sourceId, mode, audio });
   patchVoice({ sharing: true });
 }
 
 /** Stops sharing. */
 export function stopShare(): void {
-  run(invoke("screen_stop", {}).then(() => patchVoice({ sharing: false })));
+  run(invoke("screen_stop", {}).then(() => patchVoice({ sharing: false, shareAudio: "off" })));
+}
+
+/** Sets how loud one person's screen share sound is for me (0..2), saved per sharer. */
+export function setShareVolume(userId: UserId, volume: number): void {
+  run(invoke("set_share_volume", { userId, volume }));
 }
 
 /**

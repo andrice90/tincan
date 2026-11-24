@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { errorCode, errorText, invoke } from "../api/client";
 import type { ScreenSource, ShareMode } from "../api/types";
 import { Modal } from "../components/Modal";
+import { shareAudioOption } from "../lib/shareAudio";
 import { closeDialog, startShare } from "../store/actions";
 
 type Phase = { kind: "loading" } | { kind: "ready"; sources: ScreenSource[] } | { kind: "no-encoder" } | { kind: "error"; text: string };
@@ -48,6 +49,7 @@ export function ScreenPickerDialog() {
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   const [picked, setPicked] = useState<string | null>(null);
   const [mode, setMode] = useState<ShareMode>("text");
+  const [audio, setAudio] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -74,7 +76,7 @@ export function ScreenPickerDialog() {
     setBusy(true);
     setError(null);
     try {
-      await startShare(picked, mode);
+      await startShare(picked, mode, audio);
       closeDialog();
     } catch (err) {
       if (errorCode(err) === "no-hardware-encoder") setPhase({ kind: "no-encoder" });
@@ -103,6 +105,7 @@ export function ScreenPickerDialog() {
   }
 
   const sources = phase.kind === "ready" ? phase.sources : [];
+  const pickedKind = sources.find((s) => s.id === picked)?.kind ?? null;
   return (
     <Modal
       title="Share your screen"
@@ -145,6 +148,22 @@ export function ScreenPickerDialog() {
             </button>
           </div>
         </div>
+      )}
+      {phase.kind === "ready" && sources.length > 0 && (
+        <label className="switch-row share-audio" htmlFor="share-audio">
+          <span className="share-audio-text">
+            <span>Share audio</span>
+            <span className="mode-note">{shareAudioOption(pickedKind)}</span>
+          </span>
+          <input
+            id="share-audio"
+            type="checkbox"
+            role="switch"
+            className="switch"
+            checked={audio}
+            onChange={(e) => setAudio(e.target.checked)}
+          />
+        </label>
       )}
       {error && (
         <p className="error-text dialog-error" role="alert">

@@ -476,6 +476,8 @@ async function flowE(a, b) {
   // nothing else may be picked (the picker pre-selects the first display)
   const pickedNames = await dlg(a).locator('button.source-card[aria-checked="true"] .source-name').allTextContents();
   check("only the pattern window is picked", pickedNames.length === 1 && pickedNames[0] === PATTERN_TITLE, pickedNames.join(","));
+  const audioSwitch = dlg(a).getByRole("switch", { name: /Share audio/ });
+  check("share audio is on by default", await audioSwitch.isChecked());
   let t = now();
   await dlg(a).locator("button[type=submit]").click();
   await a.page.waitForSelector('section[aria-label="Voice"] button[aria-label="Stop sharing"]', { timeout: 15000 });
@@ -498,6 +500,17 @@ async function flowE(a, b) {
     { timeout: 20000, what: "first decoded frame on B" },
   );
   timing("watch_until_first_frame", now() - t);
+  // The sharer is told the window's app audio goes out (the pattern window is a test-owned
+  // process, not an ancestor of Tincan).
+  const note = await a.page.locator(".stage-self-note").textContent({ timeout: 5000 }).catch(() => null);
+  check("sharer sees the share's audio", note === "With the app's audio", String(note));
+  // B has a share volume on the stage and on a right click of the stage.
+  check("stage has a share volume button", (await b.page.getByRole("button", { name: /^Screen share volume/ }).count()) === 1);
+  await b.page.locator('canvas[aria-label="Alice\'s screen"]').click({ button: "right" });
+  const pop = b.page.getByRole("dialog", { name: "Alice's screen share volume" });
+  await pop.waitFor({ timeout: 5000 });
+  check("stage right click opens the share volume", (await pop.getByLabel("Screen share volume").count()) === 1);
+  await b.page.keyboard.press("Escape");
   await sleep(1500);
 
   // read the colours from a CDP screenshot of B's window

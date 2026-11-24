@@ -146,7 +146,15 @@ export interface VoiceParticipant {
   screenTrack: number | null;
   /** How loud they are for me (0..2, saved per user; 1 for me). */
   volume: number;
+  /** How loud their screen share's sound is for me (0..2, saved per sharer; 1 for me). */
+  shareVolume: number;
 }
+
+/**
+ * What my screen share sends besides the picture: nothing, the shared window's app, or
+ * everything the PC plays except Tincan (a shared display).
+ */
+export type ShareAudio = "off" | "app" | "system";
 
 export interface VoiceSession {
   /** Server voice room or DM call. */
@@ -158,6 +166,8 @@ export interface VoiceSession {
   muted: boolean;
   deafened: boolean;
   sharing: boolean;
+  /** The sound my share sends ("off" when not sharing, turned off, or not capturable). */
+  shareAudio: ShareAudio;
   path: PathKind;
   rttMs: number | null;
 }
@@ -309,10 +319,16 @@ export interface Commands {
   set_muted: { args: { muted: boolean }; result: null };
   set_deafened: { args: { deafened: boolean }; result: null };
   set_user_volume: { args: { userId: UserId; volume: number }; result: null };
+  /** How loud `userId`'s screen share sound plays (0..2), saved per sharer. */
+  set_share_volume: { args: { userId: UserId; volume: number }; result: null };
 
   screen_sources: { args: {}; result: ScreenSource[] };
-  /** Error string "no-hardware-encoder" when unsupported on this machine. */
-  screen_start: { args: { sourceId: string; mode: ShareMode }; result: number };
+  /**
+   * Error string "no-hardware-encoder" when unsupported on this machine. `audio` shares the
+   * window's app sound, or for a display everything except Tincan (absent: no sound). When
+   * the sound can't be captured the share starts anyway and a toast says so.
+   */
+  screen_start: { args: { sourceId: string; mode: ShareMode; audio?: boolean }; result: number };
   screen_stop: { args: {}; result: null };
   /**
    * Start receiving a screen share. `onFrame` is a Tauri Channel<ArrayBuffer>; each message is

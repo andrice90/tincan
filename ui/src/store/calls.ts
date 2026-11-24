@@ -21,7 +21,7 @@ export function leaveCommand(voice: VoiceSession | null, call: CallInfo | null):
  * A tile's person. `volume` is null when it is not known: tiles of a room you have not
  * joined (the app reports saved volumes only for joined rooms and calls).
  */
-export type TilePerson = Omit<VoiceParticipant, "volume"> & { volume: number | null };
+export type TilePerson = Omit<VoiceParticipant, "volume" | "shareVolume"> & { volume: number | null; shareVolume?: number };
 
 /**
  * Where the per-user volume slider starts: this session's choice, else the saved volume.
