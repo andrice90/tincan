@@ -16,7 +16,7 @@
 
 /* ---------------------------------------------------------------- cards */
 
-:root[data-layout="floating"] :is(.rail, .side-card, .sidebar-foot, .content-card, .composer-slot, .right-card) {
+:root[data-layout="floating"] :is(.rail, .side-card, .sidebar-foot, .content-card, .composer-slot, .right-card, .right-composer) {
   border-radius: var(--r-float);
   box-shadow: var(--shadow-float);
 }
@@ -82,29 +82,46 @@
   background: var(--bg-main);
 }
 
-/* The card is the composer's box. */
+/* The card is the composer's box: the content's composer card, and the room chat's. */
 /* Even padding: with one line of text the card is 52 px tall (5 + 42 px composer + 5),
    the height of the account card beside it. */
-:root[data-layout="floating"] .composer-slot .composer-wrap {
+:root[data-layout="floating"] :is(.composer-slot, .right-composer) .composer-wrap {
   padding: 5px;
 }
 
-:root[data-layout="floating"] .composer-slot .removed-note {
+:root[data-layout="floating"] :is(.composer-slot, .right-composer) .removed-note {
   margin-bottom: var(--sp-2);
 }
 
-/* Right card: the member list, or a voice room's chat beside its tiles. */
-:root[data-layout="floating"] .right-card {
+/* Right column: the member list, or a voice room's chat over its own composer card. */
+:root[data-layout="floating"] .right-col {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+:root[data-layout="floating"] :is(.right-card, .right-composer) {
   min-width: 0;
   display: flex;
   /* Opening, the content is wider than the card: anchored right, it slides in with the edge. */
   justify-content: flex-end;
   overflow: hidden;
+}
+
+:root[data-layout="floating"] .right-card {
+  flex: 1;
+  min-height: 0;
   background: var(--bg-side);
 }
 
-:root[data-layout="floating"] .right-card > * {
+:root[data-layout="floating"] .right-composer {
+  flex: none;
+  margin-top: var(--gap-float);
+  background: var(--bg-main);
+}
+
+:root[data-layout="floating"] :is(.right-card, .right-composer) > * {
   flex: none;
   width: 100%;
   min-width: var(--right-min);

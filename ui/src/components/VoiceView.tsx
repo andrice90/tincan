@@ -6,7 +6,7 @@ import { memo, useEffect, useRef, useState, type MouseEvent } from "react";
 import type { Channel, ChannelId, Member, ServerId, ServerSummary, UserId, VoiceParticipant, VoiceSession } from "../api/types";
 import { ScreenView } from "../media/ScreenView";
 import { joinVoice, messageUser, setFullStage, setUserVolume, stopShare, toggleRoomChat } from "../store/actions";
-import { initialVolume, shouldSend, type TilePerson } from "../store/calls";
+import { initialVolume, roomStage, shouldSend, type TilePerson } from "../store/calls";
 import { useStore } from "../store/store";
 import { ChannelMessages } from "./ChatView";
 import { ICON, ICON_SM, IconButton, PersonId, PersonName, SpeakingAvatar } from "./common";
@@ -247,12 +247,16 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
 
 const EMPTY_MEMBERS: Member[] = [];
 
-/** The main area for a voice room: live stage when joined, who is inside otherwise. */
+/**
+ * The main area for a voice room: live stage when joined, else who is inside and "Join voice".
+ * Viewing a room never joins it (store/calls.ts, roomStage).
+ */
 export function VoiceRoomView({ server, channel }: { server: ServerSummary; channel: Channel }) {
   const voice = useStore((s) => s.voice);
   const call = useStore((s) => s.call);
   const members = useStore((s) => s.members[server.id] ?? EMPTY_MEMBERS);
-  const joined = voice?.kind === "room" && voice.channelId === channel.id;
+  const stage = roomStage(voice, call, channel.id, server.removed === true);
+  const joined = stage.joined;
   const inside = members.filter((m) => m.online && m.voiceChannelId === channel.id);
   const chatOpen = useStore((s) => s.roomChatPanel);
   // Floating shows the chat panel as the right card (the shell's right slot).
@@ -269,8 +273,8 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
           </span>
         </h1>
         <div className="main-actions">
-          {!joined && (
-            <button type="button" className="btn btn-primary btn-sm" disabled={call !== null} onClick={() => joinVoice(server.id, channel.id)}>
+          {stage.join && (
+            <button type="button" className="btn btn-primary btn-sm" disabled={stage.joinDisabled} onClick={() => joinVoice(server.id, channel.id)}>
               Join voice
             </button>
           )}
@@ -310,18 +314,22 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
   );
 }
 
-function RoomChat({ server, channel }: { server: ServerSummary; channel: Channel }) {
+/** The room's chat. `composer` false: Floating, where the composer is its own card under it. */
+function RoomChat({ server, channel, composer = true }: { server: ServerSummary; channel: Channel; composer?: boolean }) {
   return (
     <section className="room-chat" aria-label={`Chat in ${channel.name}`}>
-      <ChannelMessages server={server} channel={channel} />
+      <ChannelMessages server={server} channel={channel} composer={composer} />
     </section>
   );
 }
 
-/** A voice room's chat panel as the Floating right card, found by id (it may outlive the room view). */
+/**
+ * A voice room's chat as the Floating right card, found by id (it may outlive the room view).
+ * Its composer is the composer card under it (Shell.tsx).
+ */
 export function RoomChatPanel({ serverId, channelId }: { serverId: ServerId; channelId: ChannelId }) {
   const server = useStore((s) => s.servers.find((x) => x.id === serverId));
   const channel = useStore((s) => s.channels[serverId]?.find((c) => c.id === channelId));
   if (!server || !channel) return null;
-  return <RoomChat server={server} channel={channel} />;
+  return <RoomChat server={server} channel={channel} composer={false} />;
 }

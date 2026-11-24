@@ -1,6 +1,6 @@
 // Main window layout: rail, sidebar (channel or DM list, then the account card with the
 // call panel and user panel), content with the composer slot under it, and the right slot
-// (member list, or in Floating a voice room's chat). Classic draws these as flat panels;
+// (member list, or in Floating a voice room's chat over its composer card). Classic draws these as flat panels;
 // Floating (data-layout on <html>) draws each as a card. The slots stay mounted so their
 // contents can animate closed (components/Presence.tsx); in Classic they close at once.
 
@@ -69,7 +69,7 @@ function MainContent() {
       </div>
     );
   }
-  return channel.kind === "voice" && !view.chat ? (
+  return channel.kind === "voice" ? (
     <VoiceRoomView key={channel.id} server={server} channel={channel} />
   ) : (
     <ChannelChat key={channel.id} server={server} channel={channel} />
@@ -90,7 +90,7 @@ export function Shell() {
   const membersWidth = usePanelWidth(MEMBERS_KEY, MEMBERS_BOUNDS);
 
   const composer = usePresence(composerSpot(view, servers, channels, dms), sameSig);
-  const right = usePresence(rightPanel(view, channels, showMembers, roomChatPanel, layout), sameSig);
+  const right = usePresence(rightPanel(view, servers, channels, showMembers, roomChatPanel, layout), sameSig);
   const voice = usePresence(useCallState());
 
   const rightPanelNow = right.kept;
@@ -130,9 +130,16 @@ export function Shell() {
         {right.open && rightPanelNow?.kind === "members" && (
           <ResizeHandle panel={membersWidth} bounds={MEMBERS_BOUNDS} edge="left" label="Resize member list" />
         )}
-        <div className="right-card" inert={right.closing}>
-          {rightPanelNow?.kind === "members" && <MemberList serverId={rightPanelNow.serverId} />}
-          {rightPanelNow?.kind === "room-chat" && <RoomChatPanel serverId={rightPanelNow.serverId} channelId={rightPanelNow.channelId} />}
+        <div className="right-col" inert={right.closing}>
+          <div className="right-card">
+            {rightPanelNow?.kind === "members" && <MemberList serverId={rightPanelNow.serverId} />}
+            {rightPanelNow?.kind === "room-chat" && <RoomChatPanel serverId={rightPanelNow.serverId} channelId={rightPanelNow.channelId} />}
+          </div>
+          {rightPanelNow?.kind === "room-chat" && (
+            <div className="right-composer">
+              <DockedComposer spot={rightPanelNow.composer} />
+            </div>
+          )}
         </div>
       </div>
     </div>

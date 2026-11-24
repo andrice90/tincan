@@ -392,6 +392,8 @@ async function flowC(a, b) {
 async function joinLounge(inst) {
   await openServer(inst);
   await openChannel(inst, "Lounge");
+  // opening a room only shows it: joining is the header's button
+  await inst.page.getByRole("button", { name: "Join voice", exact: true }).click();
   await inst.page.waitForSelector('section[aria-label="Voice"]', { timeout: 15000 });
   // two instances share one microphone and one set of speakers: mute at once
   await inst.page.getByRole("button", { name: "Mute", exact: true }).click();

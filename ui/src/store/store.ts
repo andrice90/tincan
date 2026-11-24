@@ -31,8 +31,7 @@ import { buildNameIndex, sharesName, type NameIndex } from "../lib/names";
 /** What the main area shows. */
 export type View =
   | { kind: "home" }
-  /** `chat`: a voice room shown as its chat page instead of its tiles. */
-  | { kind: "server"; serverId: ServerId; channelId: ChannelId | null; chat?: boolean }
+  | { kind: "server"; serverId: ServerId; channelId: ChannelId | null }
   | { kind: "dms"; convId: ConvId | null };
 
 /** Settings dialog tabs. */

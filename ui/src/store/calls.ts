@@ -54,3 +54,22 @@ export function callPanelParts(voice: VoiceSession | null, call: CallInfo | null
     callNoAudio: voice === null && call?.state === "active",
   };
 }
+
+/** What a voice room's view shows: its live stage once joined, else who is inside and a Join button. */
+export interface RoomStage {
+  /** I am in this room: the live stage (tiles, screen share). The call panel holds the controls. */
+  joined: boolean;
+  /** "Join voice" is shown: viewing a room I am not in. Only this button sends `voice_join`. */
+  join: boolean;
+  /** Join is disabled: a call is ringing or active, so it would have to be ended first. */
+  joinDisabled: boolean;
+}
+
+/**
+ * Opening a room only shows it. Viewing never joins: no audio, no mic, no call panel for it.
+ * `removed`: I was removed from the server, so there is nothing to join.
+ */
+export function roomStage(voice: VoiceSession | null, call: CallInfo | null, channelId: string, removed: boolean): RoomStage {
+  const joined = voice?.kind === "room" && voice.channelId === channelId;
+  return { joined, join: !joined && !removed, joinDisabled: call !== null };
+}

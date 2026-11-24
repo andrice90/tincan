@@ -79,15 +79,15 @@ A second layout, picked in Settings > Appearance > Layout: "Floating" (the defau
 | +----+ +-------------+ +-----------------------------+ +-------------+  |
 | |rail| | channel card| | content card                | | right card  |  |
 | |    | | server head | | header, messages, stage,    | | members, or |  |
-| |    | | channels    | | screen share                | | the room's  |  |
-| |    | | voice rooms | |                             | | chat in a   |  |
-| |    | +-------------+ +-----------------------------+ | voice room  |  |
-| |    | | account card| | composer card               | |             |  |
+| |    | | channels    | | screen share                | | a voice     |  |
+| |    | | voice rooms | |                             | | room's chat |  |
+| |    | +-------------+ +-----------------------------+ +-------------+  |
+| |    | | account card| | composer card               | | composer    |  |
 | +----+ +-------------+ +-----------------------------+ +-------------+  |
 +-------------------------------------------------------------------------+
 ```
 
-- Every region is a card on the backdrop: server rail, channel card (server or DM list), account card (voice controls while in a room or call, then avatar, name, settings), content card (header, messages, voice stage, screen share, soundboard), composer card (composer and typing line; hidden on views without a composer, such as a room's tiles), right card (member list, or a voice room's chat when its Chat button is on; that chat keeps its own composer).
+- Every region is a card on the backdrop: server rail, channel card (server or DM list), account card (voice controls while in a room or call, then avatar, name, settings), content card (header, messages, voice stage, screen share, soundboard), composer card (composer and typing line; hidden on views without a composer, such as a room's tiles), right card (member list beside a text channel, or a voice room's chat while its chat panel is open). The room chat's composer is its own card under the right card, the same radius, gap, shadow, `--bg-main` and 52px height as the composer card, so the right column is a chat card over a composer card (the member list has none).
 - Cards share one radius `--r-float` (12px), one shadow `--shadow-float` and one gap `--gap-float` (8px) between cards and around the window. The titlebar and the space around the cards are `--bg-backdrop`. Rail and channel, account and right cards are `--bg-side`; content and composer cards `--bg-main`; rail buttons `--bg-main`.
 - Grab bars sit in the gaps: the sidebar's to the right of the channel and account cards, the member list's to the left of the right card. The 2px line is centred in the gap.
 - Minimum window (800x520): the gaps and the rail take 104px, so the sidebar (200 min), content (240 min) and right card (member list 220 min, room chat 256 min, else 340) share 696px. Cards give way to those minimums. The channel card scrolls when the voice controls take its height.
@@ -95,7 +95,7 @@ A second layout, picked in Settings > Appearance > Layout: "Floating" (the defau
   - right card: width 0 to the panel's width, the content card narrows as it slides; the content inside stays at its minimum width, anchored right, so it slides in with the card's edge;
   - account card: the voice controls grow from height 0 when joining a room or call (and the channel card above shrinks), and shrink back when leaving;
   - composer card: grows from height 0 under the content card when a view has a composer, and shrinks away when the next one has none;
-  - room chat beside the tiles: it is the right card, so it moves like the member list.
+  - room chat beside the tiles: it is the right column (chat card over its composer card), so both cards slide in and out together like the member list, and the content card narrows and widens with them.
   
   What closes stays on screen, inert, until its transition ends, then unmounts. Under `prefers-reduced-motion` every change is instant. Classic keeps no motion: its panels open and close at once, as before.
 
@@ -104,8 +104,8 @@ A second layout, picked in Settings > Appearance > Layout: "Floating" (the defau
 1. **Welcome** (first launch only). Heading "Pick a display name", one input, "Continue". Identity keys are generated silently.
 2. **Home / no servers.** Two actions: "Create server", "Join with invite".
 3. **Text channel.** Messages grouped by author within 5 minutes. Hover shows timestamp and actions (copy, delete own). Attachments render as file cards: name, size, peers that have it, progress while downloading, open/download button. Images preview inline once downloaded.
-4. **Voice room view.** Selected when you open a voice room. Participant tiles in a grid; when anyone shares a screen the share takes the stage and tiles move to a strip. Double-click the stage for full window. A "Chat" button at the right of the header opens the room's chat as a 340px panel beside the tiles, so you can talk and type at once.
-4b. **Voice room chat.** Every voice room has its own text chat. The chat button at the right of the room's row in the channel list opens it as the whole content area without joining voice (header: room name, "Join voice", members toggle). The room row is bold while its chat has unread messages, like a text channel.
+4. **Voice room view.** Shown when you click a voice room (its row or name, or its chat button). Opening a room never joins it. In a room you are not in: tiles of the people inside ("No one is here yet." when empty), "Join voice" in the header, and no call controls for that room (the call panel shows only the call you are in, if any). Only "Join voice" connects audio. Once joined: participant tiles in a grid; when anyone shares a screen the share takes the stage and tiles move to a strip. Double-click the stage for full window. A "Chat" button at the right of the header toggles the room's chat as a 340px panel beside the tiles, so you can talk and type at once, joined or not.
+4b. **Voice room chat.** Every voice room has its own text chat, and it is only ever that panel (there is no full-page room chat). The chat button at the right of the room's row does what the header's Chat button does on the room on screen (toggles the panel); on another room it opens that room with the panel open. Both buttons show pressed while the panel is open. The room row and the Chat button are bold while the chat has unread messages; the chat is marked read only while the panel is on screen.
 5. **Direct messages.** Rail DM button. List of conversations, each opens a chat with a call button in its header. Messages to an offline contact show "Waiting for <name> to come online" until delivered.
 6. **Soundboard.** Opened from the call panel while in a voice room. Grid of clip tiles (name, duration). Click a tile to play it into the call. Two groups: "Your sounds" (local library, "Add sound" picks an audio file) and "Heard in this call" (clips others played that you don't have yet). A "Heard" tile shows a download button; once pulled it moves to "Your sounds" and you seed it. Tile shows progress while downloading and a play state while playing. Limits shown at the add step only: up to 20 seconds, 5 MB.
 6b. **Share screen picker.** Opened from the call panel's share button. Two groups, Displays and Windows, each a grid of tiles (name, size). A Text / Motion toggle (sharp text at up to 15 fps, or smooth motion at up to 30 fps). "Share" starts it; the button becomes "Stop sharing". A machine with no hardware H.264 encoder shows that in place of the grid.
