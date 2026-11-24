@@ -7,7 +7,8 @@ use std::path::Path;
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(tincan_cues)");
-    for f in ["assets/voice-join.wav", "assets/voice-leave.wav"] {
+    // the folder too: a file put back with an old timestamp still changes the folder
+    for f in ["assets", "assets/voice-join.wav", "assets/voice-leave.wav"] {
         println!("cargo::rerun-if-changed={f}");
     }
     if Path::new("assets/voice-join.wav").is_file() && Path::new("assets/voice-leave.wav").is_file() {
