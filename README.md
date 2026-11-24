@@ -25,7 +25,7 @@ Tin Can is a Discord-style app where each channel's members **are** the network.
 
 ## Install
 
-Download `Tincan_0.2.1_x64-setup.exe` from the [latest release](../../releases/latest) and run it.
+Download `Tincan_0.2.1_x64-setup.exe` from the [0.2.1 release](../../releases/tag/v0.2.1) and run it. Releases are alpha builds, marked pre-release on GitHub.
 
 - Windows 10 or 11, 64-bit. Screen sharing needs Windows 10 version 2004 or newer.
 - The installer is per user and needs no admin rights. It is not code-signed, so SmartScreen may warn about it: choose **More info**, then **Run anyway**.
