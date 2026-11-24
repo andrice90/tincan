@@ -91,4 +91,10 @@ Version 0.1.0 is an early test build:
 
 Tincan is licensed under the [Apache License, Version 2.0](LICENSE).
 
-The join and leave sounds in `crates/tincan-app/assets/` (`voice-join.wav`, `voice-leave.wav`) are not covered by that license. They come from a third-party royalty-free sound pack and keep that pack's terms. Replace them before redistributing Tincan outside those terms.
+The join and leave sounds in `crates/tincan-app/assets/` (`voice-join.wav`, `voice-leave.wav`) are not covered by that license. They are from Ovani Sound's Player Status Sound FX Pack, used under Ovani Sound's [Royalty-Free License](https://ovanisound.com/policies/terms-of-service):
+
+- They may ship inside Tincan.
+- They may not be redistributed on their own, apart from the app.
+- They may not be used to train AI systems.
+
+If you fork Tincan, replace them or check those terms first. If this repository becomes public, move them out of it and supply them at build time instead.
