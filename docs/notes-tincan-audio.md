@@ -19,6 +19,16 @@ Implementation notes for whoever wires `tincan-audio` into `tincan-app`. The des
 - Render: each track's jitter buffer -> Opus decode/FEC/PLC -> per-track gain -> sum, plus clip voices -> output gain -> soft limiter. That exact signal goes to the APM render reference, then is resampled for the device if needed.
 - Output is opened at 48 kHz when Windows accepts it (shared-mode render auto-converts). Capture always uses the native format.
 
+## Screen share audio (src/share.rs, src/loopback.rs)
+
+- `ShareAudio::start(source, out)` blocks until the source is open (call it from a blocking thread), then runs the `tincan-share-audio` thread. `stop()` and `Drop` join it. It never touches the engine thread.
+- Sources: `ProcessTree(pid)` and `AllExcept(pid)` are Windows process loopback (`loopback.rs`: `ActivateAudioInterfaceAsync` on `VAD\Process_Loopback`, our own 48 kHz stereo float format with `AUTOCONVERTPCM`, polled every 10 ms on an MTA thread). `TestTone` is a 220/330 Hz stereo tone at real-time pace.
+- The `PROPVARIANT` that carries the activation params is wrapped in `ManuallyDrop`: the windows crate gives it a `Drop` that calls `PropVariantClear`, which would free the borrowed blob (it was heap corruption on the first run).
+- Packets: 20 ms stereo frames, Opus music application, 128 kbps VBR, no FEC, no DTX, payload capped at 1000 bytes. The header's track and epoch are 0 (tincan-net stamps them); only the first packet has `AF_TALKSPURT`, none has `AF_SPEAKING`. Silence fills the gap when the source lags the wall clock by more than 40 ms; more than 100 ms of backlog is dropped.
+- Helpers for the app: `window_process_id(hwnd)` and `is_self_or_ancestor(pid)` (a Toolhelp process snapshot; an unreadable list counts as an ancestor).
+- Playback: `Processor` routes `KIND_SHARE_AUDIO` tracks to share streams (at most `MAX_SHARE_STREAMS` = 4, apart from the 32 voice tracks): own jitter buffer, the mono decoder (it downmixes the stereo packets), per-track gain, silent while deafened, no speaking events. They are mixed before the output gain and limiter, so they are in the AEC render reference. `remove_track` and `stop_call` drop them. Stereo playout would need a stereo output bus (ring, resampler, sink, and a stereo or downmixed AEC reference).
+- Stereo codec: `OpusCodec::stereo_encoder` and `stereo_decoder` (default methods refuse, so other codec implementations still compile). Frame sizes are per channel; buffers are interleaved.
+
 ## Jitter buffer (src/jitter.rs)
 
 - Target delay: P95 of the relative transit over the last 2 s plus 20 ms, clamped to min/max.
@@ -59,3 +69,4 @@ Implementation notes for whoever wires `tincan-audio` into `tincan-app`. The des
 - `tests/e2e.rs` runs two engines over a simulated network with 5 % loss and 0-60 ms jitter for about 8 s. It also checks mic-test levels and that the engine idles.
 - `tests/devices.rs` is ignored by default: device enumeration, the speaker playing silence, and a mic test, which opens the microphone.
 - `examples/loopback.rs` sends the microphone through two engines to the speaker. Use headphones.
+- `tests/share_loopback.rs` is ignored by default and plays a quiet 523 Hz tone for 1.5 s: this process plays it through the engine, captures its own process tree (the tone is there: mean energy 1.19e-3 against 1.25e-3 for the clean tone) and then everything except its own tree (energy 0). `cargo test -p tincan-audio --test share_loopback -- --ignored --nocapture`.

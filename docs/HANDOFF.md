@@ -4,6 +4,14 @@ Status of the Tincan build for the next session. Updated at every milestone comm
 
 ## Where it stands
 
+### Screen share audio (branch `worktree-agent-adbe5024a577b792e`)
+
+- A share can carry its sound: a window share sends its app's audio (process loopback of its process tree), a display share sends everything except Tincan's own process tree. If it can't be captured, the share goes on without sound and a toast says so. New track kind `KIND_SHARE_AUDIO` (2) on the audio datagram, Opus stereo 128 kbps; the host forwards it only to those watching the share. See architecture.md "Screen share audio".
+- UI: "Share audio" switch in the picker (on by default), the sharer's stage says what goes out, and a "Screen share volume" slider (saved per sharer) on the stage button, the stage's right click and the sharer's tile menu.
+- Contract: `screen_start.audio`, `set_share_volume`, `VoiceParticipant.shareVolume`, `VoiceSession.shareAudio`.
+- Compatible both ways: older builds drop the new kind; no control message changed.
+- Verified for real: process loopback capture of this process's tree, included and excluded (ignored test). Not verified: a real browser or game window, UWP windows, hearing it on another machine, echo cancellation with share audio in a real room. Playback is a mono downmix (the engine output is mono).
+
 ### Third round (2026-11-24)
 
 - **Floating layout, now the default:** every region is a rounded card with a gap around it, and panels slide open and closed (ease-in-out, with a reverse for each). Classic stays available in Settings > Appearance > Layout. The composer card and the account card are both 52 px tall.

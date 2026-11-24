@@ -75,6 +75,11 @@ Join errors: codes shorter than 40 chars, codes not starting with `tincan1`, `ti
 - An active call with no voice session attached shows "Call with <name>" with Hang up, so it can always be ended.
 - Calling someone (DM header or member list) opens the DM with them first: the call stage, their screen share and the per-user volume menu are there.
 - The per-user volume slider starts at the volume picked in this session, else `VoiceParticipant.volume`, else 100%. `volume` is optional in `types.ts` until the app sends it.
+- Screen share audio (`components/ShareVolume.tsx`, wording in `lib/shareAudio.ts`):
+  - The picker has a "Share audio" switch, on by default, with a note for the picked source ("Audio from this app only" for a window, "Everything your PC plays, except Tincan" for a display).
+  - The sharer's stage says what goes out under "You're sharing your screen" (`VoiceSession.shareAudio`).
+  - A watcher gets "Screen share volume" three ways: the speaker button left of the full-window button on the stage, a right click anywhere on the stage, and under the per-user volume in the sharer's tile menu. The slider starts at this session's choice, else `shareVolume`, else 100%, and sends `set_share_volume` on release.
+  - The member list's menu has no volume controls today; when a volume section lands there, `ShareVolumeSlider` can go in for a sharer with one line.
 
 ## Names
 

@@ -373,6 +373,11 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
   - This refuses the stale GOP cache the host keeps for a stopped share.
   - A sink replacing another one for the same track resubscribes, so it starts at a keyframe.
 - **Watchers end** on `screen_unwatch`, when the sink returns false (then `unsubscribe_track`), when the track leaves the roster or `peer_sharing`, and on detach.
+- **Share audio** (`screen_start { audio: true }`; absent means no audio):
+  - After the picture is running, `tincan_audio::ShareAudio::start` runs on a blocking thread and feeds `Attached::share_audio_out`. Target: `window:<HWND>` takes the owning process's tree (`window_process_id`), `display:*` everything except `std::process::id()`'s tree, `test:pattern` a synthetic tone.
+  - A window whose process is Tincan or an ancestor of it (`is_self_or_ancestor`, Toolhelp snapshot) shares no audio: its tree contains Tincan. That, an unknown window and a failed capture each give an info toast; the share continues. Never a full-system fallback.
+  - `ActiveShare` owns the capture; every stop path (`stop`, `stop_in_background`, a share that ended while its audio was starting) stops it on a blocking thread. `VoiceSession.shareAudio` is `app`/`system` while the capture thread runs, else `off` (it is read when the DTO is built; a capture that dies mid-share shows on the next `voice-updated`).
+  - Playback: the audio pump hands a `KIND_SHARE_AUDIO` datagram to the engine only when its screen track is in `watchers` (tincan-net already filters on the subscription). `screen_unwatch`, pruned watchers and a member leaving remove the engine's share stream. Per-sharer gain `share_volumes` (kv `app/share_volumes`, same layout as `app/user_volumes`) is applied with the voice volumes in `apply_volumes`, so a restarted engine gets it too. `set_share_volume` clamps to 0..2 and emits `voice-updated`.
 
 ## Test hooks (`#[doc(hidden)]`)
 
@@ -382,7 +387,7 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
 - `App::test_synthetic_voice(on)`: the `no_devices` microphone sends speech-like bursts (600 ms on, 400 ms off) instead of silence, so speaking flags and packets flow.
 - `App::test_crash_audio_engine()`: the `no_devices` microphone panics on its next read, killing the engine thread.
 - `App::test_allow_screen_capture()`: real screen capture despite `no_devices` (audio stays synthetic). Only the ignored hardware test uses it.
-- `App::test_media_counters()`: `{ audioIn, videoOut, engineRestarts, engineRunning }` (audio datagrams handed to the engine, video messages delivered to sinks).
+- `App::test_media_counters()`: `{ audioIn, shareAudioIn, shareAudioSent, videoOut, engineRestarts, engineRunning }` (audio datagrams handed to the engine, the share-audio part of them, share-audio datagrams my running share sent, video messages delivered to sinks).
 - `App::test_fetch_from(hash, user, addrs, secs)`: fetch a blob straight from a peer over the blobs protocol, as a modified client could (no message, index or holder lookup).
 - `App::test_post_attachment_ref(conv, channel, hash, name, size)`: publish a message whose attachment claims a hash without holding the bytes.
 - `App::test_pause_file_events(paused)`: the pump drops every file event while paused; resuming runs the lag recovery.
@@ -467,6 +472,12 @@ Joins need no hook, because invites carry the inviter's loopback address.
   - B's sink gets at least 20 raw messages: the first a keyframe with the right track and an Annex-B start code, timestamps increasing.
   - `screen_stop` clears `screenTrack` and drops B's sink.
   - Re-sharing in motion mode works, `screen_unwatch` drops the sink, and leaving voice ends the share.
+- `screen_share_audio_plays_only_for_watchers` (e, audio; three members, synthetic tone):
+  - A shares with audio: A's `voice-updated` says `shareAudio: "system"` and A's share sends.
+  - B watches and its engine gets share audio; C does not watch and gets none.
+  - `set_share_volume` is reported as `shareVolume` (voice `volume` unchanged), clamped to 2, refused for a bad id, and kept across leaving and rejoining.
+  - `screen_unwatch` stops it within 0.5 s; watching again brings it back. A share without `audio` sends none and reports `off`.
+- `call_share_audio_reaches_the_watching_peer` (c, audio): in a 1:1 call the peer gets the share's audio only while watching.
 - `voice_room_edges`: the saved volume comes back in `voice-updated`; a held 6 MB attachment announced as a small clip is refused when saved and its tile is gone; deleting the voice room takes both members out of it.
 - `real_screen_share_of_the_primary_display` (`#[ignore]`, run with `cargo test -p tincan-app --test media -- --ignored real_screen_share`):
   - Shares `display:0` for 2 s through tincan-screen; with no encoder it checks `no-hardware-encoder` instead.

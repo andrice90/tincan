@@ -47,9 +47,9 @@ pub(super) struct ActiveShare {
 }
 
 /// Shown when the share's sound could not be captured.
-const NO_SOUND: &str = "Couldn't capture sound for this share, so only the picture is shared.";
+const NO_SOUND: &str = "Couldn't capture audio for this share, so only the picture is shared.";
 /// Shown when the shared window's app started Tincan (its sound would include the call).
-const ANCESTOR_SOUND: &str = "Sound from that window can't be shared because Tincan runs inside it. Only the picture is shared.";
+const ANCESTOR_SOUND: &str = "Audio from that window can't be shared because Tincan runs inside it. Only the picture is shared.";
 
 /// What share audio captures for `source_id`, or the notice to show instead.
 fn share_audio_source(source_id: &str, synthetic: bool) -> Result<(ShareAudioSource, dto::ShareAudio), &'static str> {
