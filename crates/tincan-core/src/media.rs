@@ -11,7 +11,7 @@ pub const KIND_SCREEN: u16 = 1;
 /// audio datagrams as voice (`AUDIO_MAGIC`), Opus 48 kHz stereo, and is forwarded only to
 /// those watching the matching `KIND_SCREEN` track. Builds from before this kind drop it:
 /// their receivers and hosts accept only `KIND_VOICE` datagrams.
-pub const KIND_SHARE_AUDIO: u16 = 2;
+pub const KIND_SHARE_AUDIO: u16 = 3;
 /// Largest short id that fits in a track id (14 bits).
 pub const MAX_SHORT_ID: u16 = 0x3FFF;
 
@@ -335,9 +335,9 @@ mod tests {
     #[test]
     fn share_audio_tracks_pair_with_screen_tracks() {
         // The kinds stay distinct and in their wire positions (never renumbered).
-        assert_eq!((KIND_VOICE, KIND_SCREEN, KIND_SHARE_AUDIO), (0, 1, 2));
+        assert_eq!((KIND_VOICE, KIND_SCREEN, KIND_SHARE_AUDIO), (0, 1, 3));
         let audio = track_id(5, KIND_SHARE_AUDIO);
-        assert_eq!(audio, 22);
+        assert_eq!(audio, 23);
         assert_eq!(track_short_id(audio), 5);
         assert_eq!(track_kind(audio), KIND_SHARE_AUDIO);
         assert_eq!(screen_of_share_audio(audio), Some(track_id(5, KIND_SCREEN)));

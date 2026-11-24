@@ -777,13 +777,22 @@ async fn screen_share_audio_plays_only_for_watchers() {
     // A share without sound sends none and says so.
     call(&a.app, "screen_stop", json!({})).await;
     call(&a.app, "screen_start", json!({ "sourceId": "test:pattern", "mode": "text" })).await;
-    let mine = call(&a.app, "app_snapshot", json!({})).await["voice"].clone();
-    assert_eq!((mine["sharing"].clone(), mine["shareAudio"].clone()), (json!(true), json!("off")));
+    let mine = eventually("the share without audio started", 20, || async {
+        let v = call(&a.app, "app_snapshot", json!({})).await["voice"].clone();
+        (v["sharing"] == true).then_some(v)
+    })
+    .await;
+    assert_eq!(mine["shareAudio"], "off");
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(a.app.test_media_counters()["shareAudioSent"], 0);
     call(&a.app, "screen_stop", json!({})).await;
-    let mine = call(&a.app, "app_snapshot", json!({})).await["voice"].clone();
-    assert_eq!((mine["sharing"].clone(), mine["shareAudio"].clone()), (json!(false), json!("off")));
+    // The network's share state follows the command a moment later.
+    let mine = eventually("the share stopped", 20, || async {
+        let v = call(&a.app, "app_snapshot", json!({})).await["voice"].clone();
+        (v["sharing"] == false).then_some(v)
+    })
+    .await;
+    assert_eq!(mine["shareAudio"], "off");
 
     for n in [a, b, c] {
         n.app.shutdown().await;
