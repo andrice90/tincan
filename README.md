@@ -1,20 +1,22 @@
 <p align="center">
-  <img src="src-tauri/icons/icon.svg" width="128" height="128" alt="Tincan logo: a tin can sending out sound waves">
+  <img src="src-tauri/icons/icon.svg" width="128" height="128" alt="Tin Can logo: a tin can sending out sound waves">
 </p>
 
-<h1 align="center">Tincan</h1>
+<h1 align="center">Tin Can</h1>
 
 <p align="center">Peer-to-peer group chat, voice and screen share for Windows. No accounts, and no server to run.</p>
 
-Tincan is a Discord-style app where each channel's members **are** the network. The most stable member acts as host. When the host leaves, another member takes over. Messages and files are stored on each member's PC and sync automatically.
+Tin Can is a Discord-style app where each channel's members **are** the network. The most stable member acts as host. When the host leaves, another member takes over. Messages and files are stored on each member's PC and sync automatically.
 
 ## Features
 
 - **Servers:** text channels and voice rooms. Every voice room also has its own text chat.
 - **Direct messages:** one-to-one, plus 1:1 voice calls.
-- **Screen sharing:** share a screen or a window in a voice room or a call.
+- **Screen sharing:** share a screen or a window in a voice room or a call, with its audio. A window share sends that app's audio; a screen share sends everything except Tin Can. Each viewer sets the volume per sharer.
+- **Voice rooms you can look into:** opening a room shows who is inside and its chat; you join with **Join voice**.
+- **AI noise suppression:** an optional neural noise filter for your microphone (Settings > Voice), next to the standard one. See [AI noise suppression](#ai-noise-suppression).
 - **File attachments:** files travel peer to peer and keep downloading from other members who have them after the sender goes offline.
-- **Soundboard:** play short clips into a call. Others pull a clip peer to peer and become a source for it.
+- **Soundboard:** play short clips into a call and stop them. Others pull a clip peer to peer and become a source for it, and set soundboard volume per person and per room.
 - **Short codes:** 6-character server invite codes and friend codes. The owner rotates an invite code without current members losing access.
 - **Owner tools:** remove a member (they can rejoin only with an invite that still works), rename and delete channels.
 - **Avatars and server icons**, with a crop window.
@@ -23,11 +25,11 @@ Tincan is a Discord-style app where each channel's members **are** the network. 
 
 ## Install
 
-Download `Tincan_0.1.0_x64-setup.exe` from the [latest release](../../releases/latest) and run it.
+Download `Tincan_0.2.1_x64-setup.exe` from the [latest release](../../releases/latest) and run it.
 
 - Windows 10 or 11, 64-bit. Screen sharing needs Windows 10 version 2004 or newer.
 - The installer is per user and needs no admin rights. It is not code-signed, so SmartScreen may warn about it: choose **More info**, then **Run anyway**.
-- Every member of a server needs the same version. Older builds can't read events added in newer ones.
+- Every member of a server needs the same version. Older builds can't read events added in newer ones, and 0.1.0 can't hear 0.2.1's soundboard or share audio.
 
 ## Using it
 
@@ -35,7 +37,16 @@ Download `Tincan_0.1.0_x64-setup.exe` from the [latest release](../../releases/l
 2. Create a server, then open **Invite people** and share its 6-character code. Or join someone else's server with their code.
 3. To message someone directly, add them by their friend code (Settings shows yours).
 
-By default Tincan uses n0's public iroh relays to find peers and as a fallback when a direct connection isn't possible. Those relays are rate-limited and come with no guarantee. A custom relay URL can be set in Settings > Network.
+By default Tin Can uses n0's public iroh relays to find peers and as a fallback when a direct connection isn't possible. Those relays are rate-limited and come with no guarantee. A custom relay URL can be set in Settings > Network.
+
+## AI noise suppression
+
+Settings > Voice has an **AI noise suppression** switch under **Noise suppression**. It is off by default. When on, your microphone goes through DPDFNet, a neural speech enhancement model, instead of the standard WebRTC noise filter. It removes much more background noise, such as fans and keyboard clicks.
+
+- It runs on your PC; the model is part of the app.
+- It adds about 50 ms of delay to your voice, against about 7 ms for the standard filter.
+- It uses about a third of one CPU core while you are in a call (measured on an Intel i9-12900K).
+- It is new in 0.2.1 and has only been tested offline on generated speech, not yet in real calls. Turn it off if your voice sounds wrong.
 
 ## Build from source
 
@@ -58,7 +69,6 @@ cd ui && pnpm tauri build
 ```
 
 - **AI noise suppression model:** `scripts/fetch-dpdfnet.ps1` downloads DPDFNet (10 MB, pinned version, checked against its sha256) into `crates/tincan-audio/models/`, which is git-ignored, and the build embeds it. `pnpm tauri build` runs the script; for other builds run it yourself. Without the model the app builds and keeps WebRTC noise suppression only.
-
 - **Profiles:** pass `--profile <name>` or set `TINCAN_PROFILE`. Each profile keeps its own data in `%APPDATA%\Tincan\profiles\<name>`.
 - **Log file:** each run writes `logs\tincan.log` in its profile folder. `TINCAN_LOG=<filter>` changes what is logged and also prints the log to the console.
 
@@ -80,19 +90,20 @@ The docs in [`docs/`](docs) go further:
 
 ## Status
 
-Version 0.1.0 is an early test build:
+Version 0.2.1 is an early test build:
 
 - **Tested:** two profiles on one PC (offline and online), plus Rust and UI test suites.
 - **Not tested yet:**
   - hole punching across networks;
   - relay throughput for voice and video;
   - echo cancellation in a real room;
+  - AI noise suppression in real calls and on slower PCs;
   - the installer on a clean machine.
 
 ## License
 
-Tincan is licensed under the [Apache License, Version 2.0](LICENSE).
+Tin Can is licensed under the [Apache License, Version 2.0](LICENSE).
 
-Builds made with the model include DPDFNet by Ceva (`dpdfnet2_48khz_hr`, [github.com/ceva-ip/DPDFNet](https://github.com/ceva-ip/DPDFNet), [huggingface.co/Ceva-IP/DPDFNet](https://huggingface.co/Ceva-IP/DPDFNet)), also under the Apache License, Version 2.0.
+The release and builds made with the model include DPDFNet by Ceva (`dpdfnet2_48khz_hr`, [github.com/ceva-ip/DPDFNet](https://github.com/ceva-ip/DPDFNet), [huggingface.co/Ceva-IP/DPDFNet](https://huggingface.co/Ceva-IP/DPDFNet)), also under the Apache License, Version 2.0.
 
 The repository and the release contain no third-party sounds, so the join and leave cues in voice rooms are silent by default. To hear them, put your own sounds in `crates/tincan-app/assets/` as `voice-join.wav` and `voice-leave.wav` (WAV, up to 10 seconds) before building. The build embeds them when both files are present; that folder is git-ignored.
