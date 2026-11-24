@@ -138,8 +138,10 @@ pub enum AudioEvent {
     LocalSpeaking(bool),
     /// Microphone level 0..1 (-60..0 dBFS) while a mic test is on, about 20 per second.
     MicLevel(f32),
-    /// A soundboard clip finished (or was cancelled by deafen, stop_call or a newer clip).
-    ClipFinished,
+    /// Soundboard clip `id` (from [`AudioEngine::play_clip`]) is over: it was sent and played,
+    /// stopped (`stop_clip`, `stop_clips`), cut by deafen, `stop_call` or a newer clip, or it
+    /// could not start on the engine thread.
+    ClipFinished(u64),
     /// A device problem, as a short user-facing sentence. The engine keeps retrying.
     DeviceError(String),
     /// The default device changed, a stream was re-routed, or a failed device recovered.

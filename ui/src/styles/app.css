@@ -44,15 +44,6 @@
   color: var(--text-3);
 }
 
-.person-id {
-  font-size: var(--fs-12);
-  color: var(--text-3);
-}
-
-.person-id .mono {
-  font-size: var(--fs-12);
-}
-
 /* ---------------------------------------------------------------- title bar */
 
 .titlebar {
@@ -1424,7 +1415,8 @@ button.clip-tile:hover:not(:disabled) {
   opacity: 0.5;
 }
 
-.clip-tile.is-playing {
+.clip-tile.is-playing,
+button.clip-tile.is-playing:hover:not(:disabled) {
   background: var(--accent);
   color: var(--accent-fg);
 }
@@ -1452,6 +1444,32 @@ button.clip-tile:hover:not(:disabled) {
 
 .clip-tile.is-heard {
   padding-right: 36px;
+}
+
+.clip-cell {
+  position: relative;
+  display: grid;
+}
+
+/* room for the stop button, so the name ends before it */
+.clip-cell:has(.clip-stop) .clip-tile {
+  padding-right: 36px;
+}
+
+.clip-stop {
+  position: absolute;
+  top: 50%;
+  right: var(--sp-1);
+  margin-top: -14px;
+  color: var(--accent-fg);
+}
+
+.volume-sliders .field-label:not(:first-child) {
+  margin-top: var(--sp-2);
+}
+
+.menu-head .volume-sliders {
+  margin-top: var(--sp-2);
 }
 
 .clip-save {
@@ -1529,9 +1547,8 @@ button.clip-tile:hover:not(:disabled) {
   font-weight: 600;
 }
 
-.volume-pop .person-id {
+.volume-pop .menu-head-name {
   display: block;
-  margin-bottom: var(--sp-2);
 }
 
 .menu-sep {

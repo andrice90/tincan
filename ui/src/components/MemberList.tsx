@@ -6,8 +6,9 @@ import { memo, useMemo } from "react";
 import type { Member, ServerId } from "../api/types";
 import { messageUser, openDialog, startCall } from "../store/actions";
 import { useStore } from "../store/store";
-import { ICON_SM, PersonId, PersonName, SpeakingAvatar } from "./common";
+import { ICON_SM, PersonName, SpeakingAvatar } from "./common";
 import { Menu, useMenu, type MenuItem } from "./Menu";
+import { PersonVolumes } from "./VolumeSliders";
 
 const EMPTY: Member[] = [];
 
@@ -74,8 +75,10 @@ const MemberRow = memo(function MemberRow({
           label={`${m.name} menu`}
           header={
             <>
-              <bdi className="menu-head-name truncate">{m.name}</bdi>
-              <PersonId userId={m.userId} />
+              <span className="menu-head-name truncate">
+                <PersonName userId={m.userId} name={m.name} />
+              </span>
+              {!isMe && <PersonVolumes userId={m.userId} />}
             </>
           }
         />

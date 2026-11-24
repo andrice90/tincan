@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tincan_core::event::{Body, ChannelKind};
-use tincan_core::media::{AudioHeader, KIND_SCREEN, KIND_VOICE, VideoFrame, track_id};
+use tincan_core::media::{AudioHeader, KIND_SCREEN, KIND_SOUND, KIND_VOICE, VideoFrame, track_id};
 use tincan_core::wire::{ClipInfo, Ctl};
 use tincan_core::{BlobHash, ChannelId, ServerId, UserId};
 use tokio::sync::{broadcast, mpsc};
@@ -46,6 +46,26 @@ fn pump_audio(tx: mpsc::Sender<Bytes>) -> tokio::task::JoinHandle<()> {
         }
     })
 }
+
+/// Like [`pump_audio`], plus a soundboard packet (`KIND_SOUND`) with every voice packet: a
+/// member playing a clip sends two streams.
+fn pump_with_sound(tx: mpsc::Sender<Bytes>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seq = 0u16;
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tick.tick().await;
+            let sound = AudioHeader { track: track_id(0, KIND_SOUND), seq, ts: u32::from(seq) * 960, ..AudioHeader::default() }.packet(b"clip");
+            if tx.send(audio_pkt(seq)).await.is_err() || tx.send(sound).await.is_err() {
+                return;
+            }
+            seq = seq.wrapping_add(1);
+        }
+    })
+}
+
+/// The soundboard track of the member whose voice track is `voice`.
+fn sound_of(voice: u16) -> u16 { (voice & !3) | KIND_SOUND }
 
 fn voice_track(n: &Node) -> u16 { n.net.voice_info().map(|v| v.local_track).unwrap_or(u16::MAX) }
 
@@ -188,11 +208,13 @@ async fn voice_room_audio_reaches_room_members_only() {
     .await;
     let (ta, tb, tc, td) = (voice_track(&a), voice_track(&b), voice_track(&c), voice_track(&d));
     assert_eq!(ta, track_id(a.net.my_short_id(&server).unwrap(), KIND_VOICE));
-    let pumps: Vec<_> = [&sa, &sb, &sc, &sd].iter().map(|s| pump_audio(s.audio_out.clone())).collect();
+    // Everyone also plays a clip: the soundboard track travels like the voice track.
+    let pumps: Vec<_> = [&sa, &sb, &sc, &sd].iter().map(|s| pump_with_sound(s.audio_out.clone())).collect();
+    let s = sound_of;
 
     let mut heard: [HashSet<u16>; 4] = Default::default();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let want = [[tb, tc], [ta, tc], [ta, tb]];
+    let want = [[tb, tc, s(tb), s(tc)], [ta, tc, s(ta), s(tc)], [ta, tb, s(ta), s(tb)]];
     loop {
         for (i, s) in [&mut sa, &mut sb, &mut sc, &mut sd].into_iter().enumerate() {
             heard[i].extend(drain_tracks(&mut s.audio_in));
@@ -209,9 +231,9 @@ async fn voice_room_audio_reaches_room_members_only() {
     for (i, s) in [&mut sa, &mut sb, &mut sc, &mut sd].into_iter().enumerate() {
         heard[i].extend(drain_tracks(&mut s.audio_in));
     }
-    assert_eq!(heard[0], HashSet::from([tb, tc]), "host's local path");
-    assert_eq!(heard[1], HashSet::from([ta, tc]));
-    assert_eq!(heard[2], HashSet::from([ta, tb]));
+    assert_eq!(heard[0], HashSet::from([tb, tc, s(tb), s(tc)]), "host's local path");
+    assert_eq!(heard[1], HashSet::from([ta, tc, s(ta), s(tc)]));
+    assert_eq!(heard[2], HashSet::from([ta, tb, s(ta), s(tb)]));
     assert!(heard[3].is_empty(), "a member of another room heard {:?}", heard[3]);
     let _ = td;
     // Leaving stops the flow and clears the roster entry.
@@ -527,17 +549,19 @@ async fn dm_call_start_accept_hangup_with_audio_both_ways() {
     let (ta, tb) = (track_id(call_short_id(&a.net.me(), &b.net.me()), KIND_VOICE), track_id(call_short_id(&b.net.me(), &a.net.me()), KIND_VOICE));
     assert_ne!(ta, tb);
     assert_eq!(voice_track(&a), ta);
-    let pa = pump_audio(sa.audio_out.clone());
-    let pb = pump_audio(sb.audio_out.clone());
+    let pa = pump_with_sound(sa.audio_out.clone());
+    let pb = pump_with_sound(sb.audio_out.clone());
     let deadline = Instant::now() + Duration::from_secs(5);
     let (mut at_a, mut at_b) = (HashSet::new(), HashSet::new());
-    while !(at_a.contains(&tb) && at_b.contains(&ta)) {
+    let heard_all = |at_a: &HashSet<u16>, at_b: &HashSet<u16>| at_a.contains(&tb) && at_a.contains(&sound_of(tb)) && at_b.contains(&ta) && at_b.contains(&sound_of(ta));
+    while !heard_all(&at_a, &at_b) {
         assert!(Instant::now() < deadline, "call audio: a heard {at_a:?}, b heard {at_b:?}");
         at_a.extend(drain_tracks(&mut sa.audio_in));
         at_b.extend(drain_tracks(&mut sb.audio_in));
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(!at_a.contains(&ta) && !at_b.contains(&tb), "nobody hears themselves");
+    assert!(!at_a.contains(&sound_of(ta)) && !at_b.contains(&sound_of(tb)), "nor their own clips");
     // Mute state reaches the peer.
     a.net.set_status(|s| s.muted = true);
     next_event(&mut b_ev, "peer muted", Duration::from_secs(5), |e| match e {

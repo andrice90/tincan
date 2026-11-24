@@ -21,6 +21,7 @@ mod cues;
 mod engine;
 mod screen;
 mod session;
+mod volumes;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -49,6 +50,10 @@ pub(crate) const COMMANDS: &[&str] = &[
     "set_muted",
     "set_deafened",
     "set_user_volume",
+    "set_user_soundboard_volume",
+    "user_volume",
+    "room_soundboard_volume",
+    "set_room_soundboard_volume",
     "screen_sources",
     "screen_start",
     "screen_stop",
@@ -58,6 +63,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "clip_remove",
     "clip_rename",
     "clip_play",
+    "clip_stop",
     "clip_fetch",
     "audio_devices",
     "mic_test",
@@ -101,6 +107,12 @@ struct State {
     room: session::RoomMap,
     /// Per-user playback volume (0..2), persisted.
     volumes: HashMap<UserId, f32>,
+    /// Per-user soundboard volume (0..2, a multiplier on their clips), persisted.
+    sound_volumes: HashMap<UserId, f32>,
+    /// Per-voice-room soundboard volume (0..2, every clip heard there), persisted.
+    room_sound: HashMap<tincan_core::ChannelId, f32>,
+    /// My clips playing now, by engine clip id (cleared on detach and engine restart).
+    playing: HashMap<u64, BlobHash>,
     /// My running screen share.
     share: Option<screen::ActiveShare>,
     /// Clips heard in this session.
@@ -190,6 +202,19 @@ struct VolumeArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RoomArgs {
+    channel_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoomVolumeArgs {
+    channel_id: String,
+    volume: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ScreenStartArgs {
     source_id: String,
     mode: dto::ShareMode,
@@ -257,6 +282,8 @@ impl Media {
         {
             let mut st = self.st.lock();
             st.volumes = session::load_volumes(core);
+            st.sound_volumes = volumes::load_user_sound(core);
+            st.room_sound = volumes::load_room_sound(core);
             st.fetching = clips::load_fetches(core);
         }
         self.announce_clips(core);
@@ -311,6 +338,24 @@ impl Media {
                 self.set_user_volume(core, parse_user(&a.user_id)?, a.volume)?;
                 Ok(Value::Null)
             }
+            "set_user_soundboard_volume" => {
+                let a: VolumeArgs = parse(cmd, args)?;
+                self.set_user_soundboard_volume(core, parse_user(&a.user_id)?, a.volume)?;
+                Ok(Value::Null)
+            }
+            "user_volume" => {
+                let a: UserArgs = parse(cmd, args)?;
+                ok(self.user_volume(&parse_user(&a.user_id)?))
+            }
+            "room_soundboard_volume" => {
+                let a: RoomArgs = parse(cmd, args)?;
+                ok(self.room_soundboard_volume(&parse_channel(&a.channel_id)?))
+            }
+            "set_room_soundboard_volume" => {
+                let a: RoomVolumeArgs = parse(cmd, args)?;
+                self.set_room_soundboard_volume(core, parse_channel(&a.channel_id)?, a.volume)?;
+                Ok(Value::Null)
+            }
             "screen_sources" => ok(self.screen_sources().await?),
             "screen_start" => {
                 let a: ScreenStartArgs = parse(cmd, args)?;
@@ -343,6 +388,11 @@ impl Media {
             "clip_play" => {
                 let a: HashArgs = parse(cmd, args)?;
                 self.clip_play(core, parse_hash(&a.hash)?).await?;
+                Ok(Value::Null)
+            }
+            "clip_stop" => {
+                let a: HashArgs = parse(cmd, args)?;
+                self.clip_stop(core, parse_hash(&a.hash)?);
                 Ok(Value::Null)
             }
             "clip_fetch" => {

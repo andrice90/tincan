@@ -1,21 +1,26 @@
 // Soundboard panel, opened from the call panel while in voice.
 
-import { Download, Pencil, Trash2, X } from "lucide-react";
-import { memo, useEffect } from "react";
+import { Download, Pencil, Square, Trash2, X } from "lucide-react";
+import { memo, useEffect, useRef } from "react";
 import { errorText, pickFiles } from "../api/client";
 import type { Clip } from "../api/types";
 import { formatSeconds } from "../lib/format";
-import { fetchClip, openDialog, playClip, pushToast, removeClip, setSoundboardOpen } from "../store/actions";
+import { closesOnEscape, closesOnPointerDown } from "../lib/outsideClose";
+import { fetchClip, openDialog, playClip, pushToast, removeClip, setSoundboardOpen, stopClip } from "../store/actions";
+import { isMyClipPlaying } from "../store/calls";
 import { CLIP_EXTENSIONS } from "../store/clips";
 import { usePlaying, useStore } from "../store/store";
 import { ICON_SM, IconButton } from "./common";
 import { Menu, useMenu } from "./Menu";
 
 const OwnedTile = memo(function OwnedTile({ clip, disabled }: { clip: Clip; disabled: boolean }) {
-  const playing = usePlaying(clip.hash);
+  // Mine: the app reports it until it ends or I stop it. Someone else playing it lights the
+  // tile too, with no stop.
+  const mine = useStore((s) => isMyClipPlaying(s.voice, clip.hash));
+  const playing = usePlaying(clip.hash) || mine;
   const menu = useMenu();
   return (
-    <>
+    <div className="clip-cell">
       <button
         type="button"
         className={playing ? "clip-tile is-playing" : "clip-tile"}
@@ -30,6 +35,11 @@ const OwnedTile = memo(function OwnedTile({ clip, disabled }: { clip: Clip; disa
       </span>
         <span className="clip-meta">{formatSeconds(clip.durationMs)}</span>
       </button>
+      {mine && (
+        <IconButton small className="clip-stop" label={`Stop ${clip.name}`} onClick={() => stopClip(clip)}>
+          <Square size={ICON_SM} fill="currentColor" />
+        </IconButton>
+      )}
       {menu.anchor && (
         <Menu
           anchor={menu.anchor}
@@ -41,7 +51,7 @@ const OwnedTile = memo(function OwnedTile({ clip, disabled }: { clip: Clip; disa
           ]}
         />
       )}
-    </>
+    </div>
   );
 });
 
@@ -90,13 +100,22 @@ export function Soundboard() {
   const membersByServer = useStore((s) => s.members);
   const dms = useStore((s) => s.dms);
   const deafened = voice?.deafened ?? false;
+  const ref = useRef<HTMLElement>(null);
 
+  // Closes on Escape and on a click outside it (see lib/outsideClose.ts for what counts).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setSoundboardOpen(false);
+      if (e.key === "Escape" && closesOnEscape(e, document.querySelector("dialog[open]") !== null)) setSoundboardOpen(false);
+    };
+    const onDown = (e: PointerEvent) => {
+      if (closesOnPointerDown<Element>(e.target instanceof Element ? e.target : null, ref.current)) setSoundboardOpen(false);
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    document.addEventListener("pointerdown", onDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onDown, true);
+    };
   }, []);
 
   const owned = clips.filter((c) => c.owned);
@@ -121,7 +140,7 @@ export function Soundboard() {
   };
 
   return (
-    <section className="soundboard" aria-label="Soundboard">
+    <section ref={ref} className="soundboard" aria-label="Soundboard">
       <div className="soundboard-head">
         <h2>Soundboard</h2>
         <IconButton small label="Close soundboard" onClick={() => setSoundboardOpen(false)}>

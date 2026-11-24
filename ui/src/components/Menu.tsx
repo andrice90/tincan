@@ -38,20 +38,28 @@ export function Popover({ anchor, onClose, label, role = "dialog", className, ch
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const w = el.offsetWidth;
-    const h = el.offsetHeight;
-    let left: number;
-    let top: number;
-    if ("x" in anchor) {
-      left = anchor.x;
-      top = anchor.y;
-    } else {
-      left = anchor.align === "end" ? anchor.rect.right - w : anchor.rect.left;
-      top = anchor.above ? anchor.rect.top - h - 4 : anchor.rect.bottom + 4;
-    }
-    left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
-    top = Math.max(40, Math.min(top, window.innerHeight - h - 8));
-    setPos({ left, top });
+    const place = () => {
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      let left: number;
+      let top: number;
+      if ("x" in anchor) {
+        left = anchor.x;
+        top = anchor.y;
+      } else {
+        left = anchor.align === "end" ? anchor.rect.right - w : anchor.rect.left;
+        top = anchor.above ? anchor.rect.top - h - 4 : anchor.rect.bottom + 4;
+      }
+      left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
+      top = Math.max(40, Math.min(top, window.innerHeight - h - 8));
+      setPos((p) => (p && p.left === left && p.top === top ? p : { left, top }));
+    };
+    place();
+    // Content that arrives after opening (volume sliders waiting for saved values) grows the
+    // panel: keep it inside the window.
+    const ro = new ResizeObserver(place);
+    ro.observe(el);
+    return () => ro.disconnect();
   }, [anchor]);
 
   useEffect(() => {
@@ -108,6 +116,8 @@ interface MenuProps {
 export function Menu({ anchor, items, onClose, label, header }: MenuProps) {
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    // A slider in the header keeps its own arrow keys.
+    if (e.target instanceof HTMLInputElement) return;
     e.preventDefault();
     const buttons = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
     if (buttons.length === 0) return;

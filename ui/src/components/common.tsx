@@ -100,15 +100,6 @@ export function UnreadBadge({ badge }: { badge: BadgeContent }) {
   );
 }
 
-/** "ID abcd1234": the short id, shown where one person is looked at (menus, popovers). */
-export function PersonId({ userId }: { userId: UserId }) {
-  return (
-    <span className="person-id">
-      ID <bdi className="mono">{shortId(userId)}</bdi>
-    </span>
-  );
-}
-
 interface IconButtonProps {
   label: string;
   onClick?: () => void;

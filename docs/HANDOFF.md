@@ -4,6 +4,15 @@ Status of the Tincan build for the next session. Updated at every milestone comm
 
 ## Where it stands
 
+### Soundboard and names (branch `worktree-agent-a345a20b5a9682faf`)
+
+- **Stop a sound:** a stop button on the tile of a sound I am playing; it stops it here and in the call at once (`clip_stop`, `VoiceSession.playingClips`).
+- **Soundboard track:** clips now travel on their own audio track per member (`KIND_SOUND`, track kind 2) instead of inside the voice packets. That makes a true per-person soundboard volume possible. **Compatibility:** older builds drop these packets, so everyone in a room needs this build to hear clips.
+- **Volumes:** right-click a member or a voice tile for Volume and Soundboard volume; right-click a voice room for its Soundboard volume. All saved on this PC.
+- **Names:** display names only. The short id shows only when two names look alike (SECURITY-4).
+- The soundboard closes on a click outside it.
+- Not verified: the two-profile UI e2e was not run for this change, and nothing on real audio hardware.
+
 ### Third round (2026-11-24)
 
 - **Floating layout, now the default:** every region is a rounded card with a gap around it, and panels slide open and closed (ease-in-out, with a reverse for each). Classic stays available in Settings > Appearance > Layout. The composer card and the account card are both 52 px tall.

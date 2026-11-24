@@ -15,6 +15,7 @@ import type {
   AudioDevices,
   CallInfo,
   Channel,
+  BlobHash,
   ChannelId,
   ChannelKind,
   Clip,
@@ -151,6 +152,12 @@ const st = {
   screenTracks: new Map<UserId, number>(),
   /** Per-user playback volumes (0..2), as saved by set_user_volume. Jordan starts quieter. */
   volumes: new Map<UserId, number>([[people.jordan.id, 0.3]]),
+  /** Per-user soundboard volumes (0..2), as saved by set_user_soundboard_volume. */
+  soundVolumes: new Map<UserId, number>(),
+  /** Per-voice-room soundboard volumes (0..2), as saved by set_room_soundboard_volume. */
+  roomSoundVolumes: new Map<ChannelId, number>(),
+  /** My clips playing now, by hash: the timer that ends each. */
+  playing: new Map<BlobHash, ReturnType<typeof setTimeout>>(),
   heardDemoDone: false,
   /** Short invite code per server ("ABC-DEF"); none until the owner made one. */
   inviteCodes: new Map<ServerId, string>(),
@@ -628,7 +635,14 @@ function participantOf(m: { userId: UserId; name: string; muted: boolean; deafen
     avatar: m.userId === st.me?.userId ? st.me.avatar : (SAMPLE_AVATARS.get(m.userId) ?? null),
     screenTrack: st.screenTracks.get(m.userId) ?? null,
     volume: m.userId === st.me?.userId ? 1 : (st.volumes.get(m.userId) ?? 1),
+    soundboardVolume: m.userId === st.me?.userId ? 1 : (st.soundVolumes.get(m.userId) ?? 1),
   };
+}
+
+/** My clips stop when I leave voice. */
+function stopPlaying(): void {
+  for (const t of st.playing.values()) clearTimeout(t);
+  st.playing.clear();
 }
 
 /** Rebuilds the voice session from the member list (rooms) or the call peer (calls). */
@@ -640,6 +654,7 @@ function rebuildVoice(): void {
   v.muted = st.selfMuted;
   v.deafened = st.selfDeafened;
   v.sharing = st.screenTracks.has(me.userId);
+  v.playingClips = [...st.playing.keys()].sort();
   if (v.kind === "room") {
     const s = st.servers.find((x) => x.summary.id === v.convId);
     if (!s) return;
@@ -913,6 +928,7 @@ function endCall(): void {
   st.call = null;
   emit("call-updated", null);
   if (hadVoice) {
+    stopPlaying();
     st.voice = null;
     st.screenTracks.delete(meId());
     emit("voice-updated", null);
@@ -932,6 +948,7 @@ function startCallVoice(dm: DmSummary): VoiceSession {
     sharing: false,
     path: "relay",
     rttMs: 88,
+    playingClips: [],
   };
   rebuildVoice();
   ensureSpeakingTimer();
@@ -942,6 +959,7 @@ function startCallVoice(dm: DmSummary): VoiceSession {
 function leaveRoom(): void {
   const me = st.me;
   if (me) st.screenTracks.delete(me.userId);
+  stopPlaying();
   st.voice = null;
   setMyVoiceState();
   emit("voice-updated", null);
@@ -1408,6 +1426,7 @@ const handlers: Handlers = {
       sharing: false,
       path: s.summary.connection.path === "none" ? "direct" : s.summary.connection.path,
       rttMs: s.summary.connection.rttMs,
+      playingClips: [],
     };
     setMyVoiceState();
     rebuildVoice();
@@ -1496,6 +1515,23 @@ const handlers: Handlers = {
     return null;
   },
 
+  set_user_soundboard_volume: ({ userId, volume }) => {
+    if (!(volume >= 0 && volume <= 2)) fail("Volume must be between 0% and 200%.");
+    st.soundVolumes.set(userId, volume);
+    if (st.voice) voiceChanged();
+    return null;
+  },
+
+  user_volume: ({ userId }) => ({ volume: st.volumes.get(userId) ?? 1, soundboardVolume: st.soundVolumes.get(userId) ?? 1 }),
+
+  room_soundboard_volume: ({ channelId }) => st.roomSoundVolumes.get(channelId) ?? 1,
+
+  set_room_soundboard_volume: ({ channelId, volume }) => {
+    if (!(volume >= 0 && volume <= 2)) fail("Volume must be between 0% and 200%.");
+    st.roomSoundVolumes.set(channelId, volume);
+    return null;
+  },
+
   screen_sources: async () => {
     await sleep(200);
     const sources: ScreenSource[] = [
@@ -1565,7 +1601,27 @@ const handlers: Handlers = {
     if (!st.voice) fail("not-in-voice");
     if (st.selfDeafened) fail("deafened");
     const c = st.clips.find((x) => x.hash === hash && x.owned) ?? fail("Save that sound before playing it.");
+    const prev = st.playing.get(hash);
+    if (prev) clearTimeout(prev);
+    st.playing.set(
+      hash,
+      setTimeout(() => {
+        st.playing.delete(hash);
+        if (st.voice) voiceChanged();
+      }, c.durationMs),
+    );
+    voiceChanged();
     emit("sound-played", { userId: me.userId, name: me.name, clip: c });
+    return null;
+  },
+
+  clip_stop: ({ hash }) => {
+    const t = st.playing.get(hash);
+    if (t) {
+      clearTimeout(t);
+      st.playing.delete(hash);
+      if (st.voice) voiceChanged();
+    }
     return null;
   },
 

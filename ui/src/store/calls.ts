@@ -1,6 +1,6 @@
 // Pure decisions for voice rooms and calls, kept apart from the store so they can be tested.
 
-import type { CallInfo, VoiceParticipant, VoiceSession } from "../api/types";
+import type { BlobHash, CallInfo, VoiceParticipant, VoiceSession } from "../api/types";
 
 /** The command the call panel's red button sends. */
 export type LeaveCommand = "voice_leave" | "call_hangup" | null;
@@ -18,23 +18,29 @@ export function leaveCommand(voice: VoiceSession | null, call: CallInfo | null):
 }
 
 /**
- * A tile's person. `volume` is null when it is not known: tiles of a room you have not
- * joined (the app reports saved volumes only for joined rooms and calls).
+ * A tile's person. The volumes are null when they are not known: tiles of a room you have
+ * not joined (the app reports saved volumes only for joined rooms and calls; the menu then
+ * asks for them with `user_volume`).
  */
-export type TilePerson = Omit<VoiceParticipant, "volume"> & { volume: number | null };
+export type TilePerson = Omit<VoiceParticipant, "volume" | "soundboardVolume"> & { volume: number | null; soundboardVolume: number | null };
 
 /**
- * Where the per-user volume slider starts: this session's choice, else the saved volume.
- * Null when neither is known: then no slider is shown, so a click on it can never replace
- * the saved volume with a made-up 100%.
+ * Where a volume slider starts: this session's choice, else the saved volume. Null when
+ * neither is known: then no slider is shown, so a click on it can never replace the saved
+ * volume with a made-up 100%.
  */
-export function initialVolume(chosen: number | undefined, p: TilePerson): number | null {
-  return chosen ?? p.volume;
+export function initialVolume(chosen: number | undefined, saved: number | null): number | null {
+  return chosen ?? saved;
 }
 
 /** Send the slider's value only when it differs from the one last sent (or shown at open). */
 export function shouldSend(last: number, current: number): boolean {
   return Math.round(last * 100) !== Math.round(current * 100);
+}
+
+/** True while my own clip `hash` plays in the session (the app's engine-driven list). */
+export function isMyClipPlaying(voice: VoiceSession | null, hash: BlobHash): boolean {
+  return voice?.playingClips.includes(hash) ?? false;
 }
 
 /** Which parts the call panel shows. */

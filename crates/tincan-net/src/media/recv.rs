@@ -14,7 +14,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use iroh::endpoint::{Connection, RecvStream, VarInt};
 use tincan_core::media::{
-    AudioHeader, CODEC_H264_ANNEXB, KIND_VOICE, VIDEO_STREAM_HEADER_LEN, VideoFrame, VideoFrameReader, VideoStreamHeader, track_kind,
+    AudioHeader, CODEC_H264_ANNEXB, VIDEO_STREAM_HEADER_LEN, VideoFrame, VideoFrameReader, VideoStreamHeader, is_audio_kind, track_kind,
+    track_short_id,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -369,7 +370,8 @@ fn on_msg(orders: &mut HashMap<u16, Order>, sink: &dyn VideoSink, m: Msg) {
     }
 }
 
-/// Read audio datagrams on `conn` into `audio_in` (voice tracks other than `own`), counting
+/// Read audio datagrams on `conn` into `audio_in` (voice and soundboard tracks of anyone but
+/// the owner of `own`, my voice track), counting
 /// them in `stats`. Ends with the connection.
 pub(crate) async fn audio_rx(conn: Connection, own: Arc<std::sync::atomic::AtomicU16>, audio_in: mpsc::Sender<Bytes>, stats: Arc<RxStats>) {
     let mut buf = vec![Bytes::new(); DATAGRAM_BATCH];
@@ -382,7 +384,7 @@ pub(crate) async fn audio_rx(conn: Connection, own: Arc<std::sync::atomic::Atomi
         let own = own.load(std::sync::atomic::Ordering::Relaxed);
         for pkt in buf.iter_mut().take(n).map(std::mem::take) {
             let Some((h, _)) = AudioHeader::parse(&pkt) else { continue };
-            if track_kind(h.track) != KIND_VOICE || h.track == own {
+            if !is_audio_kind(track_kind(h.track)) || track_short_id(h.track) == track_short_id(own) {
                 continue;
             }
             stats.with(h.track, |t| t.audio(h.seq, h.ts, now));

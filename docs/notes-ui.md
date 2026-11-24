@@ -18,8 +18,9 @@ Pure UI logic has dependency-free tests: from `ui/`, run `node --experimental-st
 
 | Module | Rules |
 |---|---|
-| `store/calls.ts` | which command Leave voice / Hang up sends, which parts the call panel shows, where the per-user volume slider starts, a voice room's view (`roomStage`: joined stage, or viewing with "Join voice") |
+| `store/calls.ts` | which command Leave voice / Hang up sends, which parts the call panel shows, where the per-user volume slider starts, a voice room's view (`roomStage`: joined stage, or viewing with "Join voice"), whether my clip is playing (stop button) |
 | `store/chatView.ts` | which chat is on screen and so may be marked read (`shownChat`, `roomChatShown`), what the room row's chat button does (`roomChatClick`) |
+| `lib/outsideClose.ts` | when a click outside the soundboard or Escape closes it |
 | `store/messages.ts` | message cache merges (first page, live events, older pages, snapshot refresh, off-screen cap) |
 | `store/typing.ts` | the typing list and its sweep timer (timers injected) |
 | `store/transfers.ts` | when a command's transfer result may replace the store's, which transfers a snapshot re-reads |
@@ -79,7 +80,7 @@ Join errors: codes shorter than 40 chars, codes not starting with `tincan1`, `ti
 
 ## Names
 
-Display names are chosen by each peer and are not unique. When two people the UI knows (members of any server, DM contacts) use names that look the same, both are shown with their short id (the first 8 characters of the user id, the app's fallback name) after the name: member list, DM list, DM header, message authors, voice tiles, room lists, incoming call. The member menu and the voice tile popover always show "ID <short id>". Peer names and ids render in `<bdi>`, so a name's bidi controls can't reorder the id, and a long name is cut short with an ellipsis while the id after it stays whole (`.person` is an inline flex row). Nothing changes in text e2e matches unless two names clash.
+Display names are chosen by each peer and are not unique. The UI shows display names only. The one exception is SECURITY-4: when two people the UI knows (members of any server, DM contacts, me) use names that look the same, both are shown with their short id (the first 8 characters of the user id, the app's fallback name) after the name, through `PersonName`/`IdSuffix`: member list, member menu, DM list, DM header, message authors, voice tiles and their popover, room lists, incoming call. The member menu and the voice tile popover no longer show "ID <short id>" for everyone (`PersonId` is gone). IDs stay where they are the point: "Copy full ID" and the friend code in Settings, and the Add contact dialog. A person with no known name is shown as their short id by the app (`short_name`), because there is no name to show. Peer names and ids render in `<bdi>`, so a name's bidi controls can't reorder the id, and a long name is cut short with an ellipsis while the id after it stays whole (`.person` is an inline flex row). Nothing changes in text e2e matches unless two names clash.
 
 `nameKey` decides what "look the same" means: NFKD (width, ligatures, math letters), then default-ignorable and format characters (zero-width, bidi controls, variation selectors, Hangul fillers, soft hyphen) and combining marks (accents, overlays) are removed, Cyrillic, Greek, Armenian and a few Latin letters that look like a Latin letter are mapped to it (a UTS #39 confusables subset, mapped before lowercasing so Greek capital eta is H and small eta is n), then lowercase, 0 to o, and 1, l, i, I and | to l, and runs of spaces to one. It folds too much on purpose: two different names that fold together only get an extra short id. My own name is in the index too, so a contact named like me gets the id. Results are cached (bounded, names come from peers).
 
@@ -153,6 +154,13 @@ Tasks for the owner:
 
 - [x] `crates/tincan-app`: the toasts and error texts the UI shows come from the app (mirrored in `src/api/mock.ts`) and were outside this pass. Checked afterwards: one passive toast reworded ("Audio stopped working, so Tincan restarted it.").
 - [x] `docs/HANDOFF.md`: mark "unslop-ui pass on the UI" done.
+
+## Soundboard stop, volumes, outside click
+
+- **Stop.** An owned tile shows a stop button (`.clip-stop`, a sibling of the tile button in `.clip-cell`, since a button can't hold a button) while its hash is in `VoiceSession.playingClips`. The tile keeps `aria-label="Play <name>"` and `is-playing` (e2e selects both); `is-playing` is also lit by `sound-played` for someone else's play, which has no stop. `playClip` no longer starts a local timer for my own play: the app's list drives it.
+- **Volumes.** `components/VolumeSliders.tsx`: `PersonVolumes` (Volume and Soundboard volume) in the member menu header (not on my own row) and the voice tile popover, `RoomSoundVolume` in the voice room menu header (now for every member; the rename and delete items stay owner only). Without values from the voice session the sliders wait for `user_volume` / `room_soundboard_volume`, so a release never saves a made-up 100 %. Values picked this session are kept per person and room. `Menu` leaves the arrow keys to a slider in its header.
+- **Outside click.** The soundboard is not a `Popover` (that closes on window blur, and the Add sound file picker blurs the window). A capture-phase `pointerdown` closes it unless the target is inside it, in a `.popover` or `dialog`, or on `.soundboard-toggle` (the call panel button, so it toggles). Escape closes it unless a menu took the key first or a dialog is open.
+- unslop-ui final pass (`--surface`) on the soundboard, the volume sliders and the menus: none to cut. The new copy is "Volume", "Soundboard volume", "Stop <name>". Two surface fixes made while checking it in the mock: a hovered playing tile lost its accent (the hover rule outranked `is-playing`), and a playing tile's name ran under the stop button (36 px right padding while it shows).
 
 ## Avatars and server icons
 

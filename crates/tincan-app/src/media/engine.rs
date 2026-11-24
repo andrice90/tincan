@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tincan_audio::{AudioConfig, AudioEngine, AudioError, AudioEvent, AudioIo, AudioSource, ClipPcm, NullSink};
-use tincan_core::media::track_short_id;
+use tincan_core::media::{KIND_VOICE, track_kind, track_short_id};
 use tokio::sync::mpsc;
 
 use super::{MAX_CLIP_MS, Media, State};
@@ -222,7 +222,8 @@ impl Media {
     /// One engine event.
     fn on_audio_event(&self, core: &Core, ev: AudioEvent) {
         match ev {
-            AudioEvent::Speaking { track, speaking } => {
+            // Only voice tracks light the ring (a soundboard track never sets the flag).
+            AudioEvent::Speaking { track, speaking } if track_kind(track) == KIND_VOICE => {
                 let mut st = self.st.lock();
                 if let Some(user) = st.room.short.get(&track_short_id(track)).copied() {
                     set_speaking(core, &mut st, user, speaking);
@@ -234,7 +235,13 @@ impl Media {
             }
             AudioEvent::MicLevel(level) => core.events.emit(Ev::MicLevel, dto::MicLevel { level: level.clamp(0.0, 1.0) }),
             AudioEvent::DeviceError(text) => core.toast(ToastKind::Error, text),
-            AudioEvent::DeviceChanged | AudioEvent::ClipFinished => {}
+            AudioEvent::Speaking { .. } | AudioEvent::DeviceChanged => {}
+            AudioEvent::ClipFinished(id) => {
+                let mut st = self.st.lock();
+                if st.playing.remove(&id).is_some() {
+                    self.emit_voice(core, &mut st);
+                }
+            }
         }
     }
 
@@ -260,6 +267,11 @@ impl Media {
         }
         for user in std::mem::take(&mut st.speaking) {
             core.events.emit(Ev::Speaking, dto::Speaking { user_id: user.to_z32(), speaking: false });
+        }
+        // Clip ids belong to the dead engine, and its clips stopped with it.
+        if !st.playing.is_empty() {
+            st.playing.clear();
+            self.emit_voice(core, &mut st);
         }
         if st.attached.is_none() && !st.mic_test {
             // Nothing is using audio; the next use starts a fresh engine.

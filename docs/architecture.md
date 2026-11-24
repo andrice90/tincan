@@ -378,7 +378,7 @@ People normally share the server's 6-character invite code instead (see "Short c
 ```
 [0]     0xA1 (audio v1)
 [1]     flags: bit0 speaking, bit1 talkspurt start, bit2 FEC present, bit3 soundboard active
-[2..4]  track_id u16 = short_id * 4 + kind (kind 0 = voice)
+[2..4]  track_id u16 = short_id * 4 + kind (kind 0 = voice, 2 = soundboard; 1 is screen share)
 [4..6]  seq u16 (+1 per packet; DTX does not consume seq)
 [6..10] ts u32 (48 kHz sample clock, random origin)
 [10]    level 0..127 (-dBov)
@@ -388,14 +388,17 @@ People normally share the server's 6-character invite code instead (see "Short c
 
 - Jitter buffer per track: min 40 ms, start 60 ms, max 200 ms (300 ms on relayed paths). Target = max(min, P95 of relative arrival delay over 2 s + 1 frame). Grow on underrun, shrink by dropping one frame in silence when over target + 20 ms for 1 s.
 - Loss: decode FEC from the next packet if buffered, else Opus PLC for up to 5 frames, then fade to silence.
-- Mixer: per-user gain, sum, soft limiter. UI sounds (join/leave chimes) go through the same mixer so the echo canceller sees them.
+- Mixer: per-track gain (a person's voice, and their soundboard track at their volume x their soundboard volume x the room's soundboard volume), sum, soft limiter. UI sounds (join/leave chimes) go through the same mixer so the echo canceller sees them.
 - Speaking: sender sets bit0 from post-APM energy with 250 ms hangover; receivers light the ring after 2 speaking packets and hold 300 ms. The engine emits `Speaking{track_id, speaking}` changes only.
 - Mute: stop sending voice datagrams. Deafen: mute + stop playout.
 
 ### Soundboard
 
 - Library: clips the user added (file picker) or pulled from others. Stored as blobs; metadata (hash, name, duration) in SQLite.
-- Play: the engine decodes the clip (symphonia), resamples to 48 kHz mono once and caches the PCM. While playing, clip samples are mixed into the outgoing stream after noise suppression and AGC (so they are not gated or squashed), DTX and voice gating are off, and flag bit3 is set. The clip is also mixed into local playout, so the player hears it and the echo canceller has it as reference.
+- Play: the engine decodes the clip (symphonia), resamples to 48 kHz mono once and caches the PCM. While playing, clip samples go out on the player's soundboard track (`short_id * 4 + 2`): a second Opus stream, 40 kbps, no DTX, flag bit3 set, never the speaking flag, sent only while a clip plays. It never passes the APM and is never mixed into the voice, which keeps DTX. The clip is also mixed into local playout, so the player hears it and the echo canceller has it as reference.
+- Why a track of its own: a clip mixed into the voice packet could not be turned down without turning down the voice (flag bit3 only said a clip was in there). With its own track every listener has a per-person soundboard volume and a per-room one (both local, saved per user and per room), and the host forwards it like voice (same policer, raised to 150 packets/s per member).
+- Stop: the player can stop a clip; the engine fades the local and the sent copy out over 5 ms.
+- Compatibility: builds before the soundboard track drop kind-2 audio (host and receivers), so in a room with an older build clips are not heard. Every machine needs this build.
 - Announce: the player sends `SoundPlayed{clip: ClipInfo}` to the voice room via the host; the host forwards it to the room. Listeners see it under "Heard in this call" and can pull it (holders = the player plus anyone who has it). Once pulled it is in their library and they seed it.
 
 ### Screen share (native, tincan-screen)

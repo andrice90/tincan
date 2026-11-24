@@ -22,7 +22,7 @@ use bytes::Bytes;
 use iroh::endpoint::Connection;
 use parking_lot::Mutex;
 use tincan_core::event::ChannelKind;
-use tincan_core::media::{AudioHeader, KIND_SCREEN, KIND_VOICE, VideoFrame, track_id, track_kind, track_short_id};
+use tincan_core::media::{AudioHeader, KIND_SCREEN, KIND_SOUND, KIND_VOICE, VideoFrame, track_id, track_kind, track_short_id};
 use tincan_core::wire::{ClipInfo, Ctl};
 use tincan_core::{BlobHash, ChannelId, ServerId, UserId};
 use tokio::sync::mpsc;
@@ -219,9 +219,11 @@ impl Sfu {
                     st.tracks.keys().copied().filter(|t| track_short_id(*t) == m.short_id && Some(*t) != local_track).collect();
                 ids.into_iter().filter_map(|t| st.tracks.remove(&t)).collect()
             };
-            let voice = track_id(m.short_id, KIND_VOICE);
-            st.uplink.remove(&voice);
-            st.reports.remove(&voice);
+            for kind in [KIND_VOICE, KIND_SOUND] {
+                let t = track_id(m.short_id, kind);
+                st.uplink.remove(&t);
+                st.reports.remove(&t);
+            }
             (m, owned)
         };
         m.abort();
@@ -395,7 +397,7 @@ impl Sfu {
             let st = &mut *st;
             let policer = st.policers.entry(from).or_insert_with(|| AudioPolicer::new(now));
             for p in pkts.iter_mut() {
-                if super::wire::voice_track_from(p, short_id).is_none() || !policer.allow(p.len(), now) {
+                if super::wire::audio_track_from(p, short_id).is_none() || !policer.allow(p.len(), now) {
                     *p = Bytes::new();
                     continue;
                 }
@@ -512,6 +514,7 @@ impl Sfu {
                     if changed {
                         st.rooms.clear();
                         st.uplink.remove(&track_id(short_id, KIND_VOICE));
+                        st.uplink.remove(&track_id(short_id, KIND_SOUND));
                     }
                     changed
                 };

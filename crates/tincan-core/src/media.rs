@@ -7,6 +7,10 @@ use bytes::Bytes;
 pub const KIND_VOICE: u16 = 0;
 /// Track kinds (low 2 bits of a track id): screen share.
 pub const KIND_SCREEN: u16 = 1;
+/// Track kinds (low 2 bits of a track id): soundboard audio. A member's clips go out on their
+/// own Opus stream (`track_id(short_id, KIND_SOUND)`) so receivers can set its volume apart
+/// from the voice. Same datagram format as voice.
+pub const KIND_SOUND: u16 = 2;
 /// Largest short id that fits in a track id (14 bits).
 pub const MAX_SHORT_ID: u16 = 0x3FFF;
 
@@ -16,6 +20,8 @@ pub fn track_id(short_id: u16, kind: u16) -> u16 { short_id.wrapping_mul(4) | (k
 pub fn track_short_id(track: u16) -> u16 { track >> 2 }
 /// The kind part of a track id.
 pub fn track_kind(track: u16) -> u16 { track & 3 }
+/// True for the kinds carried in audio datagrams (voice and soundboard).
+pub fn is_audio_kind(kind: u16) -> bool { kind == KIND_VOICE || kind == KIND_SOUND }
 
 // ---------------------------------------------------------------- audio datagrams
 
@@ -30,7 +36,8 @@ pub const AF_SPEAKING: u8 = 1 << 0;
 pub const AF_TALKSPURT: u8 = 1 << 1;
 /// Flag: the Opus packet carries in-band FEC.
 pub const AF_FEC: u8 = 1 << 2;
-/// Flag: a soundboard clip is mixed into this packet.
+/// Flag: the packet carries soundboard audio. Builds since the soundboard track send it on
+/// `KIND_SOUND` packets only; older builds set it on voice packets with a clip mixed in.
 pub const AF_SOUNDBOARD: u8 = 1 << 3;
 
 /// Layout: `[0] magic, [1] flags, [2..4] track, [4..6] seq, [6..10] ts (48 kHz), [10] level, [11] epoch`.
@@ -315,6 +322,8 @@ mod tests {
         assert_eq!(track_kind(t), KIND_SCREEN);
         // kind is masked to 2 bits
         assert_eq!(track_id(1, 7), 7);
+        assert_eq!(track_kind(track_id(3, KIND_SOUND)), KIND_SOUND);
+        assert!(is_audio_kind(KIND_VOICE) && is_audio_kind(KIND_SOUND) && !is_audio_kind(KIND_SCREEN));
     }
 
     #[test]

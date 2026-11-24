@@ -10,6 +10,7 @@ import { useStore } from "../store/store";
 import { unreadBadge } from "../lib/unread";
 import { ICON_SM, IconButton, PersonName, SpeakingAvatar, UnreadBadge } from "./common";
 import { Menu, useMenu, type MenuItem } from "./Menu";
+import { RoomSoundVolume } from "./VolumeSliders";
 
 /** One line of host state for the header. */
 export function hostLine(c: Connection, meId: string | undefined, removed = false): string {
@@ -143,9 +144,10 @@ function ChannelGroup({
 
 function useChannelMenu(server: ServerSummary, channel: Channel): { onContextMenu?: (e: MouseEvent) => void; node: ReactNode } {
   const menu = useMenu();
-  if (!server.isOwner) return { node: null };
   const room = channel.kind === "voice";
-  const items: MenuItem[] = [
+  // Everyone gets a voice room's soundboard volume; only the owner renames and deletes.
+  if (!server.isOwner && !room) return { node: null };
+  const items: MenuItem[] = !server.isOwner ? [] : [
     {
       label: room ? "Rename voice room" : "Rename channel",
       icon: <Pencil size={ICON_SM} />,
@@ -160,7 +162,15 @@ function useChannelMenu(server: ServerSummary, channel: Channel): { onContextMen
   ];
   return {
     onContextMenu: menu.openAt,
-    node: menu.anchor && <Menu anchor={menu.anchor} items={items} onClose={menu.close} label={`${channel.name} menu`} />,
+    node: menu.anchor && (
+      <Menu
+        anchor={menu.anchor}
+        items={items}
+        onClose={menu.close}
+        label={`${channel.name} menu`}
+        header={room ? <RoomSoundVolume channelId={channel.id} /> : undefined}
+      />
+    ),
   };
 }
 

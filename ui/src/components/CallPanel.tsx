@@ -141,7 +141,7 @@ export function CallPanel({ voice, call }: CallState) {
           >
             {voice.sharing ? <MonitorOff size={ICON} /> : <MonitorUp size={ICON} />}
           </IconButton>
-          <IconButton label="Soundboard" pressed={soundboardOpen} onClick={() => setSoundboardOpen(!soundboardOpen)}>
+          <IconButton className="soundboard-toggle" label="Soundboard" pressed={soundboardOpen} onClick={() => setSoundboardOpen(!soundboardOpen)}>
             <AudioLines size={ICON} />
           </IconButton>
         </div>

@@ -10,7 +10,7 @@ function member(userId: string, avatar: string | null): Member {
 
 test("avatars: every list contributes, missing ones show the initial", () => {
   const dm: DmSummary = { convId: "c", userId: "riley", name: "Riley", online: false, unread: false, lastMessageAt: null, avatar: URL("bb") };
-  const p: VoiceParticipant = { userId: "casey", name: "Casey", muted: false, deafened: false, speaking: false, avatar: URL("cc"), screenTrack: null, volume: 1 };
+  const p: VoiceParticipant = { userId: "casey", name: "Casey", muted: false, deafened: false, speaking: false, avatar: URL("cc"), screenTrack: null, volume: 1, soundboardVolume: 1 };
   const idx = buildAvatarIndex({ s1: [member("alex", URL("aa")), member("jordan", null)] }, [dm], [p], null);
   eq(idx.get("alex"), URL("aa"));
   eq(idx.get("riley"), URL("bb"), "a DM-only contact");
