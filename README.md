@@ -6,7 +6,7 @@
 
 <p align="center">Peer-to-peer group chat, voice and screen share for Windows. No accounts, and no server to run.</p>
 
-Tincan is a Discord-style app where the people in a server host it themselves. The most stable member online acts as host. When the host leaves, another member takes over, and voice or screen share drops for a moment while that happens. Messages and files are stored on each member's PC and sync between them.
+Tincan is a Discord-style app where each channel's members **are** the network. The most stable member acts as host. When the host leaves, another member takes over. Messages and files are stored on each member's PC and sync automatically.
 
 ## Features
 
