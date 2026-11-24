@@ -1764,6 +1764,13 @@ if (typeof window !== "undefined") {
       list.push(msg);
       st.messages.set(key, list);
       emit("message-added", msg);
+      // unread like the app: the UI's mark_read clears it when the chat is on screen
+      if (!ch.unread) {
+        ch.unread = true;
+        s.summary.unread = true;
+        emitChannels(s);
+        emit("server-updated", s.summary);
+      }
     },
     typing: (name, channelName = "general") => {
       const s = st.servers.find((x) => x.summary.name === "Game night");
