@@ -955,3 +955,33 @@ async fn voice_and_calls_report_rtt_and_the_peers_short_id() {
         n.net.shutdown().await;
     }
 }
+
+/// A host alone in its server (the other member offline) joins voice: the session must
+/// connect to its own SFU, also after the host restarted alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn solo_host_voice_connects() {
+    let a = node("alice", fast()).await;
+    let b = node("bob", fast()).await;
+    wire(&[&a, &b]);
+    let server = cluster(&a, &[&b]).await;
+    let ch = voice_channel(&a, &server);
+    b.net.shutdown().await;
+    let _s = join_voice(&a, server, ch).await;
+    connected(&[&a]).await;
+    a.net.voice_leave().await;
+    // restart alone
+    let (a_id, a_store) = (a.identity.clone(), a.storage.clone());
+    a.net.shutdown().await;
+    let a = crate::tests::start(a_id, a_store, "alice", fast()).await;
+    until("alice hosts alone again", Duration::from_secs(15), || crate::tests::host_of(&a, &server) == Some(a.net.me())).await;
+    let _s = join_voice(&a, server, ch).await;
+    connected(&[&a]).await;
+    // joining before hosting resumes must connect too
+    a.net.voice_leave().await;
+    let (a_id, a_store) = (a.identity.clone(), a.storage.clone());
+    a.net.shutdown().await;
+    let a = crate::tests::start(a_id, a_store, "alice", fast()).await;
+    let _s = join_voice(&a, server, ch).await;
+    connected(&[&a]).await;
+    a.net.shutdown().await;
+}

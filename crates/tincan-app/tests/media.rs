@@ -762,3 +762,27 @@ async fn real_screen_share_of_the_primary_display() {
     a.app.shutdown().await;
     b.app.shutdown().await;
 }
+
+/// A host alone in its server joins voice: the session must leave "Connecting" (path none)
+/// even though nobody else ever moves the RTT or the roster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn solo_host_voice_leaves_connecting() {
+    let _g = SERIAL.lock().await;
+    let da = tempfile::tempdir().unwrap();
+    let mut a = node(da.path(), "Alice").await;
+    let created = call(&a.app, "create_server", json!({ "name": "Solo" })).await;
+    let server = created["id"].as_str().unwrap().to_string();
+    let room = voice_room(&a.app, &server).await;
+    a.app.test_synthetic_voice(true);
+    for round in 0..3 {
+        let v = call(&a.app, "voice_join", json!({ "serverId": server, "channelId": room })).await;
+        if v["path"] == "none" {
+            wait_for(&mut a.rx, "voice-updated", 10, |v| !v.is_null() && v["path"] != "none").await;
+        }
+        let snap = call(&a.app, "app_snapshot", json!({})).await;
+        assert_ne!(snap["voice"]["path"], "none", "round {round}: snapshot still connecting: {}", snap["voice"]);
+        call(&a.app, "voice_leave", json!({})).await;
+        wait_for(&mut a.rx, "voice-updated", 10, Value::is_null).await;
+    }
+    a.app.shutdown().await;
+}
