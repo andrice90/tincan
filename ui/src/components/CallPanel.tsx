@@ -1,7 +1,8 @@
 // Docked above the user panel while in a voice room or a call.
 
+import { useMemo } from "react";
 import { AudioLines, HeadphoneOff, Headphones, Mic, MicOff, MonitorOff, MonitorUp, PhoneOff } from "lucide-react";
-import type { PathKind } from "../api/types";
+import type { CallInfo, PathKind, VoiceSession } from "../api/types";
 import { cancelCall, leaveVoice, openDialog, setDeafened, setMuted, setSoundboardOpen, stopShare } from "../store/actions";
 import { callPanelParts } from "../store/calls";
 import { useStore } from "../store/store";
@@ -18,9 +19,26 @@ function pathLabel(path: PathKind): { text: string; cls: string } {
   }
 }
 
-export function CallPanel() {
+export interface CallState {
+  voice: VoiceSession | null;
+  call: CallInfo | null;
+}
+
+/** The voice and call state while the call panel has something to show, else null. */
+export function useCallState(): CallState | null {
   const voice = useStore((s) => s.voice);
   const call = useStore((s) => s.call);
+  return useMemo(() => {
+    const parts = callPanelParts(voice, call);
+    return voice || parts.calling || parts.callNoAudio ? { voice, call } : null;
+  }, [voice, call]);
+}
+
+/**
+ * Takes the state as props: while the Floating account card closes after I left, it
+ * keeps showing the last state instead of the empty store.
+ */
+export function CallPanel({ voice, call }: CallState) {
   const soundboardOpen = useStore((s) => s.soundboardOpen);
   const servers = useStore((s) => s.servers);
   const meId = useStore((s) => s.me?.userId);

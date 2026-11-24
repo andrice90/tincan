@@ -1,6 +1,6 @@
 // Root: title bar, the current screen, dialogs and toasts.
 
-import { useEffect } from "react";
+import { useEffect, useLayoutEffect } from "react";
 import { TitleBar } from "./components/TitleBar";
 import { Toasts } from "./components/Toasts";
 import { Dialogs } from "./dialogs/Dialogs";
@@ -18,9 +18,18 @@ function useTheme(): void {
   }, [theme]);
 }
 
+/** Classic or Floating on <html> (main.tsx sets it before the first paint too). */
+function useLayoutAttr(): void {
+  const layout = useStore((s) => s.layout);
+  useLayoutEffect(() => {
+    document.documentElement.dataset.layout = layout;
+  }, [layout]);
+}
+
 export function App() {
   useEffect(() => init(), []);
   useTheme();
+  useLayoutAttr();
   const ready = useStore((s) => s.ready);
   const fatal = useStore((s) => s.fatal);
   const hasMe = useStore((s) => s.me !== null);

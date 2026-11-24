@@ -3,7 +3,7 @@
 
 import { HeadphoneOff, Maximize2, MessageSquare, MicOff, Minimize2, Monitor, Volume2 } from "lucide-react";
 import { memo, useEffect, useRef, useState, type MouseEvent } from "react";
-import type { Channel, Member, ServerSummary, UserId, VoiceParticipant, VoiceSession } from "../api/types";
+import type { Channel, ChannelId, Member, ServerId, ServerSummary, UserId, VoiceParticipant, VoiceSession } from "../api/types";
 import { ScreenView } from "../media/ScreenView";
 import { joinVoice, messageUser, setFullStage, setUserVolume, stopShare, toggleRoomChat } from "../store/actions";
 import { initialVolume, shouldSend, type TilePerson } from "../store/calls";
@@ -247,6 +247,8 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
   const joined = voice?.kind === "room" && voice.channelId === channel.id;
   const inside = members.filter((m) => m.online && m.voiceChannelId === channel.id);
   const chatOpen = useStore((s) => s.roomChatPanel);
+  // Floating shows the chat panel as the right card (the shell's right slot).
+  const inlineChat = useStore((s) => s.layout !== "floating");
   const unread = channel.unread && !chatOpen;
 
   return (
@@ -294,12 +296,24 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
             </div>
           )}
         </div>
-        {chatOpen && (
-          <section className="room-chat" aria-label={`Chat in ${channel.name}`}>
-            <ChannelMessages server={server} channel={channel} />
-          </section>
-        )}
+        {chatOpen && inlineChat && <RoomChat server={server} channel={channel} />}
       </div>
     </>
   );
+}
+
+function RoomChat({ server, channel }: { server: ServerSummary; channel: Channel }) {
+  return (
+    <section className="room-chat" aria-label={`Chat in ${channel.name}`}>
+      <ChannelMessages server={server} channel={channel} />
+    </section>
+  );
+}
+
+/** A voice room's chat panel as the Floating right card, found by id (it may outlive the room view). */
+export function RoomChatPanel({ serverId, channelId }: { serverId: ServerId; channelId: ChannelId }) {
+  const server = useStore((s) => s.servers.find((x) => x.id === serverId));
+  const channel = useStore((s) => s.channels[serverId]?.find((c) => c.id === channelId));
+  if (!server || !channel) return null;
+  return <RoomChat server={server} channel={channel} />;
 }

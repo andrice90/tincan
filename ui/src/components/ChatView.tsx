@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import { Hash, Phone, Users, Volume2 } from "lucide-react";
 import type { Channel, DmSummary, ServerSummary } from "../api/types";
 import { joinVoice, openDialog, startCall, toggleMembers, watchDm } from "../store/actions";
+import type { ComposerSpot } from "../store/dock";
 import { convKey, useStore, type TypingEntry } from "../store/store";
 import { Avatar, ICON, IconButton, PersonName } from "./common";
 import { Composer, TypingLine } from "./Composer";
@@ -12,8 +13,12 @@ import { VoiceStage } from "./VoiceView";
 
 const NO_TYPING: TypingEntry[] = [];
 
-/** History, composer and typing line of a server channel; a voice room's chat uses it too. */
-export function ChannelMessages({ server, channel }: { server: ServerSummary; channel: Channel }) {
+/**
+ * History of a server channel, with its composer and typing line unless `composer` is
+ * false (a channel page: the shell's composer slot has them). A voice room's chat panel
+ * keeps its own.
+ */
+export function ChannelMessages({ server, channel, composer = true }: { server: ServerSummary; channel: Channel; composer?: boolean }) {
   const meId = useStore((s) => s.me?.userId ?? "");
   const typing = useStore((s) => s.typing[convKey(server.id, channel.id)] ?? NO_TYPING);
   const room = channel.kind === "voice";
@@ -27,7 +32,7 @@ export function ChannelMessages({ server, channel }: { server: ServerSummary; ch
         pendingName={null}
         startText={room ? `Start of the chat in ${channel.name}` : `Start of #${channel.name}`}
       />
-      {server.removed ? (
+      {!composer ? null : server.removed ? (
         <RemovedNote />
       ) : (
         <>
@@ -69,13 +74,25 @@ export function ChannelChat({ server, channel }: { server: ServerSummary; channe
           </IconButton>
         </div>
       </header>
-      <ChannelMessages server={server} channel={channel} />
+      <ChannelMessages server={server} channel={channel} composer={false} />
+    </>
+  );
+}
+
+/** The composer slot's content: the composer and typing line of the conversation on screen. */
+export function DockedComposer({ spot }: { spot: ComposerSpot }) {
+  const typing = useStore((s) => s.typing[convKey(spot.convId, spot.channelId)] ?? NO_TYPING);
+  if (spot.removed) return <RemovedNote />;
+  return (
+    <>
+      <Composer key={convKey(spot.convId, spot.channelId)} convId={spot.convId} channelId={spot.channelId} placeholder={spot.placeholder} />
+      <TypingLine names={typing.map((t) => t.name)} />
     </>
   );
 }
 
 /** In place of the composer once the owner removed me: the history stays readable. */
-function RemovedNote() {
+export function RemovedNote() {
   return (
     <div className="composer-wrap">
       <div className="removed-note" role="status">
@@ -88,14 +105,16 @@ function RemovedNote() {
   );
 }
 
-/** A direct message conversation, with the call stage on top while in a call with them. Mount with key = conv id. */
+/**
+ * A direct message conversation, with the call stage on top while in a call with them.
+ * Its composer is in the shell's composer slot. Mount with key = conv id.
+ */
 export function DmChat({ dm }: { dm: DmSummary }) {
   const meId = useStore((s) => s.me?.userId ?? "");
   const voice = useStore((s) => s.voice);
   const call = useStore((s) => s.call);
   const inCall = voice?.kind === "call" && voice.convId === dm.convId;
   const busy = call !== null || voice?.kind === "call";
-  const typing = useStore((s) => s.typing[convKey(dm.convId, null)] ?? NO_TYPING);
 
   // While this DM is on screen the app keeps the connection to them up.
   useEffect(() => {
@@ -130,8 +149,6 @@ export function DmChat({ dm }: { dm: DmSummary }) {
         pendingName={dm.name}
         startText={`Start of your conversation with ${dm.name}`}
       />
-      <Composer convId={dm.convId} channelId={null} placeholder={`Message ${dm.name}`} />
-      <TypingLine names={typing.map((t) => t.name)} />
     </>
   );
 }
