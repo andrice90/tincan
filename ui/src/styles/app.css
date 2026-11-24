@@ -44,15 +44,6 @@
   color: var(--text-3);
 }
 
-.person-id {
-  font-size: var(--fs-12);
-  color: var(--text-3);
-}
-
-.person-id .mono {
-  font-size: var(--fs-12);
-}
-
 /* ---------------------------------------------------------------- title bar */
 
 .titlebar {
@@ -1548,9 +1539,8 @@ button.clip-tile:hover:not(:disabled) {
   font-weight: 600;
 }
 
-.volume-pop .person-id {
+.volume-pop .menu-head-name {
   display: block;
-  margin-bottom: var(--sp-2);
 }
 
 .menu-sep {

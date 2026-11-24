@@ -9,7 +9,7 @@ import { joinVoice, messageUser, setFullStage, stopShare, toggleRoomChat } from 
 import type { TilePerson } from "../store/calls";
 import { useStore } from "../store/store";
 import { ChannelMessages } from "./ChatView";
-import { ICON, ICON_SM, IconButton, PersonId, PersonName, SpeakingAvatar } from "./common";
+import { ICON, ICON_SM, IconButton, PersonName, SpeakingAvatar } from "./common";
 import { Popover, useMenu } from "./Menu";
 import { PersonVolumes } from "./VolumeSliders";
 import { tileGrid } from "../lib/tileGrid";
@@ -24,7 +24,9 @@ function gridStyle(n: number): CSSProperties {
 function VolumePopover({ p, anchor, onClose }: { p: TilePerson; anchor: NonNullable<ReturnType<typeof useMenu>["anchor"]>; onClose: () => void }) {
   return (
     <Popover anchor={anchor} onClose={onClose} label={`${p.name} options`} className="volume-pop">
-      <PersonId userId={p.userId} />
+      <span className="menu-head-name truncate">
+        <PersonName userId={p.userId} name={p.name} />
+      </span>
       <PersonVolumes userId={p.userId} known={p} />
       <button
         type="button"
