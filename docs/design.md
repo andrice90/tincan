@@ -71,7 +71,7 @@ Motion: `transition: background-color 120ms ease-out, color 120ms ease-out`. No 
 
 ## Floating layout
 
-A second layout, picked in Settings > Appearance > Layout: "Classic" (the flat panels above, the default) or "Floating". It is saved on this PC (`localStorage` key `tincan.layout`, per profile) and set as `data-layout="floating"` on `<html>` before the first paint; `src/styles/floating.css` holds its rules.
+A second layout, picked in Settings > Appearance > Layout: "Floating" (the default) or "Classic" (the flat panels above). It is saved on this PC (`localStorage` key `tincan.layout`, per profile) and set as `data-layout="floating"` on `<html>` before the first paint; `src/styles/floating.css` holds its rules.
 
 ```
 +-------------------------------------------------------------------------+

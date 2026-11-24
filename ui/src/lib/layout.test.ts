@@ -28,33 +28,33 @@ const throwing: WidthStore = {
   },
 };
 
-test("layout: Classic unless Floating was saved", () => {
-  eq(parseLayout(null), "classic");
-  eq(parseLayout(""), "classic");
-  eq(parseLayout("Floating"), "classic");
-  eq(parseLayout("classic"), "classic");
+test("layout: Floating unless Classic was saved", () => {
+  eq(parseLayout(null), "floating");
+  eq(parseLayout(""), "floating");
+  eq(parseLayout("Classic"), "floating");
   eq(parseLayout("floating"), "floating");
+  eq(parseLayout("classic"), "classic");
 });
 
-test("layout: load from storage, missing or throwing storage gives Classic", () => {
-  eq(loadLayout(undefined), "classic");
-  eq(loadLayout(throwing), "classic");
-  eq(loadLayout(memStore()), "classic");
-  eq(loadLayout(memStore({ [LAYOUT_KEY]: "floating" })), "floating");
-  eq(loadLayout(memStore({ [LAYOUT_KEY]: "cards" })), "classic");
+test("layout: load from storage, missing or throwing storage gives Floating", () => {
+  eq(loadLayout(undefined), "floating");
+  eq(loadLayout(throwing), "floating");
+  eq(loadLayout(memStore()), "floating");
+  eq(loadLayout(memStore({ [LAYOUT_KEY]: "classic" })), "classic");
+  eq(loadLayout(memStore({ [LAYOUT_KEY]: "cards" })), "floating");
 });
 
-test("layout: Floating is saved, Classic is saved as no key", () => {
+test("layout: Classic is saved, Floating is saved as no key", () => {
   const s = memStore();
-  saveLayout(s, "floating");
-  eq(s.data, { [LAYOUT_KEY]: "floating" });
-  eq(loadLayout(s), "floating");
   saveLayout(s, "classic");
-  eq(s.data, {});
+  eq(s.data, { [LAYOUT_KEY]: "classic" });
   eq(loadLayout(s), "classic");
+  saveLayout(s, "floating");
+  eq(s.data, {});
+  eq(loadLayout(s), "floating");
   // blocked or full storage is not an error
-  saveLayout(throwing, "floating");
-  saveLayout(undefined, "floating");
+  saveLayout(throwing, "classic");
+  saveLayout(undefined, "classic");
 });
 
 test("layout: close delay only in Floating with motion allowed", () => {

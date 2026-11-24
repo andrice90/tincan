@@ -31,7 +31,7 @@ Pure UI logic has dependency-free tests: from `ui/`, run `node --experimental-st
 | `lib/panelWidth.ts` | side panel width bounds, clamping, saved value, arrow keys and drag |
 | `lib/nativeMenu.ts` | when the WebView's own right-click menu may open |
 | `lib/unread.ts` | the unread badge on a sidebar row (dot or count, "99+") |
-| `lib/layout.ts` | Classic or Floating: saved value, default saved as no key, how long closing content stays mounted |
+| `lib/layout.ts` | Floating (default) or Classic: saved value, default saved as no key, how long closing content stays mounted |
 | `lib/presence.ts` | open, closing and closed state of a panel that keeps its last content while it closes; a stale close timer never unmounts a reopened panel |
 | `store/dock.ts` | which composer the shell's composer slot shows, and what the right slot shows (members, or in Floating a room's chat) |
 

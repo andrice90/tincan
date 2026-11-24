@@ -1,5 +1,5 @@
-// The window layout: Classic (flat panels, the default) or Floating (every region a
-// card with a gap around it, panels that slide open and closed). Saved in localStorage
+// The window layout: Floating (every region a card with a gap around it, panels that
+// slide open and closed; the default) or Classic (flat panels). Saved in localStorage
 // like the panel widths, so it is per profile. Storage is passed in for the tests.
 
 import type { WidthStore } from "./panelWidth";
@@ -20,26 +20,26 @@ export const PANEL_MOTION_MS = 220;
 /** Margin after the transition before closing content is unmounted. */
 const CLOSE_SLACK_MS = 40;
 
-/** The saved layout; anything else is Classic. */
+/** The saved layout; anything else is Floating, the default. */
 export function parseLayout(raw: string | null): Layout {
-  return raw === "floating" ? "floating" : "classic";
+  return raw === "classic" ? "classic" : "floating";
 }
 
-/** Reads the saved layout. Missing or throwing storage gives Classic. */
+/** Reads the saved layout. Missing or throwing storage gives Floating. */
 export function loadLayout(store: WidthStore | undefined): Layout {
-  if (!store) return "classic";
+  if (!store) return "floating";
   try {
     return parseLayout(store.getItem(LAYOUT_KEY));
   } catch {
-    return "classic";
+    return "floating";
   }
 }
 
-/** Saves the layout; Classic, the default, is saved as no value. */
+/** Saves the layout; Floating, the default, is saved as no value. */
 export function saveLayout(store: WidthStore | undefined, layout: Layout): void {
   if (!store) return;
   try {
-    if (layout === "classic") store.removeItem(LAYOUT_KEY);
+    if (layout === "floating") store.removeItem(LAYOUT_KEY);
     else store.setItem(LAYOUT_KEY, layout);
   } catch {
     // Storage full or blocked: the layout still applies for this session.
