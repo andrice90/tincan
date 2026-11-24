@@ -30,12 +30,14 @@ Defined once in `src/styles/tokens.css` as CSS custom properties. Dark is the de
 | `--speaking` | `#3fb37f` | `#2b9466` | Speaking ring, direct connection |
 | `--warn` | `#e2a336` | `#b07a14` | Relayed connection, degraded |
 | `--danger` | `#e5484d` | `#cd2b31` | Leave call, delete, errors |
+| `--bg-backdrop` | `#0f1114` | `#dcdfe3` | Floating: titlebar and the space around the cards |
+| `--shadow-float` | `0 1px 2px` 30%, `0 2px 8px` 18% black | 6% and 5% | Floating: card shadow |
 
 Type: `"Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif` (ships with Windows, no font download). Sizes 12, 13, 14, 16, 20. Weights 400 and 600.
 
-Spacing: 4px scale (4, 8, 12, 16, 20, 24, 32). Radius: 6px controls, 8px cards and tiles, 12px server icons, 50% avatars.
+Spacing: 4px scale (4, 8, 12, 16, 20, 24, 32). Radius: 6px controls, 8px cards and tiles, 12px server icons and Floating layout cards (`--r-float`), 50% avatars. Floating gap: 8px (`--gap-float`).
 
-Motion: `transition: background-color 120ms ease-out, color 120ms ease-out`. No entrance animations. Speaking ring fades in 80ms.
+Motion: `transition: background-color 120ms ease-out, color 120ms ease-out`. No entrance animations. Speaking ring fades in 80ms. The Floating layout adds one more: panels opening and closing (see below).
 
 ## Window layout
 
@@ -58,7 +60,7 @@ Motion: `transition: background-color 120ms ease-out, color 120ms ease-out`. No 
 ```
 
 - Custom title bar (decorations off) 32px tall, draggable, with min/max/close on the right. Keeps the window one continuous surface.
-- Channel list and member list widths: a grab bar on the edge that faces the content resizes them (channel list 200 to 420 px, default 240; member list 220 to 360 px, default 220). Drag or use the arrow keys, Home and End; double-click resets. The bar shows a `--border` line on hover and an `--accent` line while dragging or focused. In a narrow window both give way to their minimum before the content goes below 276 px (the room left in the 800 px minimum window at default widths).
+- Channel list and member list widths: a grab bar on the edge that faces the content resizes them (channel list 200 to 420 px, default 240; member list 220 to 360 px, default 220). Drag or use the arrow keys, Home and End; double-click resets. The bar shows a `--border` line on hover and an `--accent` line while dragging or focused. In a narrow window both give way to their minimum before the content goes below 276 px (the room left in the 800 px minimum window at default widths). In the Floating layout the gaps take that room: the content keeps 240 px, see "Floating layout".
 - Rail: DM button, divider, servers (the server icon, or initials on a rounded square; selected = accent fill, or an accent ring around an icon), add-server button. Unread = small dot under the icon.
 - Avatars everywhere (member list, message authors, DM list and header, voice tiles, call panel rows of a call, user panel) show the person's picture over the coloured initial. The initial stays underneath as the fallback while the picture loads, when there is none, or if it fails to load. Pictures load lazily at the avatar's size.
 - Unread text channel: name in `--text-1` at weight 600, and a badge at the row's end (a 6 px `--text-1` dot; a count capped at "99+" once the app sends one). The channel on screen never shows one.
@@ -66,6 +68,36 @@ Motion: `transition: background-color 120ms ease-out, color 120ms ease-out`. No 
 - Voice rooms list who is inside. Avatar ring turns `--speaking` while that person talks. Mic-off and screen icons appear only when true.
 - Call panel (only while in a call): room name, connection label (Direct / Relayed, with RTT on hover), mute, deafen, share screen, leave.
 - User panel: avatar, name, settings button. Mute and deafen live in the call panel.
+
+## Floating layout
+
+A second layout, picked in Settings > Appearance > Layout: "Classic" (the flat panels above, the default) or "Floating". It is saved on this PC (`localStorage` key `tincan.layout`, per profile) and set as `data-layout="floating"` on `<html>` before the first paint; `src/styles/floating.css` holds its rules.
+
+```
++-------------------------------------------------------------------------+
+| title bar (backdrop)                                                    |
+| +----+ +-------------+ +-----------------------------+ +-------------+  |
+| |rail| | channel card| | content card                | | right card  |  |
+| |    | | server head | | header, messages, stage,    | | members, or |  |
+| |    | | channels    | | screen share                | | the room's  |  |
+| |    | | voice rooms | |                             | | chat in a   |  |
+| |    | +-------------+ +-----------------------------+ | voice room  |  |
+| |    | | account card| | composer card               | |             |  |
+| +----+ +-------------+ +-----------------------------+ +-------------+  |
++-------------------------------------------------------------------------+
+```
+
+- Every region is a card on the backdrop: server rail, channel card (server or DM list), account card (voice controls while in a room or call, then avatar, name, settings), content card (header, messages, voice stage, screen share, soundboard), composer card (composer and typing line; hidden on views without a composer, such as a room's tiles), right card (member list, or a voice room's chat when its Chat button is on; that chat keeps its own composer).
+- Cards share one radius `--r-float` (12px), one shadow `--shadow-float` and one gap `--gap-float` (8px) between cards and around the window. The titlebar and the space around the cards are `--bg-backdrop`. Rail and channel, account and right cards are `--bg-side`; content and composer cards `--bg-main`; rail buttons `--bg-main`.
+- Grab bars sit in the gaps: the sidebar's to the right of the channel and account cards, the member list's to the left of the right card. The 2px line is centred in the gap.
+- Minimum window (800x520): the gaps and the rail take 104px, so the sidebar (200 min), content (240 min) and right card (member list 220 min, room chat 256 min, else 340) share 696px. Cards give way to those minimums. The channel card scrolls when the voice controls take its height.
+- Motion: `--motion-panel` (220ms `cubic-bezier(0.65, 0, 0.35, 1)`, ease-in-out). Each open has the same close in reverse, and pushes the cards next to it:
+  - right card: width 0 to the panel's width, the content card narrows as it slides; the content inside stays at its minimum width, anchored right, so it slides in with the card's edge;
+  - account card: the voice controls grow from height 0 when joining a room or call (and the channel card above shrinks), and shrink back when leaving;
+  - composer card: grows from height 0 under the content card when a view has a composer, and shrinks away when the next one has none;
+  - room chat beside the tiles: it is the right card, so it moves like the member list.
+  
+  What closes stays on screen, inert, until its transition ends, then unmounts. Under `prefers-reduced-motion` every change is instant. Classic keeps no motion: its panels open and close at once, as before.
 
 ## Screens
 
@@ -80,7 +112,7 @@ Motion: `transition: background-color 120ms ease-out, color 120ms ease-out`. No 
 7. **Invite dialog.** The invite code in a read-only field and "Copy invite".
 8. **Join dialog.** Paste field, "Join server". Error states say what failed and what to do.
 8b. **Crop image.** Opened after picking an image for "Change avatar" (Settings, Profile) or "Change icon" (the owner's server menu, which also has "Remove icon"). A 280px square viewport with the final shape outlined and everything outside it dimmed: a circle for avatars, the rail's rounded square (12/44 of the side) for server icons. Drag (pointer or touch) or the arrow keys move the image (Shift moves further); the "Zoom" slider, the wheel and +/- zoom from 1x (the shape just covered) to 4x. The image always covers the shape. Cancel and Save; Save renders the visible crop to 128x128 and encodes WebP under 64 KB (PNG at falling sizes when WebP is unavailable). Escape cancels and returns to where the picker was opened.
-9. **Settings.** Profile (avatar with "Change avatar" and "Remove", name), Voice (input, output, input level meter, noise suppression, echo cancellation), Files (download folder), Network (connection status, custom relay URL).
+9. **Settings.** Profile (avatar with "Change avatar" and "Remove", name), Voice (input, output, input level meter, noise suppression, echo cancellation), Files (download folder), Network (connection status, custom relay URL), Appearance (theme: Match Windows, Dark, Light; layout: Classic, Floating).
 
 ## Icons
 

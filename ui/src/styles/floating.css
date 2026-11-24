@@ -94,7 +94,8 @@
 :root[data-layout="floating"] .composer-slot .typing-line {
   height: 20px;
   line-height: 20px;
-  padding: 0 var(--sp-3);
+  /* starts on the composer box's edge, as in Classic */
+  padding: 0 var(--sp-2);
 }
 
 /* Right card: the member list, or a voice room's chat beside its tiles. */
