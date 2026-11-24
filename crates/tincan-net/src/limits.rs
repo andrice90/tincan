@@ -115,10 +115,11 @@ pub(crate) struct AudioPolicer {
     pub dropped: u64,
 }
 
-/// Packets per second allowed per member (Opus at 20 ms is 50/s; room for jitter clumps).
-pub(crate) const AUDIO_PPS: f64 = 100.0;
+/// Packets per second allowed per member. Opus at 20 ms is 50/s per stream, and a member
+/// playing a clip sends two streams (voice and soundboard): 100/s, with room for jitter clumps.
+pub(crate) const AUDIO_PPS: f64 = 150.0;
 /// Packet burst.
-pub(crate) const AUDIO_BURST: f64 = 50.0;
+pub(crate) const AUDIO_BURST: f64 = 75.0;
 /// Bytes per second allowed per member (512 kbit/s; honest voice is at most about 60).
 pub(crate) const AUDIO_BYTES_PER_S: f64 = 64.0 * 1024.0;
 
@@ -236,10 +237,19 @@ mod tests {
             assert!(p.allow(150, t0 + Duration::from_millis(i * 20)), "honest packet {i}");
         }
         assert_eq!(p.dropped, 0);
+        // 10 s of voice plus a soundboard stream (100 packets/s), arriving in 40 ms clumps.
+        let mut s = AudioPolicer::new(t0);
+        for i in 0..250u64 {
+            let at = t0 + Duration::from_millis(i * 40);
+            for k in 0..4 {
+                assert!(s.allow(200, at), "two streams, clump {i} packet {k}");
+            }
+        }
+        assert_eq!(s.dropped, 0);
         // A flood of 1200-byte datagrams at 5000/s for one second: bounded.
         let mut q = AudioPolicer::new(t0);
         let passed = (0..5000u64).filter(|i| q.allow(1200, t0 + Duration::from_micros(i * 200))).count();
-        assert!(passed <= 100, "{passed} flood packets passed");
+        assert!(passed <= 150, "{passed} flood packets passed");
         // Oversized datagrams never pass.
         let mut r = AudioPolicer::new(t0);
         assert!(!r.allow(tincan_core::media::AUDIO_HEADER_LEN + OPUS_MAX_PACKET + 1, t0));

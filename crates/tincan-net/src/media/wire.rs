@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tincan_core::media::{AUDIO_HEADER_LEN, AUDIO_MAGIC, KIND_VOICE, VideoFrame, encode_video_frame, track_kind, track_short_id};
+use tincan_core::media::{AUDIO_HEADER_LEN, AUDIO_MAGIC, VideoFrame, encode_video_frame, is_audio_kind, track_kind, track_short_id};
 use tincan_core::wire::Ctl;
 use tokio::sync::mpsc;
 
@@ -39,11 +39,18 @@ impl Wire {
 }
 
 /// Write the current track id and epoch byte into an outgoing audio datagram (copies only when
-/// they differ). None for anything that is not an audio datagram.
-pub(crate) fn stamp_audio(pkt: Bytes, track: u16, epoch: u8) -> Option<Bytes> {
+/// they differ). `voice` is my current voice track: the stamped track keeps the packet's own
+/// kind (voice or soundboard) under my current short id. None for anything that is not an
+/// audio datagram of an audio kind.
+pub(crate) fn stamp_audio(pkt: Bytes, voice: u16, epoch: u8) -> Option<Bytes> {
     if pkt.len() < AUDIO_HEADER_LEN || pkt[0] != AUDIO_MAGIC {
         return None;
     }
+    let kind = track_kind(u16::from_be_bytes([pkt[2], pkt[3]]));
+    if !is_audio_kind(kind) {
+        return None;
+    }
+    let track = (voice & !3) | kind;
     let t = track.to_be_bytes();
     if pkt[2] == t[0] && pkt[3] == t[1] && pkt[11] == epoch {
         return Some(pkt);
@@ -54,11 +61,11 @@ pub(crate) fn stamp_audio(pkt: Bytes, track: u16, epoch: u8) -> Option<Bytes> {
     Some(Bytes::from(v))
 }
 
-/// The voice track of an audio datagram sent by the member with `short_id`; None if the
-/// datagram is malformed or claims someone else's track.
-pub(crate) fn voice_track_from(pkt: &[u8], short_id: u16) -> Option<u16> {
+/// The audio track (voice or soundboard) of a datagram sent by the member with `short_id`;
+/// None if the datagram is malformed, is not audio, or claims someone else's track.
+pub(crate) fn audio_track_from(pkt: &[u8], short_id: u16) -> Option<u16> {
     let track = tincan_core::media::audio_track_of(pkt)?;
-    (track_kind(track) == KIND_VOICE && track_short_id(track) == short_id).then_some(track)
+    (is_audio_kind(track_kind(track)) && track_short_id(track) == short_id).then_some(track)
 }
 
 /// A group replayed from a cache after a migration may start up to this far (90 kHz, 10 s)
@@ -155,7 +162,7 @@ impl CtlTx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tincan_core::media::{AF_SPEAKING, AudioHeader, KIND_SCREEN, track_id};
+    use tincan_core::media::{AF_SPEAKING, AudioHeader, KIND_SCREEN, KIND_SOUND, KIND_VOICE, track_id};
 
     #[test]
     fn wire_slices_the_frame_back_out() {
@@ -180,6 +187,12 @@ mod tests {
         assert_eq!(back, AudioHeader { track: 12, epoch: 9, ..h });
         assert_eq!(payload, b"opus");
         assert!(stamp_audio(Bytes::from_static(b"short"), 1, 1).is_none());
+        // A soundboard packet keeps its kind under the new short id; screen kinds are refused.
+        let sb = AudioHeader { track: track_id(1, KIND_SOUND), ..h }.packet(b"opus");
+        let (back, _) = AudioHeader::parse(&stamp_audio(sb, track_id(3, KIND_VOICE), 9).unwrap()).unwrap();
+        assert_eq!(back.track, track_id(3, KIND_SOUND));
+        let screen = AudioHeader { track: track_id(1, KIND_SCREEN), ..h }.packet(b"opus");
+        assert!(stamp_audio(screen, track_id(3, KIND_VOICE), 9).is_none());
     }
 
     #[test]
@@ -228,9 +241,11 @@ mod tests {
     #[test]
     fn senders_cannot_claim_other_tracks() {
         let pkt = |track| AudioHeader { track, ..AudioHeader::default() }.packet(b"x");
-        assert_eq!(voice_track_from(&pkt(track_id(3, KIND_VOICE)), 3), Some(12));
-        assert_eq!(voice_track_from(&pkt(track_id(4, KIND_VOICE)), 3), None);
-        assert_eq!(voice_track_from(&pkt(track_id(3, KIND_SCREEN)), 3), None);
-        assert_eq!(voice_track_from(b"\xA1", 3), None);
+        assert_eq!(audio_track_from(&pkt(track_id(3, KIND_VOICE)), 3), Some(12));
+        assert_eq!(audio_track_from(&pkt(track_id(3, KIND_SOUND)), 3), Some(14));
+        assert_eq!(audio_track_from(&pkt(track_id(4, KIND_VOICE)), 3), None);
+        assert_eq!(audio_track_from(&pkt(track_id(4, KIND_SOUND)), 3), None);
+        assert_eq!(audio_track_from(&pkt(track_id(3, KIND_SCREEN)), 3), None);
+        assert_eq!(audio_track_from(b"\xA1", 3), None);
     }
 }

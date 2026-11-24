@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 use tincan_audio::{AudioConfig, AudioEngine, AudioError, AudioEvent, AudioIo, LibOpus, NullSink, OpusCodec, SilenceSource};
-use tincan_core::media::{AF_SOUNDBOARD, AudioHeader};
+use tincan_core::media::{AF_SOUNDBOARD, AudioHeader, KIND_SOUND, track_id};
 
 fn sine(rate: u32, hz: f32, secs: f32, amp: f32) -> Vec<f32> {
     let n = (rate as f32 * secs) as usize;
@@ -159,7 +159,7 @@ async fn soundboard_while_muted_is_sent_flagged_with_energy() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(512);
     e.start_call(12, 3, tx).unwrap();
     e.set_muted(true);
-    e.play_clip(clip.clone()).unwrap();
+    let id = e.play_clip(clip.clone()).unwrap();
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 
     let mut dec = LibOpus.decoder().unwrap();
@@ -167,7 +167,8 @@ async fn soundboard_while_muted_is_sent_flagged_with_energy() {
     let (mut flagged, mut energy) = (0, 0.0f32);
     while let Ok(p) = rx.try_recv() {
         let (h, opus) = AudioHeader::parse(&p).unwrap();
-        assert_eq!((h.track, h.epoch), (12, 3));
+        // voice track 12 is short id 3: the clip goes out on short id 3's soundboard track
+        assert_eq!((h.track, h.epoch), (track_id(3, KIND_SOUND), 3));
         if h.flags & AF_SOUNDBOARD != 0 {
             flagged += 1;
             dec.decode(opus, &mut pcm).unwrap();
@@ -178,13 +179,29 @@ async fn soundboard_while_muted_is_sent_flagged_with_energy() {
     assert!(energy / (flagged as f32 * 960.0) > 0.01, "energy {energy}");
     let mut finished = false;
     while let Ok(ev) = events.try_recv() {
-        finished |= ev == AudioEvent::ClipFinished;
+        finished |= ev == AudioEvent::ClipFinished(id);
     }
     assert!(finished, "ClipFinished emitted");
 
     e.set_deafened(true);
     assert!(matches!(e.play_clip(clip.clone()), Err(AudioError::Deafened)));
     e.set_deafened(false);
+
+    // Stopping a long clip ends its stream at once and reports it finished.
+    let long = Arc::new(tincan_audio::ClipPcm::from_samples(vec![0.3; 48_000 * 5]));
+    while rx.try_recv().is_ok() {}
+    let id = e.play_clip(long).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    e.stop_clip(id);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut stopped = false;
+    while let Ok(ev) = events.try_recv() {
+        stopped |= ev == AudioEvent::ClipFinished(id);
+    }
+    assert!(stopped, "ClipFinished after stop_clip");
+    while rx.try_recv().is_ok() {}
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(rx.try_recv().is_err(), "nothing sent after the stop (voice is muted)");
     e.stop_call();
     assert!(matches!(e.play_clip(clip), Err(AudioError::NotInCall)));
 }

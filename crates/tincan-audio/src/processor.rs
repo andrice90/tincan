@@ -10,24 +10,29 @@
 use crate::AudioEvent;
 use crate::apm::{APM_FRAME, Apm};
 use crate::clip::ClipPcm;
-use crate::codec::{MAX_OPUS_PACKET, OpusCodec, OpusDecode, OpusEncode, packet_has_silk};
+use crate::codec::{EncoderSettings, MAX_OPUS_PACKET, OpusCodec, OpusDecode, OpusEncode, packet_has_silk};
 use crate::dsp::{LocalVad, RemoteSpeaking, dbov, fade_in, fade_out, level_byte, meter_level, rms, soft_limit, soft_limit_all};
 use crate::error::{AudioError, Result};
 use crate::jitter::{FRAME_MS, FRAME_SAMPLES, JitterBuffer, JitterConfig, Playout};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tincan_core::media::{AF_FEC, AF_SOUNDBOARD, AF_SPEAKING, AF_TALKSPURT, AUDIO_HEADER_LEN, AudioHeader};
+use tincan_core::media::{AF_FEC, AF_SOUNDBOARD, AF_SPEAKING, AF_TALKSPURT, AUDIO_HEADER_LEN, AudioHeader, KIND_SOUND, is_audio_kind, track_id, track_kind, track_short_id};
 use tokio::sync::mpsc;
 
 /// Samples per processing frame (10 ms at 48 kHz).
 pub(crate) const FRAME_10MS: usize = APM_FRAME;
-/// Remote tracks kept at once; packets for further track ids are ignored.
-pub(crate) const MAX_TRACKS: usize = 32;
+/// Remote tracks kept at once (a voice and a soundboard track per person); packets for
+/// further track ids are ignored.
+pub(crate) const MAX_TRACKS: usize = 64;
 /// Clip voices playing at once; the oldest is cut when another starts.
 pub(crate) const MAX_VOICES: usize = 8;
 /// Gain applied to soundboard clips (in the call and locally), -3 dB.
 pub(crate) const SOUNDBOARD_GAIN: f32 = 0.7;
+/// Fade-out of a clip that is stopped (5 ms, like the clip edges).
+pub(crate) const STOP_RAMP: usize = 240;
+/// Bitrate of the soundboard stream (clips are often music, so a little above voice).
+const SOUND_BITRATE: i32 = 40_000;
 /// Fade-in length after silence or concealment, to avoid clicks (10 ms).
 const FADE_IN: usize = 480;
 /// Capture frames per `MicLevel` event (50 ms -> 20 events per second).
@@ -59,11 +64,24 @@ struct CallState {
     prev_sent: bool,
     vad: LocalVad,
     local_speaking: bool,
-    dtx: bool,
     fec: bool,
+    /// The soundboard stream (`KIND_SOUND` under my short id); None if its encoder failed.
+    sound: Option<SoundStream>,
     loss_pct: u8,
     sent: u64,
     dropped: u64,
+}
+
+/// My clips go out on their own Opus stream, so each receiver can set its volume apart from my
+/// voice. It shares the voice's sample clock, so a pause between clips reads as a pause (seq
+/// contiguous, ts jump) at the receiver's jitter buffer. Nothing is sent while no clip plays.
+struct SoundStream {
+    enc: Box<dyn OpusEncode>,
+    pcm: Vec<f32>,
+    pkt: Vec<u8>,
+    seq: u16,
+    talkspurt: bool,
+    prev_sent: bool,
 }
 
 struct RemoteTrack {
@@ -181,6 +199,27 @@ struct Voice {
     play_pos: usize,
     send_pos: usize,
     soundboard: bool,
+    /// The caller's id of a soundboard clip (`ClipFinished` carries it; 0 for UI sounds).
+    id: u64,
+    /// Stopped: local playout and sending each fade out over [`STOP_RAMP`] samples from
+    /// these positions.
+    stop: Option<(usize, usize)>,
+}
+
+/// Gain of sample `i` of a voice stopped at `at` (None: not stopped).
+fn stop_gain(i: usize, at: Option<usize>) -> f32 {
+    match at {
+        Some(at) if i >= at => (at + STOP_RAMP).saturating_sub(i) as f32 / STOP_RAMP as f32,
+        _ => 1.0,
+    }
+}
+
+impl Voice {
+    /// Where local playout ends.
+    fn play_end(&self) -> usize { self.stop.map_or(self.clip.len(), |(p, _)| (p + STOP_RAMP).min(self.clip.len())) }
+    /// Where sending ends.
+    fn send_end(&self) -> usize { self.stop.map_or(self.clip.len(), |(_, s)| (s + STOP_RAMP).min(self.clip.len())) }
+    fn done(&self) -> bool { self.play_pos >= self.play_end() && self.send_pos >= self.send_end() }
 }
 
 /// See the module docs.
@@ -194,6 +233,8 @@ pub(crate) struct Processor {
     tracks: Vec<RemoteTrack>,
     gains: HashMap<u16, f32>,
     voices: Vec<Voice>,
+    /// Local gain of my own soundboard clips (the room's soundboard volume; not sent).
+    local_sound_gain: f32,
     mic_test: bool,
     meter_sum: f32,
     meter_frames: u32,
@@ -223,6 +264,7 @@ impl Processor {
             tracks: Vec::new(),
             gains: HashMap::new(),
             voices: Vec::new(),
+            local_sound_gain: 1.0,
             mic_test: false,
             meter_sum: 0.0,
             meter_frames: 0,
@@ -249,6 +291,18 @@ impl Processor {
                 tracing::warn!(%e, "opus encoder setup");
             }
         }
+        let sound = match self.codec.encoder(&EncoderSettings { bitrate_bps: SOUND_BITRATE, dtx: false, ..EncoderSettings::default() }) {
+            Ok(mut enc) => {
+                if let Err(e) = enc.set_packet_loss_perc(loss_perc_for(loss)) {
+                    tracing::warn!(%e, "opus encoder setup (soundboard)");
+                }
+                Some(SoundStream { enc, pcm: vec![0.0; FRAME_SAMPLES], pkt: vec![0; MAX_OPUS_PACKET], seq: rand::random(), talkspurt: true, prev_sent: false })
+            }
+            Err(e) => {
+                tracing::warn!(%e, "soundboard encoder; clips will not be sent");
+                None
+            }
+        };
         self.call = Some(CallState {
             track,
             epoch,
@@ -265,8 +319,8 @@ impl Processor {
             prev_sent: false,
             vad: LocalVad::default(),
             local_speaking: false,
-            dtx: true,
             fec: true,
+            sound,
             loss_pct: loss,
             sent: 0,
             dropped: 0,
@@ -353,6 +407,11 @@ impl Processor {
             if let Err(e) = c.enc.set_bitrate(bitrate_for_loss(self.loss_pct)) {
                 tracing::warn!(%e, "opus bitrate");
             }
+            if let Some(s) = &mut c.sound
+                && let Err(e) = s.enc.set_packet_loss_perc(loss_perc_for(self.loss_pct))
+            {
+                tracing::warn!(%e, "opus loss perc (soundboard)");
+            }
         }
     }
 
@@ -379,65 +438,97 @@ impl Processor {
 
     // ------------------------------------------------------------------ clips
 
-    /// Plays a soundboard clip into the call and locally. Allowed while muted.
-    pub(crate) fn play_clip(&mut self, clip: Arc<ClipPcm>) -> Result<()> {
-        if self.call.is_none() {
-            return Err(AudioError::NotInCall);
+    /// Plays soundboard clip `id` into the call (its own stream) and locally. Allowed while
+    /// muted. `ClipFinished(id)` follows when it has been sent and played, was stopped or
+    /// cut, and also right away when it could not start (the error is returned too).
+    pub(crate) fn play_clip(&mut self, clip: Arc<ClipPcm>, id: u64) -> Result<()> {
+        let refused = if self.call.is_none() {
+            Some(AudioError::NotInCall)
+        } else if self.deafened {
+            Some(AudioError::Deafened)
+        } else {
+            None
+        };
+        if let Some(e) = refused {
+            self.emit(AudioEvent::ClipFinished(id));
+            return Err(e);
         }
-        if self.deafened {
-            return Err(AudioError::Deafened);
-        }
-        self.add_voice(Voice { play_pos: 0, send_pos: 0, soundboard: true, clip });
+        self.add_voice(Voice { play_pos: 0, send_pos: 0, soundboard: true, clip, id, stop: None });
         Ok(())
     }
 
     /// Plays a UI sound locally only (also while deafened).
     pub(crate) fn play_local(&mut self, clip: Arc<ClipPcm>) {
         let len = clip.len();
-        self.add_voice(Voice { play_pos: 0, send_pos: len, soundboard: false, clip });
+        self.add_voice(Voice { play_pos: 0, send_pos: len, soundboard: false, clip, id: 0, stop: None });
+    }
+
+    /// Stops soundboard clip `id` here and in the call at once (a 5 ms fade, so it does not
+    /// click). `ClipFinished(id)` follows once the fade is out. Unknown ids are ignored.
+    pub(crate) fn stop_clip(&mut self, id: u64) {
+        for v in self.voices.iter_mut().filter(|v| v.soundboard && v.id == id && v.stop.is_none()) {
+            v.stop = Some((v.play_pos, v.send_pos));
+        }
+    }
+
+    /// Stops every soundboard clip of mine (see [`Processor::stop_clip`]).
+    pub(crate) fn stop_all_clips(&mut self) {
+        for v in self.voices.iter_mut().filter(|v| v.soundboard && v.stop.is_none()) {
+            v.stop = Some((v.play_pos, v.send_pos));
+        }
+    }
+
+    /// Local gain of my own soundboard clips (0..=4; what is sent is not changed).
+    pub(crate) fn set_local_sound_gain(&mut self, g: f32) {
+        self.local_sound_gain = if g.is_finite() { g.clamp(0.0, 4.0) } else { 1.0 };
     }
 
     fn add_voice(&mut self, v: Voice) {
         if v.clip.is_empty() {
             if v.soundboard {
-                self.emit(AudioEvent::ClipFinished);
+                self.emit(AudioEvent::ClipFinished(v.id));
             }
             return;
         }
         if self.voices.len() >= MAX_VOICES {
             let old = self.voices.remove(0);
             if old.soundboard {
-                self.emit(AudioEvent::ClipFinished);
+                self.emit(AudioEvent::ClipFinished(old.id));
             }
         }
         self.voices.push(v);
     }
 
     fn cancel_soundboard(&mut self) {
-        let before = self.voices.len();
-        self.voices.retain(|v| !v.soundboard);
-        for _ in self.voices.len()..before {
-            self.emit(AudioEvent::ClipFinished);
+        let mut cut = Vec::new();
+        self.voices.retain(|v| {
+            if v.soundboard {
+                cut.push(v.id);
+            }
+            !v.soundboard
+        });
+        for id in cut {
+            self.emit(AudioEvent::ClipFinished(id));
         }
     }
 
     fn reap_voices(&mut self) {
-        let mut finished = 0;
+        let mut finished = Vec::new();
         self.voices.retain(|v| {
-            let done = v.play_pos >= v.clip.len() && v.send_pos >= v.clip.len();
+            let done = v.done();
             if done && v.soundboard {
-                finished += 1;
+                finished.push(v.id);
             }
             !done
         });
-        for _ in 0..finished {
-            self.emit(AudioEvent::ClipFinished);
+        for id in finished {
+            self.emit(AudioEvent::ClipFinished(id));
         }
     }
 
     /// True while a clip still has samples to play locally (keeps the output device open).
     pub(crate) fn has_local_voices(&self) -> bool {
-        self.voices.iter().any(|v| v.play_pos < v.clip.len())
+        self.voices.iter().any(|v| v.play_pos < v.play_end())
     }
 
     // ------------------------------------------------------------------ receive
@@ -445,9 +536,10 @@ impl Processor {
     /// Routes one received audio datagram to its track's jitter buffer.
     pub(crate) fn push_packet(&mut self, pkt: Bytes, now_ms: u64) {
         let Some(call) = &self.call else { return };
-        let own = call.track;
+        let own = track_short_id(call.track);
         let Some((h, opus)) = AudioHeader::parse(&pkt) else { return };
-        if h.track == own || opus.is_empty() || opus.len() > MAX_OPUS_PACKET {
+        // My own voice and soundboard tracks never play back.
+        if track_short_id(h.track) == own || !is_audio_kind(track_kind(h.track)) || opus.is_empty() || opus.len() > MAX_OPUS_PACKET {
             return;
         }
         let idx = match self.tracks.iter().position(|t| t.id == h.track) {
@@ -519,15 +611,17 @@ impl Processor {
             }
             t.cursor += n;
         }
+        let local_sound = self.local_sound_gain;
         for v in &mut self.voices {
-            let len = v.clip.len();
+            let len = v.play_end();
             if v.play_pos >= len {
                 continue;
             }
             let end = (v.play_pos + n).min(len);
-            let gain = if v.soundboard { SOUNDBOARD_GAIN } else { 1.0 };
-            for (o, s) in out.iter_mut().zip(&v.clip.samples()[v.play_pos..end]) {
-                *o += s * gain;
+            let gain = if v.soundboard { SOUNDBOARD_GAIN * local_sound } else { 1.0 };
+            let stop = v.stop.map(|(p, _)| p);
+            for (i, (o, s)) in out.iter_mut().zip(&v.clip.samples()[v.play_pos..end]).enumerate() {
+                *o += s * gain * stop_gain(v.play_pos + i, stop);
             }
             v.play_pos = end;
         }
@@ -589,47 +683,87 @@ impl Processor {
         } else {
             call.send.copy_from_slice(&call.pcm20);
         }
+        // My clips, mixed for the soundboard stream (never into the voice).
         let mut clip_active = false;
-        for v in self.voices.iter_mut().filter(|v| v.soundboard) {
-            let len = v.clip.len();
-            if v.send_pos >= len {
-                continue;
+        if let Some(sound) = call.sound.as_mut() {
+            sound.pcm.fill(0.0);
+            for v in self.voices.iter_mut().filter(|v| v.soundboard) {
+                let len = v.send_end();
+                if v.send_pos >= len {
+                    continue;
+                }
+                clip_active = true;
+                let end = (v.send_pos + FRAME_SAMPLES).min(len);
+                let stop = v.stop.map(|(_, s)| s);
+                for (i, (o, s)) in sound.pcm.iter_mut().zip(&v.clip.samples()[v.send_pos..end]).enumerate() {
+                    *o += s * SOUNDBOARD_GAIN * stop_gain(v.send_pos + i, stop);
+                }
+                v.send_pos = end;
             }
-            clip_active = true;
-            let end = (v.send_pos + FRAME_SAMPLES).min(len);
-            for (o, s) in call.send.iter_mut().zip(&v.clip.samples()[v.send_pos..end]) {
-                *o += s * SOUNDBOARD_GAIN;
+            if clip_active {
+                soft_limit_all(&mut sound.pcm);
             }
-            v.send_pos = end;
-        }
-        if clip_active {
-            soft_limit_all(&mut call.send);
+        } else {
+            // No soundboard encoder: the clip still plays locally, and is not sent.
+            for v in self.voices.iter_mut().filter(|v| v.soundboard) {
+                v.send_pos = v.send_end();
+            }
         }
         let speaking_changed = speaking != call.local_speaking;
         call.local_speaking = speaking;
         let ts = call.ts;
         call.ts = call.ts.wrapping_add(FRAME_SAMPLES as u32);
-        self.send_frame(muted, clip_active, speaking, ts);
+        self.send_frame(muted, speaking, ts);
+        self.send_sound(clip_active, ts);
         if speaking_changed {
             self.emit(AudioEvent::LocalSpeaking(speaking));
         }
         self.reap_voices();
     }
 
-    fn send_frame(&mut self, muted: bool, clip_active: bool, speaking: bool, ts: u32) {
+    /// One 20 ms frame of the soundboard stream, while a clip plays.
+    fn send_sound(&mut self, clip_active: bool, ts: u32) {
         let Some(call) = self.call.as_mut() else { return };
-        if muted && !clip_active {
+        let Some(s) = call.sound.as_mut() else { return };
+        if !clip_active {
+            // a pause: nothing sent, the sequence number is not consumed
+            s.talkspurt = true;
+            s.prev_sent = false;
+            return;
+        }
+        let n = match s.enc.encode(&s.pcm, &mut s.pkt) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(%e, "opus encode (soundboard)");
+                return;
+            }
+        };
+        let opus = &s.pkt[..n];
+        let mut flags = AF_SOUNDBOARD;
+        if s.talkspurt {
+            flags |= AF_TALKSPURT;
+        }
+        if call.fec && s.prev_sent && packet_has_silk(opus) {
+            flags |= AF_FEC;
+        }
+        let track = track_id(track_short_id(call.track), KIND_SOUND);
+        let header = AudioHeader { flags, track, seq: s.seq, ts, level: level_byte(rms(&s.pcm)), epoch: call.epoch };
+        match call.out.try_send(header.packet(opus)) {
+            Ok(()) => call.sent += 1,
+            Err(_) => call.dropped += 1,
+        }
+        s.seq = s.seq.wrapping_add(1);
+        s.talkspurt = false;
+        s.prev_sent = true;
+    }
+
+    fn send_frame(&mut self, muted: bool, speaking: bool, ts: u32) {
+        let Some(call) = self.call.as_mut() else { return };
+        if muted {
             // muted: send nothing, the sequence number is not consumed (like DTX)
             call.talkspurt = true;
             call.prev_sent = false;
             return;
-        }
-        let want_dtx = !clip_active;
-        if want_dtx != call.dtx {
-            if let Err(e) = call.enc.set_dtx(want_dtx) {
-                tracing::warn!(%e, "opus dtx");
-            }
-            call.dtx = want_dtx;
         }
         let n = match call.enc.encode(&call.send, &mut call.pkt) {
             Ok(n) => n,
@@ -654,9 +788,6 @@ impl Processor {
         }
         if call.fec && call.prev_sent && packet_has_silk(opus) {
             flags |= AF_FEC;
-        }
-        if clip_active {
-            flags |= AF_SOUNDBOARD;
         }
         let header = AudioHeader { flags, track: call.track, seq: call.seq, ts, level: level_byte(rms(&call.send)), epoch: call.epoch };
         match call.out.try_send(header.packet(opus)) {
@@ -787,44 +918,163 @@ mod tests {
         assert!(drain(&mut rx).is_empty());
     }
 
+    fn tone(secs: f32) -> Arc<ClipPcm> {
+        let n = (48_000.0 * secs) as usize;
+        Arc::new(ClipPcm::from_samples((0..n).map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin()).collect()))
+    }
+
+    fn finished(ev: &mut mpsc::UnboundedReceiver<AudioEvent>) -> Vec<u64> {
+        events(ev).into_iter().filter_map(|e| if let AudioEvent::ClipFinished(id) = e { Some(id) } else { None }).collect()
+    }
+
     #[test]
-    fn soundboard_while_muted_is_flagged_and_loud_and_dtx_off() {
+    fn soundboard_while_muted_is_flagged_and_loud_on_its_own_track() {
         let (mut p, mut ev) = processor();
         let mut rx = start(&mut p, 8);
         p.set_muted(true);
-        let clip: Vec<f32> = (0..48_000).map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin()).collect();
-        p.play_clip(Arc::new(ClipPcm::from_samples(clip))).unwrap();
+        p.play_clip(tone(1.0), 7).unwrap();
         run(&mut p, 0, 120, |_| 0.0);
         let pkts = drain(&mut rx);
-        assert_eq!(pkts.len(), 50, "1 s clip = 50 packets, DTX off, voice muted");
+        assert_eq!(pkts.len(), 50, "1 s clip = 50 packets, no DTX, voice muted");
         let mut dec = LibOpus.decoder().unwrap();
         let mut pcm = vec![0f32; 960];
         let mut energy = 0.0;
+        let hs: Vec<AudioHeader> = pkts.iter().map(|b| AudioHeader::parse(b).unwrap().0).collect();
+        assert!(hs.windows(2).all(|w| w[1].seq == w[0].seq.wrapping_add(1)));
+        assert!(hs[0].flags & AF_TALKSPURT != 0);
         for b in &pkts {
             let (h, opus) = AudioHeader::parse(b).unwrap();
+            assert_eq!(h.track, track_id(2, KIND_SOUND), "the soundboard track of short id 2");
+            assert_eq!(h.epoch, 7);
             assert!(h.flags & AF_SOUNDBOARD != 0);
-            assert!(h.flags & AF_SPEAKING == 0, "voice is muted");
+            assert!(h.flags & AF_SPEAKING == 0, "never speaking");
             assert!(h.level < 20, "level byte {}", h.level);
             dec.decode(opus, &mut pcm).unwrap();
             energy += pcm.iter().map(|x| x * x).sum::<f32>();
         }
         assert!(energy / (50.0 * 960.0) > 0.01, "clip carries energy");
-        assert!(events(&mut ev).contains(&AudioEvent::ClipFinished));
+        assert_eq!(finished(&mut ev), vec![7]);
         // after the clip: muted again, nothing sent
         run(&mut p, 120, 50, |_| 0.0);
         assert!(drain(&mut rx).is_empty());
     }
 
     #[test]
-    fn play_clip_errors() {
+    fn a_clip_over_speech_leaves_the_voice_stream_alone() {
         let (mut p, _ev) = processor();
+        let mut rx = start(&mut p, 4);
+        run(&mut p, 0, 50, speech);
+        p.play_clip(tone(0.5), 1).unwrap();
+        run(&mut p, 50, 100, speech);
+        let hs: Vec<AudioHeader> = drain(&mut rx).iter().map(|b| AudioHeader::parse(b).unwrap().0).collect();
+        let (voice, sound): (Vec<&AudioHeader>, Vec<&AudioHeader>) = hs.iter().partition(|h| h.track == 4);
+        assert!(sound.iter().all(|h| h.track == track_id(1, KIND_SOUND) && h.flags & AF_SOUNDBOARD != 0));
+        assert_eq!(sound.len(), 25, "0.5 s clip");
+        assert!(voice.len() >= 60, "voice keeps going: {}", voice.len());
+        assert!(voice.iter().all(|h| h.flags & AF_SOUNDBOARD == 0), "no clip mixed into the voice");
+        assert!(voice.windows(2).all(|w| w[1].seq == w[0].seq.wrapping_add(1)), "voice seq untouched by the clip");
+    }
+
+    #[test]
+    fn stopping_a_clip_ends_sending_and_playout_at_once() {
+        let (mut p, mut ev) = processor();
+        let mut rx = start(&mut p, 8);
+        p.set_muted(true);
+        p.play_clip(tone(2.0), 3).unwrap();
+        p.play_clip(tone(2.0), 4).unwrap();
+        run(&mut p, 0, 20, |_| 0.0);
+        let before = drain(&mut rx).len();
+        assert_eq!(before, 10);
+        p.stop_clip(3);
+        p.stop_clip(99); // unknown: ignored
+        run(&mut p, 20, 10, |_| 0.0);
+        assert_eq!(finished(&mut ev), vec![3], "only the stopped clip ends");
+        assert!(p.has_local_voices(), "clip 4 still plays");
+        p.stop_all_clips();
+        let mut out = vec![0f32; FRAME_10MS];
+        // the fade is 5 ms: the next 10 ms frame ends silent
+        p.render(&mut out, 300, true);
+        assert!(out[STOP_RAMP..].iter().all(|x| x.abs() < 1e-6), "faded out");
+        assert!(out[..STOP_RAMP].windows(2).all(|w| (w[1] - w[0]).abs() < 0.05), "no click");
+        run(&mut p, 31, 20, |_| 0.0);
+        assert_eq!(finished(&mut ev), vec![4]);
+        assert!(!p.has_local_voices());
+        let after = drain(&mut rx).len();
+        assert!(after <= 6, "{after} packets after the stop (one fade frame each time)");
+        run(&mut p, 51, 20, |_| 0.0);
+        assert!(drain(&mut rx).is_empty(), "nothing after both stopped");
+    }
+
+    #[test]
+    fn my_room_soundboard_gain_scales_local_playout_only() {
+        let (mut p, _ev) = processor();
+        let mut rx = start(&mut p, 8);
+        p.set_muted(true);
+        p.set_local_sound_gain(0.0);
+        p.play_clip(tone(0.5), 1).unwrap();
+        let mut out = vec![0f32; FRAME_10MS];
+        let mut buf = vec![0f32; FRAME_10MS];
+        let mut local = 0.0f32;
+        for f in 0..60 {
+            p.render(&mut out, f * 10, true);
+            local += out.iter().map(|x| x * x).sum::<f32>();
+            buf.fill(0.0);
+            p.capture(&mut buf, f * 10);
+        }
+        assert!(local < 1e-6, "silent here");
+        assert_eq!(drain(&mut rx).len(), 25, "still sent in full");
+    }
+
+    #[test]
+    fn play_clip_errors() {
+        let (mut p, mut ev) = processor();
         let clip = Arc::new(ClipPcm::from_samples(vec![0.1; 4800]));
-        assert!(matches!(p.play_clip(clip.clone()), Err(AudioError::NotInCall)));
+        assert!(matches!(p.play_clip(clip.clone(), 1), Err(AudioError::NotInCall)));
         let _rx = start(&mut p, 4);
         p.set_deafened(true);
-        assert!(matches!(p.play_clip(clip.clone()), Err(AudioError::Deafened)));
+        assert!(matches!(p.play_clip(clip.clone(), 2), Err(AudioError::Deafened)));
+        assert_eq!(finished(&mut ev), vec![1, 2], "a refused clip is over at once");
         p.set_deafened(false);
-        assert!(p.play_clip(clip).is_ok());
+        assert!(p.play_clip(clip, 3).is_ok());
+    }
+
+    /// Energy `b` plays from `a`'s muted clip, with these gains on a's two tracks.
+    fn heard_clip_energy(voice_gain: f32, sound_gain: f32) -> f32 {
+        let (mut a, _eva) = processor();
+        let (mut b, _evb) = processor();
+        let mut rx_a = start(&mut a, 4);
+        let _rx_b = start(&mut b, 8);
+        b.set_track_volume(4, voice_gain);
+        b.set_track_volume(track_id(1, KIND_SOUND), sound_gain);
+        a.play_clip(tone(1.0), 1).unwrap();
+        let mut cap = vec![0f32; FRAME_10MS];
+        let mut out = vec![0f32; FRAME_10MS];
+        let mut energy = 0.0f32;
+        for f in 0..150usize {
+            let now = f as u64 * 10;
+            a.render(&mut out, now, true);
+            cap.iter_mut().enumerate().for_each(|(i, s)| *s = speech(f * FRAME_10MS + i));
+            a.capture(&mut cap, now);
+            for pkt in drain(&mut rx_a) {
+                b.push_packet(pkt, now + 30);
+            }
+            b.render(&mut out, now + 30, true);
+            energy += out.iter().map(|x| x * x).sum::<f32>();
+            cap.fill(0.0);
+            b.capture(&mut cap, now + 30);
+        }
+        energy
+    }
+
+    #[test]
+    fn a_receiver_sets_soundboard_volume_apart_from_voice() {
+        let both = heard_clip_energy(1.0, 1.0);
+        let voice_only = heard_clip_energy(1.0, 0.0);
+        let sound_only = heard_clip_energy(0.0, 1.0);
+        let none = heard_clip_energy(0.0, 0.0);
+        assert!(none < 1e-6, "{none}");
+        assert!(voice_only > 0.5 && sound_only > 5.0, "voice {voice_only}, clip {sound_only}");
+        assert!((both - voice_only - sound_only).abs() < 0.5 * both, "two separate tracks: {both} vs {voice_only} + {sound_only}");
     }
 
     #[test]

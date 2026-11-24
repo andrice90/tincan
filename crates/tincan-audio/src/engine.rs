@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -48,7 +48,10 @@ enum Cmd {
     Processing { echo_cancellation: bool, noise_suppression: bool },
     LossHint(u8),
     Relayed(bool),
-    PlayClip(Arc<ClipPcm>),
+    PlayClip(Arc<ClipPcm>, u64),
+    StopClip(u64),
+    StopClips,
+    LocalSoundGain(f32),
     PlayLocal(Arc<ClipPcm>),
     MicTest(bool),
     Shutdown,
@@ -58,6 +61,8 @@ struct Shared {
     in_call: AtomicBool,
     deafened: AtomicBool,
     alive: AtomicBool,
+    /// Last soundboard clip id handed out.
+    clip_id: AtomicU64,
 }
 
 /// Runs the engine thread above normal priority so playout keeps up under CPU load.
@@ -130,7 +135,7 @@ impl AudioEngine {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (pkt_tx, pkt_rx) = crossbeam_channel::bounded(PACKET_QUEUE);
-        let shared = Arc::new(Shared { in_call: AtomicBool::new(false), deafened: AtomicBool::new(false), alive: AtomicBool::new(true) });
+        let shared = Arc::new(Shared { in_call: AtomicBool::new(false), deafened: AtomicBool::new(false), alive: AtomicBool::new(true), clip_id: AtomicU64::new(0) });
         let codec = cfg.codec.clone();
         let settings = Settings {
             echo_cancellation: cfg.echo_cancellation,
@@ -280,18 +285,39 @@ impl AudioEngine {
         crate::clip::decode_clip(bytes, max_ms)
     }
 
-    /// Plays a soundboard clip into the call (mixed after noise suppression and AGC, DTX off,
-    /// header flag `AF_SOUNDBOARD`) and locally (so the echo canceller has it as reference).
-    /// Works while muted. Errors: [`AudioError::NotInCall`], [`AudioError::Deafened`].
-    /// `AudioEvent::ClipFinished` follows when it has been sent and played.
-    pub fn play_clip(&self, clip: Arc<ClipPcm>) -> Result<()> {
+    /// Plays a soundboard clip into the call and locally (so the echo canceller has it as
+    /// reference). In the call it goes out on its own Opus stream, track
+    /// `track_id(short_id, KIND_SOUND)` with the header flag `AF_SOUNDBOARD`, so receivers can
+    /// set its volume apart from the voice; nothing is sent on that track between clips.
+    /// Works while muted. Returns the clip's id; `AudioEvent::ClipFinished(id)` follows when it
+    /// is over. Errors: [`AudioError::NotInCall`], [`AudioError::Deafened`].
+    pub fn play_clip(&self, clip: Arc<ClipPcm>) -> Result<u64> {
         if !self.inner.shared.in_call.load(Ordering::Acquire) {
             return Err(AudioError::NotInCall);
         }
         if self.inner.shared.deafened.load(Ordering::Acquire) {
             return Err(AudioError::Deafened);
         }
-        self.send(Cmd::PlayClip(clip))
+        let id = self.inner.shared.clip_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.send(Cmd::PlayClip(clip, id))?;
+        Ok(id)
+    }
+
+    /// Stops soundboard clip `id` locally and in the call at once (a 5 ms fade).
+    /// `ClipFinished(id)` follows. Unknown or finished ids are ignored.
+    pub fn stop_clip(&self, id: u64) {
+        self.post(Cmd::StopClip(id));
+    }
+
+    /// Stops every soundboard clip I am playing (see [`AudioEngine::stop_clip`]).
+    pub fn stop_clips(&self) {
+        self.post(Cmd::StopClips);
+    }
+
+    /// Local gain of my own soundboard clips (0..=4, 1 = unchanged), such as the room's
+    /// soundboard volume. What goes into the call is not changed.
+    pub fn set_local_sound_gain(&self, g: f32) {
+        self.post(Cmd::LocalSoundGain(g));
     }
 
     /// Plays a UI sound (join/leave chime) through the output mixer, opening the output if
@@ -484,11 +510,15 @@ impl Driver {
                     self.proc.set_jitter_config(cfg);
                 }
             }
-            Cmd::PlayClip(c) => {
-                if let Err(e) = self.proc.play_clip(c) {
+            Cmd::PlayClip(c, id) => {
+                // A refused clip still gets its ClipFinished (from the processor).
+                if let Err(e) = self.proc.play_clip(c, id) {
                     tracing::debug!(%e, "play_clip ignored");
                 }
             }
+            Cmd::StopClip(id) => self.proc.stop_clip(id),
+            Cmd::StopClips => self.proc.stop_all_clips(),
+            Cmd::LocalSoundGain(g) => self.proc.set_local_sound_gain(g),
             Cmd::PlayLocal(c) => self.proc.play_local(c),
             Cmd::MicTest(on) => self.proc.set_mic_test(on),
             Cmd::Shutdown => {}

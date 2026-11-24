@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use serde_json::Value;
-use tincan_core::media::{KIND_VOICE, VideoFrame, track_id, ui_video_message};
+use tincan_core::media::{KIND_SOUND, KIND_VOICE, VideoFrame, track_id, ui_video_message};
 use tincan_core::storage::Storage;
 use tincan_core::{ChannelId, ConvId, ServerId, UserId};
 use tincan_net::{CallEnd, CallInfo, CallState, ConnState, MediaSession, Net, VoiceInfo};
@@ -163,6 +163,17 @@ fn volume_of(st: &State, user: &UserId) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
+/// How loud `user`'s soundboard clips play for me (0..2, on top of their volume).
+fn sound_volume_of(st: &State, user: &UserId) -> f64 { super::volumes::shown(st.sound_volumes.get(user).copied().unwrap_or(1.0)) }
+
+/// Hashes of my clips playing now, sorted and without repeats.
+fn playing_clips(st: &State) -> Vec<String> {
+    let mut v: Vec<String> = st.playing.values().map(|h| h.to_hex()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// Hang up a call whose audio could not start (Net already answered or connected it), so
 /// neither side is left in a silent call that nothing in the UI can end.
 fn hang_up_unattached(core: &Arc<Core>) {
@@ -218,6 +229,7 @@ impl Media {
         }
         st.sound_seen.clear();
         st.pcm.clear();
+        st.playing.clear();
         st.room = RoomMap::default();
         core.files.set_upload_limit(None);
         tracing::info!(conv = %a.conv.short(), "voice detached");
@@ -323,6 +335,7 @@ impl Media {
         for (user, short) in left {
             if let (Some(e), Some(short)) = (&engine, short) {
                 e.remove_track(track_id(short, KIND_VOICE));
+                e.remove_track(track_id(short, KIND_SOUND));
             }
             engine::set_speaking(core, st, user, false);
         }
@@ -332,13 +345,15 @@ impl Media {
         }
     }
 
-    /// Per-user playback gains for everyone in my session.
+    /// Per-user playback gains (voice and soundboard tracks) for everyone in my session, and
+    /// the room's soundboard volume for my own clips.
     pub(super) fn apply_volumes(&self, e: &tincan_audio::AudioEngine, st: &State) {
         for user in &st.room.users {
             if let Some(short) = st.room.short_of(user) {
-                e.set_track_volume(track_id(short, KIND_VOICE), st.volumes.get(user).copied().unwrap_or(1.0));
+                Self::apply_user_gains(e, st, user, short);
             }
         }
+        e.set_local_sound_gain(Self::current_room_sound(st));
     }
 
     /// Screen tracks shared in my session right now (None while that is unknown).
@@ -449,6 +464,7 @@ impl Media {
             avatar: core.my_avatar_url(),
             screen_track: my_share,
             volume: 1.0,
+            soundboard_volume: 1.0,
         };
         let mut participants = vec![me];
         let session = match a.kind {
@@ -468,6 +484,7 @@ impl Media {
                             avatar: core.member_avatar_url(&view, &e.user),
                             screen_track: e.sharing,
                             volume: volume_of(st, &e.user),
+                            soundboard_volume: sound_volume_of(st, &e.user),
                         });
                     }
                 }
@@ -488,6 +505,7 @@ impl Media {
                     sharing: my_share.is_some(),
                     path,
                     rtt_ms,
+                    playing_clips: playing_clips(st),
                 }
             }
             Kind::Call { peer } => {
@@ -501,6 +519,7 @@ impl Media {
                     avatar: core.dm_avatar_url(&peer),
                     screen_track: call.as_ref().and_then(|c| c.peer_sharing),
                     volume: volume_of(st, &peer),
+                    soundboard_volume: sound_volume_of(st, &peer),
                 });
                 dto::VoiceSession {
                     kind: dto::VoiceKind::Call,
@@ -513,6 +532,7 @@ impl Media {
                     sharing: my_share.is_some(),
                     path,
                     rtt_ms,
+                    playing_clips: playing_clips(st),
                 }
             }
         };
@@ -846,12 +866,10 @@ impl Media {
         self.emit_voice(core, st);
     }
 
-    /// `set_user_volume` (0..2, remembered across sessions and restarts).
+    /// `set_user_volume` (0..2, remembered across sessions and restarts). It is the person's
+    /// overall volume: their soundboard clips follow it too.
     pub(super) fn set_user_volume(&self, core: &Arc<Core>, user: UserId, volume: f64) -> Result<(), String> {
-        if !volume.is_finite() {
-            return Err("Volume must be a number between 0 and 2.".into());
-        }
-        let v = volume.clamp(0.0, 2.0) as f32;
+        let v = super::volumes::checked(volume)?;
         let mut st = self.st.lock();
         if (v - 1.0).abs() < 1e-4 {
             st.volumes.remove(&user);
@@ -860,7 +878,7 @@ impl Media {
         }
         save_volumes(core, &st.volumes);
         if let (Some(e), Some(short)) = (self.engine_handle(), st.room.short_of(&user)) {
-            e.set_track_volume(track_id(short, KIND_VOICE), v);
+            Self::apply_user_gains(&e, &st, &user, short);
         }
         // `VoiceParticipant.volume` changed.
         self.emit_voice(core, &mut st);

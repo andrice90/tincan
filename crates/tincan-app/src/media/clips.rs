@@ -5,8 +5,9 @@
 //! Limits (architecture.md; the UI shows the same): 20 s decoded and 5 MB per file. Every
 //! decode runs on a blocking thread under `catch_unwind` (see `engine::decode_clip`).
 //!
-//! A heard clip is not replayed locally: the player's engine mixes it into its outgoing
-//! voice stream (`AF_SOUNDBOARD`), so every listener already hears it once.
+//! A heard clip is not replayed locally: the player's engine sends it on its own soundboard
+//! track (`KIND_SOUND`, beside the voice), so every listener already hears it once, at the
+//! soundboard volumes they picked (`volumes.rs`).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -382,19 +383,38 @@ impl Media {
         let pcm = self.pcm_of(core, hash).await?;
         self.check_can_play()?;
         let engine = self.engine_handle().ok_or_else(|| "not-in-voice".to_string())?;
-        engine.play_clip(pcm).map_err(|e| match e {
-            AudioError::NotInCall => "not-in-voice".to_string(),
-            AudioError::Deafened => "deafened".to_string(),
-            other => {
-                tracing::warn!(error = %other, "playing a clip failed");
-                "Audio isn't working right now. Try again in a moment.".to_string()
-            }
-        })?;
+        {
+            // Under `st`: the engine's ClipFinished for this id (handled under `st` too)
+            // cannot be seen before the id is recorded.
+            let mut st = self.st.lock();
+            let id = engine.play_clip(pcm).map_err(|e| match e {
+                AudioError::NotInCall => "not-in-voice".to_string(),
+                AudioError::Deafened => "deafened".to_string(),
+                other => {
+                    tracing::warn!(error = %other, "playing a clip failed");
+                    "Audio isn't working right now. Try again in a moment.".to_string()
+                }
+            })?;
+            st.playing.insert(id, hash);
+            self.emit_voice(core, &mut st);
+        }
         let conv = self.st.lock().attached.as_ref().map(|a| a.conv);
         if let Some(conv) = conv {
             core.share_blob(hash, conv);
         }
         core.net.sound_played(clip_info(&rec)).await.map_err(net_err)
+    }
+
+    /// `clip_stop`: stop every play of `hash` of mine, here and in the call at once.
+    /// `VoiceSession.playingClips` drops it when the engine reports the clips over.
+    pub(super) fn clip_stop(&self, _core: &Arc<Core>, hash: BlobHash) {
+        let st = self.st.lock();
+        let ids: Vec<u64> = st.playing.iter().filter(|(_, h)| **h == hash).map(|(id, _)| *id).collect();
+        if let Some(e) = self.engine_handle() {
+            for id in ids {
+                e.stop_clip(id);
+            }
+        }
     }
 
     fn check_can_play(&self) -> Result<(), String> {

@@ -280,8 +280,21 @@ pub struct VoiceParticipant {
     pub avatar: Option<String>,
     /// Screen track while sharing.
     pub screen_track: Option<u16>,
-    /// How loud they play for me (0..2, saved per user; 1 for me).
+    /// How loud they play for me (0..2, saved per user; 1 for me). Their clips follow it too.
     pub volume: f64,
+    /// How loud their soundboard clips play for me, on top of `volume` (0..2, saved per
+    /// user; 1 for me).
+    pub soundboard_volume: f64,
+}
+
+/// `user_volume` result: both saved volumes of a person.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserVolume {
+    /// Overall (voice and clips), 0..2.
+    pub volume: f64,
+    /// Their clips, on top of `volume`, 0..2.
+    pub soundboard_volume: f64,
 }
 
 /// `VoiceSession.kind`.
@@ -318,6 +331,8 @@ pub struct VoiceSession {
     pub path: PathKind,
     /// Round-trip time.
     pub rtt_ms: Option<u32>,
+    /// Hashes of my clips playing now (from `clip_play` until they end or `clip_stop`).
+    pub playing_clips: Vec<String>,
 }
 
 /// `CallState`.

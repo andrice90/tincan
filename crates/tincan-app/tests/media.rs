@@ -17,8 +17,8 @@ use tokio::time::Instant;
 /// One test at a time: each runs several endpoints with real timers.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-const VOICE_KEYS: &[&str] = &["kind", "convId", "channelId", "name", "participants", "muted", "deafened", "sharing", "path", "rttMs"];
-const PARTICIPANT_KEYS: &[&str] = &["userId", "name", "muted", "deafened", "speaking", "avatar", "screenTrack", "volume"];
+const VOICE_KEYS: &[&str] = &["kind", "convId", "channelId", "name", "participants", "muted", "deafened", "sharing", "path", "rttMs", "playingClips"];
+const PARTICIPANT_KEYS: &[&str] = &["userId", "name", "muted", "deafened", "speaking", "avatar", "screenTrack", "volume", "soundboardVolume"];
 const CLIP_KEYS: &[&str] = &["hash", "name", "durationMs", "size", "owned", "heardFrom", "transfer"];
 const CALL_KEYS: &[&str] = &["callId", "userId", "name", "state"];
 
@@ -586,8 +586,41 @@ async fn soundboard_clips_travel_between_members() {
     assert_eq!(heard["clip"]["heardFrom"], a.user.as_str());
     let listed = call(&b.app, "clips", json!({})).await;
     assert!(listed.as_array().unwrap().iter().any(|c| c["hash"] == hash.as_str() && c["owned"] == false));
-    // The clip's audio arrived inside Alice's stream (her mic is muted).
+    // The clip's audio arrived on Alice's soundboard track (her mic is muted).
     audio_flows(&b.app, "Bob hearing the clip").await;
+
+    // Alice's session shows the clip playing until it ends (2 s) ...
+    let playing = |v: &Value| v["playingClips"] == json!([hash.as_str()]);
+    let not_playing = |v: &Value| v["playingClips"] == json!([]);
+    let mine = || async { call(&a.app, "app_snapshot", json!({})).await["voice"].clone() };
+    eventually("the first play ended", 10, || async { not_playing(&mine().await).then_some(()) }).await;
+    call(&a.app, "clip_play", json!({ "hash": hash })).await;
+    assert!(playing(&mine().await), "playing right after clip_play");
+    let started = std::time::Instant::now();
+    eventually("the clip ended by itself", 10, || async { not_playing(&mine().await).then_some(()) }).await;
+    assert!(started.elapsed() > Duration::from_millis(1500), "a 2 s clip ended after {:?}", started.elapsed());
+    // ... or until she stops it, which ends it at once.
+    call(&a.app, "clip_play", json!({ "hash": hash })).await;
+    assert!(playing(&mine().await));
+    let stopped = std::time::Instant::now();
+    call(&a.app, "clip_stop", json!({ "hash": hash })).await;
+    eventually("the stopped clip ended", 5, || async { not_playing(&mine().await).then_some(()) }).await;
+    assert!(stopped.elapsed() < Duration::from_millis(1500), "stop took {:?}", stopped.elapsed());
+    call(&a.app, "clip_stop", json!({ "hash": hash })).await; // nothing playing: a no-op
+    assert!(call_err(&a.app, "clip_stop", json!({ "hash": "nope" })).await.contains("not valid"));
+
+    // Bob's volumes for Alice: overall and soundboard, saved apart; and the room's.
+    assert_eq!(call(&b.app, "user_volume", json!({ "userId": a.user })).await, json!({ "volume": 1.0, "soundboardVolume": 1.0 }));
+    call(&b.app, "set_user_soundboard_volume", json!({ "userId": a.user, "volume": 0.25 })).await;
+    let v = wait_for(&mut b.rx, "voice-updated", 10, |v| participant(v, &a.user).is_some_and(|p| p["soundboardVolume"] == json!(0.25))).await;
+    assert_voice_shape(&v);
+    assert_eq!(participant(&v, &a.user).unwrap()["volume"], json!(1.0), "overall volume untouched");
+    assert_eq!(call(&b.app, "user_volume", json!({ "userId": a.user })).await, json!({ "volume": 1.0, "soundboardVolume": 0.25 }));
+    assert!(!call_err(&b.app, "set_user_soundboard_volume", json!({ "userId": a.user, "volume": "loud" })).await.is_empty());
+    assert_eq!(call(&b.app, "room_soundboard_volume", json!({ "channelId": room })).await, json!(1.0));
+    call(&b.app, "set_room_soundboard_volume", json!({ "channelId": room, "volume": 3 })).await;
+    assert_eq!(call(&b.app, "room_soundboard_volume", json!({ "channelId": room })).await, json!(2.0), "clamped to 200 %");
+    assert!(call_err(&b.app, "room_soundboard_volume", json!({ "channelId": "zz" })).await.contains("not valid"));
 
     let pulling = call(&b.app, "clip_fetch", json!({ "hash": hash })).await;
     assert_keys(&pulling, CLIP_KEYS);
