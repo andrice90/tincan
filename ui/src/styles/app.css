@@ -1125,6 +1125,8 @@ button.member-row:hover {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  /* the tile grid sizes its tiles from this box (cqw / cqh) */
+  container-type: size;
 }
 
 .room-chat {
@@ -1151,14 +1153,25 @@ button.member-row:hover {
   color: var(--text-2);
 }
 
-/* Fixed-width tiles, centred: when the panels around the stage slide open or closed, the
-   tiles keep their size and only rewrap, instead of stretching with the width every frame
-   (narrower than one tile, a tile takes the whole width). */
+/* Columns come from the number of people (--cols, --rows, set by VoiceView), never from the
+   width: when a panel slides or a grab bar is dragged the tiles only scale, smoothly, and
+   never rewrap or jump. A tile is as wide as fits both the width and the height (16:9),
+   at most 360 px and at least 120 px (below that the grid scrolls). */
 .tiles {
+  --tile-w: clamp(
+    120px,
+    min(
+      (100cqw - 2 * var(--sp-4) - (var(--cols) - 1) * var(--sp-3)) / var(--cols),
+      (100cqh - 2 * var(--sp-4) - (var(--rows) - 1) * var(--sp-3)) / var(--rows) * 16 / 9
+    ),
+    360px
+  );
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 240px));
+  flex: 1;
+  min-height: 0;
+  grid-template-columns: repeat(var(--cols, 1), var(--tile-w));
   justify-content: center;
-  align-content: start;
+  align-content: safe center;
   gap: var(--sp-3);
   padding: var(--sp-4);
   overflow-y: auto;
@@ -1309,20 +1322,18 @@ button.member-row:hover {
   height: 96px;
 }
 
+/* a call's tiles scale from this box too (see .tiles) */
 .call-stage {
   flex: none;
   display: flex;
   flex-direction: column;
+  container-type: size;
   height: 44%;
   min-height: 200px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-side);
 }
 
-.call-stage .tiles {
-  grid-template-columns: repeat(auto-fit, minmax(180px, 240px));
-  justify-content: center;
-}
 
 .volume-pop {
   width: 240px;

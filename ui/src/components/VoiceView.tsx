@@ -11,6 +11,14 @@ import { useStore } from "../store/store";
 import { ChannelMessages } from "./ChatView";
 import { ICON, ICON_SM, IconButton, PersonId, PersonName, SpeakingAvatar } from "./common";
 import { Popover, useMenu } from "./Menu";
+import { tileGrid } from "../lib/tileGrid";
+import type { CSSProperties } from "react";
+
+/** The tile grid's columns and rows as CSS variables (see `.tiles` in app.css). */
+function gridStyle(n: number): CSSProperties {
+  const { cols, rows } = tileGrid(n);
+  return { "--cols": cols, "--rows": rows } as CSSProperties;
+}
 
 /** Per-user playback volume picked in this session (0..2); the app's saved value seeds it. */
 const volumes = new Map<UserId, number>();
@@ -181,7 +189,7 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
 
   if (!stagePerson && !iShare) {
     return (
-      <div className="tiles">
+      <div className="tiles" style={gridStyle(participants.length)}>
         {participants.map((p) => (
           <Tile key={p.userId} p={p} isMe={p.userId === meId} />
         ))}
@@ -284,7 +292,7 @@ export function VoiceRoomView({ server, channel }: { server: ServerSummary; chan
           ) : inside.length === 0 ? (
             <p className="voice-empty">No one is here yet.</p>
           ) : (
-            <div className="tiles">
+            <div className="tiles" style={gridStyle(inside.length)}>
               {inside.map((m) => (
                 <Tile
                   key={m.userId}
