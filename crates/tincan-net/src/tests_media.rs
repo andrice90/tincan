@@ -252,6 +252,9 @@ async fn voice_and_share_survive_host_migration() {
     let (track, frames) = b.net.share_start().unwrap();
     assert_eq!(track, track_id(b.net.my_short_id(&server).unwrap(), KIND_SCREEN));
     let sharer = spawn_sharer(&b.net, frames, track, 30, 2000, true);
+    // Bob's share has audio too.
+    let share_audio = pump_audio(sb.share_audio_out.clone());
+    let share_audio_track = track_id(b.net.my_short_id(&server).unwrap(), tincan_core::media::KIND_SHARE_AUDIO);
     c.net.subscribe_track(track);
     let first = collect_frames(&mut sc.video_in, track, 20, Duration::from_secs(10)).await;
     assert_eq!(first.len(), 20, "carol watches bob before the migration");
@@ -283,6 +286,15 @@ async fn voice_and_share_survive_host_migration() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     eprintln!("voice resumed after the host left in {:?}", t0.elapsed());
+    // Share audio resumes on the new path too.
+    loop {
+        if drain_tracks(&mut sc.audio_in).contains(&share_audio_track) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "share audio did not resume within 15 s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    eprintln!("share audio resumed after the host left in {:?}", t0.elapsed());
     // Video keeps coming over the new path: no gap inside a group, restarts at keyframes.
     let moved_at = Instant::now();
     let mut all = first;
@@ -298,6 +310,7 @@ async fn voice_and_share_survive_host_migration() {
     assert_ne!(info.epoch, epoch_before, "the epoch byte follows the new host");
     shutdown.await.unwrap();
     sharer.abort();
+    share_audio.abort();
     pb.abort();
     pc.abort();
     for n in [b, c] {

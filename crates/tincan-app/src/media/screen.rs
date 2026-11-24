@@ -51,6 +51,11 @@ const NO_SOUND: &str = "Couldn't capture audio for this share, so only the pictu
 /// Shown when the shared window's app started Tincan (its sound would include the call).
 const ANCESTOR_SOUND: &str = "Audio from that window can't be shared because Tincan runs inside it. Only the picture is shared.";
 
+/// Shown when the share's audio capture stops while the picture goes on.
+const AUDIO_STOPPED: &str = "Audio capture stopped, so only the picture is shared now.";
+/// How often a running share's audio capture is checked.
+const AUDIO_CHECK: Duration = Duration::from_secs(1);
+
 /// What share audio captures for `source_id`, or the notice to show instead.
 fn share_audio_source(source_id: &str, synthetic: bool) -> Result<(ShareAudioSource, dto::ShareAudio), &'static str> {
     if synthetic {
@@ -344,7 +349,31 @@ impl Media {
         };
         if let Some(a) = left {
             let _ = tokio::task::spawn_blocking(move || a.stop()).await;
+            return;
         }
+        // A capture that stops by itself mid-share (device or session gone) is told, and the
+        // stage stops saying audio goes out. Stopping the share takes it out of `st.share`
+        // first, so that never counts.
+        let weak = Arc::downgrade(core);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(AUDIO_CHECK).await;
+                let Some(core) = weak.upgrade() else { return };
+                let died = {
+                    let st = core.media.st.lock();
+                    match st.share.as_ref().filter(|s| s.id == id).and_then(|s| s.audio.as_ref()) {
+                        Some((a, _)) => !a.is_running(),
+                        None => return,
+                    }
+                };
+                if died {
+                    tracing::warn!("share audio capture stopped during the share");
+                    core.toast(ToastKind::Info, AUDIO_STOPPED);
+                    core.media.reconcile(&core);
+                    return;
+                }
+            }
+        });
     }
 
     /// A share ended by itself (window closed, capture failed).

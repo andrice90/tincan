@@ -5,8 +5,8 @@
 //!   A datagram whose track id is not the sender's own voice track is dropped. The host's own
 //!   packets are injected the same way.
 //! - Share audio: a datagram on the sender's own share-audio track (`KIND_SHARE_AUDIO`) goes
-//!   only to the members (and the host's app) subscribed to the sender's screen track, while
-//!   that track exists here, policed separately from voice. It is never counted in uplink
+//!   only to the members (and the host's app) subscribed to the sender's screen track,
+//!   policed separately from voice. It is never counted in uplink
 //!   stats or receiver reports (those drive the voice encoder).
 //! - Video: each member's GOP uploads are put in order and pushed into that track's
 //!   [`VideoTrack`], whose viewers are the members (and the host's app) that subscribed.
@@ -425,11 +425,10 @@ impl Sfu {
             let mut st = self.st.lock();
             let Some(ch) = st.members.get(&from).and_then(|m| m.voice) else { return };
             let st = &mut *st;
-            let sharing = st.tracks.contains_key(&screen);
             for p in pkts.iter_mut() {
                 if super::wire::share_audio_track_from(p, short_id).is_some() {
                     let policer = st.share_policers.entry(from).or_insert_with(|| AudioPolicer::new(now));
-                    if !sharing || !policer.allow(p.len(), now) {
+                    if !policer.allow(p.len(), now) {
                         *p = Bytes::new();
                     } else if share_to.is_none() {
                         share_to = Some(st.share_viewers(screen, Some(from)));
