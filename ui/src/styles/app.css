@@ -1413,7 +1413,8 @@ button.clip-tile:hover:not(:disabled) {
   opacity: 0.5;
 }
 
-.clip-tile.is-playing {
+.clip-tile.is-playing,
+button.clip-tile.is-playing:hover:not(:disabled) {
   background: var(--accent);
   color: var(--accent-fg);
 }
@@ -1446,6 +1447,11 @@ button.clip-tile:hover:not(:disabled) {
 .clip-cell {
   position: relative;
   display: grid;
+}
+
+/* room for the stop button, so the name ends before it */
+.clip-cell:has(.clip-stop) .clip-tile {
+  padding-right: 36px;
 }
 
 .clip-stop {

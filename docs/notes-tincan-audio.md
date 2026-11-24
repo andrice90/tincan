@@ -15,7 +15,8 @@ Implementation notes for whoever wires `tincan-audio` into `tincan-app`. The des
 - Capture: device -> mono -> rubato to 48 kHz -> input gain -> mic-test meter -> sonora APM, 10 ms frames.
 - The APM runs AEC3, NS (Moderate), AGC2 (adaptive digital; the analog volume controller is off), a high-pass filter and a 48 kHz internal rate.
 - Encode: two APM frames make one 20 ms Opus frame, VOIP/voice, 32 kbps VBR, complexity 7, FEC, DTX.
-- Soundboard clips are added after the APM at gain 0.7 and run through a soft limiter. DTX is off while one plays and the packet carries `AF_SOUNDBOARD`.
+- Soundboard clips go out on their own Opus stream, never mixed into the voice: track `track_id(short_id, KIND_SOUND)` (the voice track's short id, kind 2), 40 kbps, no DTX, gain 0.7 and a soft limiter, flag `AF_SOUNDBOARD`, never `AF_SPEAKING`. It shares the voice's sample clock and sends only while a clip plays (a gap is a pause: seq contiguous, ts jump). So a receiver keeps a separate jitter buffer and gain per person for clips, and the voice keeps DTX while a clip plays. If its encoder can't be made, clips still play locally and are not sent.
+- `play_clip` returns an id; `AudioEvent::ClipFinished(id)` follows when the clip has been sent and played, was stopped, was cut (deafen, `stop_call`, the oldest of 8 when a ninth starts) or was refused on the engine thread. `stop_clip(id)` and `stop_clips()` fade the local and the sent copy out over 5 ms (`STOP_RAMP`), so a stop doesn't click. `set_local_sound_gain` scales only my own clips here (the room's soundboard volume).
 - Render: each track's jitter buffer -> Opus decode/FEC/PLC -> per-track gain -> sum, plus clip voices -> output gain -> soft limiter. That exact signal goes to the APM render reference, then is resampled for the device if needed.
 - Output is opened at 48 kHz when Windows accepts it (shared-mode render auto-converts). Capture always uses the native format.
 
@@ -35,7 +36,7 @@ Implementation notes for whoever wires `tincan-audio` into `tincan-app`. The des
 
 ## What the app supplies
 
-- `local_track` = `track_id(short_id, KIND_VOICE)`. Remote tracks are created on their first packet (32 at most) and keyed by `header.track`. Map track to user with `track_short_id`.
+- `local_track` = `track_id(short_id, KIND_VOICE)`. Remote tracks are created on their first packet (64 at most: a voice and a soundboard track per person) and keyed by `header.track`. Map track to user with `track_short_id`, and the kind with `track_kind`. Packets of my own short id (either kind) are ignored.
 - In DM calls there is no host to hand out short ids, so both sides must use distinct track ids. tincan-net uses the rule "the lower `UserId` takes short id 0" and exports it as `tincan_net::call_short_id(me, peer)`; `CallInfo.peer_short_id` is the peer's.
 - `set_epoch(e)` after a host migration. Jitter-buffer state survives because track ids are stable.
 - `set_relayed(true)` when the path to the host is relay-only (raises the jitter maximum to 300 ms).
@@ -54,8 +55,8 @@ Implementation notes for whoever wires `tincan-audio` into `tincan-app`. The des
 
 ## Tests
 
-- `cargo test -p tincan-audio` runs the unit tests: codec, ring, DSP, jitter buffer and the processor in virtual time (DTX, speaking, mute, soundboard, two processors).
-- `tests/clips.rs` covers WAV via hound, FLAC and MP3 frames built by hand, max length, and soundboard while muted through the engine.
+- `cargo test -p tincan-audio` runs the unit tests: codec, ring, DSP, jitter buffer and the processor in virtual time (DTX, speaking, mute, two processors). Soundboard: a muted clip is 50 packets on the soundboard track; a clip over speech leaves the voice stream unflagged with contiguous seq; stop cuts one clip of two, then all, within the 5 ms fade, without a click; the local sound gain silences my playout but not what is sent; a receiver hears voice and clip apart (gain 0 on one track removes only that part).
+- `tests/clips.rs` covers WAV via hound, FLAC and MP3 frames built by hand, max length, and soundboard while muted through the engine (on the soundboard track, `ClipFinished(id)`, `stop_clip` ends sending).
 - `tests/e2e.rs` runs two engines over a simulated network with 5 % loss and 0-60 ms jitter for about 8 s. It also checks mic-test levels and that the engine idles.
 - `tests/devices.rs` is ignored by default: device enumeration, the speaker playing silence, and a mic test, which opens the microphone.
 - `examples/loopback.rs` sends the microphone through two engines to the speaker. Use headphones.

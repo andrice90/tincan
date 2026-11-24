@@ -23,7 +23,8 @@ Crate: `crates/tincan-app`. The public surface in `src/lib.rs` is the frozen she
 | `media/mod.rs` | `Media`: state, `COMMANDS`, command routing, the hooks the rest of the app calls, lock order |
 | `media/engine.rs` | The `AudioEngine` slot, its event forwarder, restart after the engine thread dies, the synthetic test microphone, `decode_clip` under `catch_unwind` |
 | `media/session.rs` | Attach and detach of a `MediaSession`, `reconcile`, audio and video pumps, `VoiceSession` and `CallInfo` DTOs, calls, mute and deafen, per-user volume, devices, mic test |
-| `media/clips.rs` | Soundboard library, heard clips, pulling a heard clip, announcing the library |
+| `media/clips.rs` | Soundboard library, heard clips, pulling a heard clip, announcing the library, `clip_stop` |
+| `media/volumes.rs` | Per-user and per-room soundboard volumes (kv), the gains of each member's voice and soundboard tracks |
 | `media/screen.rs` | Screen sources, share start and stop (tincan-screen or the synthetic pattern), `screen_watch` and `screen_unwatch` |
 
 ## Profile directory
@@ -323,7 +324,12 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
   - `VoiceParticipant.volume` is the saved per-user volume (0..2, 1 for me).
   - `voice-updated` is sent when the JSON changes: on `VoiceUpdated`, roster and connection changes of my server, `CallUpdated`, mute or deafen changes, share changes.
 - **Mute and deafen** follow `actions.ts`: unmuting clears deafen, deafening sets muted, undeafening leaves muted. They go to the engine (`set_muted`, `set_deafened`) and to `net.set_status`. The state persists across sessions within a run.
-- **`set_user_volume`:** 0..2, persisted in kv `app/user_volumes`, then `voice-updated` (the participant's `volume`). It is applied as `set_track_volume(track_id(short, KIND_VOICE))` whenever the session's short-id map changes. Members who leave the room get `remove_track`.
+- **`set_user_volume`:** 0..2, persisted in kv `app/user_volumes`, then `voice-updated` (the participant's `volume`). It is the person's overall volume: it sets their voice track and also scales their soundboard track. Gains are applied whenever the session's short-id map changes. Members who leave the room get `remove_track` for both tracks.
+- **Soundboard volumes (`volumes.rs`):**
+  - `set_user_soundboard_volume` (kv `app/user_soundboard_volumes`, z32 -> gain) and `set_room_soundboard_volume` (kv `app/room_soundboard_volumes`, voice room id hex -> gain, at most 1000 rooms). Both 0..2; a value of 1 removes the entry. `user_volume` and `room_soundboard_volume` read them back (1 when never set), for menus outside voice.
+  - A member's soundboard track (`track_id(short, KIND_SOUND)`) plays at `overall x person soundboard x room soundboard`, clamped to the engine's 4. My own clips play here at the room's soundboard volume (`AudioEngine::set_local_sound_gain`); what I send is never scaled. In a call the room factor is 1.
+  - `VoiceParticipant.soundboardVolume` is the person's soundboard volume (1 for me); `voice-updated` follows `set_user_soundboard_volume`.
+- **Speaking** comes only from voice tracks: a `Speaking` event of a soundboard track is ignored.
 - **`audio_devices`:** `AudioEngine::devices()` on a blocking thread; empty lists with `no_devices`.
 - **`mic_test`:** `engine.mic_test(on)`; the engine sends `mic-level` about 20 times per second.
 
@@ -341,12 +347,14 @@ Lock order inside media: `st` (the state mutex), then the engine slot, then the 
   - Not in voice gives `not-in-voice`; deafened gives `deafened` (checked before and after decoding).
   - A clip not in the library: "Save that sound before playing it."
   - The PCM comes from the cache (at most 4 clips or 2 M samples, dropped on leaving voice) or a fresh decode.
-  - `engine.play_clip`, then the clip is shared with the session's conversation (the server of the room, or the DM of the call), then `net.sound_played(ClipInfo)`. Playing works while muted.
+  - `engine.play_clip` (under `st`, so its `ClipFinished(id)` can't be handled before the id is recorded in `State.playing`), then `voice-updated` with the hash in `VoiceSession.playingClips`, then the clip is shared with the session's conversation (the server of the room, or the DM of the call), then `net.sound_played(ClipInfo)`. Playing works while muted.
+  - `AudioEvent::ClipFinished(id)` removes the id and re-sends `voice-updated`. `playingClips` is cleared on detach and when the engine dies (its ids and clips die with it).
+- **`clip_stop { hash }`:** `engine.stop_clip(id)` for every play of that hash of mine. The engine fades the local and the sent copy out over 5 ms; `ClipFinished` then drops it from `playingClips`. Nothing playing is a no-op.
 - **Incoming `SoundPlayed`:**
   - Only for my attached session, and at most one per player every 250 ms (the throttle is cleared on detach).
   - Announcements over 5 MiB or about 20 s are ignored. Peer names are cleaned of control and hidden format characters and cut to 32 characters.
   - Emits `sound-played { userId, name, clip }`; `clip.owned` says whether it is in my library. A clip I don't own is remembered as heard.
-  - The clip is **not** played locally: the player's engine already mixes it into its voice stream (`AF_SOUNDBOARD`), so a local copy would play it twice.
+  - The clip is **not** played locally: the player's engine already sends it on its soundboard track (`KIND_SOUND`), so a local copy would play it twice. That track is why a listener can set the player's soundboard volume apart from their voice.
 - **`clip_fetch`:**
   - Records the pull (kv `app/clip_fetches`, so it survives a restart), then `files.download(hash, Clip, [player, ...who_has(conv)])`.
   - A blob already held (as an attachment, or a clip no longer in the library) is read, tagged as a clip and finished at once. One over 5 MB (a peer announced a held attachment's hash with a small size) or one that can't be read or tagged forgets the pull and errors: "That sound is larger than 5 MB, so it wasn't saved." or "Couldn't save the sound. Try again."
@@ -459,6 +467,8 @@ Joins need no hook, because invites carry the inviter's loopback address.
   - A 2 s WAV is added (about 2000 ms).
   - `not-in-voice` outside voice, `deafened` while deafened; it plays while muted.
   - B gets `sound-played` (owned false, heardFrom A), the clip in `clips`, and audio; `clip_fetch` ends in `clips-updated` with it owned, same name and duration.
+  - A's `playingClips` holds the hash right after `clip_play`, until the 2 s clip ends by itself (not before 1.5 s), and `clip_stop` ends a second play within 1.5 s. `clip_stop` with nothing playing is a no-op.
+  - B's `user_volume`, `set_user_soundboard_volume` (the participant's `soundboardVolume`, overall `volume` untouched), and `room_soundboard_volume` / `set_room_soundboard_volume` (clamped to 2).
   - A shuts down; C joins with B's invite and joins voice. B plays, C pulls it from B (the only holder).
   - Rename and remove work; renaming a removed clip errors.
 - `screen_share_reaches_a_watcher` (e):
