@@ -17,6 +17,7 @@
 //! [`Media::voice_snapshot`]).
 
 mod clips;
+mod cues;
 mod engine;
 mod screen;
 mod session;
@@ -114,6 +115,8 @@ struct State {
     mic_test: bool,
     /// Last `voice-updated` payload sent.
     last_voice: Option<Value>,
+    /// The voice room and the others in it as last emitted, for the join and leave cues.
+    last_room: cues::Seen,
     /// The call as last reported (peer, state), for end-of-call notices.
     last_call: Option<(UserId, tincan_net::CallState)>,
 }

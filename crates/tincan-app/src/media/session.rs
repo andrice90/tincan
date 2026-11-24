@@ -384,12 +384,30 @@ impl Media {
     /// Emit `voice-updated` if the session DTO differs from the last one sent.
     pub(super) fn emit_voice(&self, core: &Core, st: &mut State) {
         let dto = self.voice_dto(core, st);
+        self.room_cue(core, st, dto.as_ref());
         let Ok(v) = serde_json::to_value(&dto) else { return };
         if st.last_voice.as_ref() == Some(&v) {
             return;
         }
         st.last_voice = Some(v.clone());
         core.events.emit_value(Ev::VoiceUpdated, v);
+    }
+
+    /// Join and leave sounds (`cues.rs`): compares the room's people with the last emit.
+    fn room_cue(&self, core: &Core, st: &mut State, dto: Option<&dto::VoiceSession>) {
+        let me = core.me.to_z32();
+        let next: super::cues::Seen = dto.filter(|v| matches!(v.kind, dto::VoiceKind::Room)).map(|v| {
+            (v.conv_id.clone(), v.participants.iter().map(|p| p.user_id.clone()).filter(|u| *u != me).collect())
+        });
+        let cue = super::cues::cue_for(&st.last_room, &next);
+        st.last_room = next;
+        if let Some(cue) = cue
+            && !st.deafened
+            && let Some(engine) = self.engine_handle()
+            && let Some(pcm) = super::cues::pcm(cue)
+        {
+            engine.play_local(pcm);
+        }
     }
 
     /// `VoiceSession` of the attached session.
