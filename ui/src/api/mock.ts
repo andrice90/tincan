@@ -36,6 +36,7 @@ import type {
   UserId,
   VoiceParticipant,
   VoiceSession,
+  ShareAudio,
 } from "./types";
 import { parseShortCode, randomShortCode } from "../lib/codes";
 import { baseName, stripExtension } from "../lib/format";
@@ -158,6 +159,10 @@ const st = {
   roomSoundVolumes: new Map<ChannelId, number>(),
   /** My clips playing now, by hash: the timer that ends each. */
   playing: new Map<BlobHash, ReturnType<typeof setTimeout>>(),
+  /** Per-sharer screen share sound volumes (0..2), as saved by set_share_volume. */
+  shareVolumes: new Map<UserId, number>(),
+  /** What my share sends besides the picture. */
+  myShareAudio: "off" as ShareAudio,
   heardDemoDone: false,
   /** Short invite code per server ("ABC-DEF"); none until the owner made one. */
   inviteCodes: new Map<ServerId, string>(),
@@ -636,6 +641,7 @@ function participantOf(m: { userId: UserId; name: string; muted: boolean; deafen
     screenTrack: st.screenTracks.get(m.userId) ?? null,
     volume: m.userId === st.me?.userId ? 1 : (st.volumes.get(m.userId) ?? 1),
     soundboardVolume: m.userId === st.me?.userId ? 1 : (st.soundVolumes.get(m.userId) ?? 1),
+    shareVolume: m.userId === st.me?.userId ? 1 : (st.shareVolumes.get(m.userId) ?? 1),
   };
 }
 
@@ -655,6 +661,7 @@ function rebuildVoice(): void {
   v.deafened = st.selfDeafened;
   v.sharing = st.screenTracks.has(me.userId);
   v.playingClips = [...st.playing.keys()].sort();
+  v.shareAudio = v.sharing ? st.myShareAudio : "off";
   if (v.kind === "room") {
     const s = st.servers.find((x) => x.summary.id === v.convId);
     if (!s) return;
@@ -946,6 +953,7 @@ function startCallVoice(dm: DmSummary): VoiceSession {
     muted: st.selfMuted,
     deafened: st.selfDeafened,
     sharing: false,
+    shareAudio: "off",
     path: "relay",
     rttMs: 88,
     playingClips: [],
@@ -1424,6 +1432,7 @@ const handlers: Handlers = {
       muted: st.selfMuted,
       deafened: st.selfDeafened,
       sharing: false,
+      shareAudio: "off",
       path: s.summary.connection.path === "none" ? "direct" : s.summary.connection.path,
       rttMs: s.summary.connection.rttMs,
       playingClips: [],
@@ -1545,13 +1554,21 @@ const handlers: Handlers = {
     return sources;
   },
 
-  screen_start: async ({ sourceId }) => {
+  set_share_volume: ({ userId, volume }) => {
+    if (!(volume >= 0 && volume <= 2)) fail("Volume must be between 0% and 200%.");
+    st.shareVolumes.set(userId, volume);
+    if (st.voice) voiceChanged();
+    return null;
+  },
+
+  screen_start: async ({ sourceId, audio }) => {
     const me = meId();
     if (!st.voice) fail("not-in-voice");
     await sleep(300);
     if (FLAG_NOENC) fail("no-hardware-encoder");
     if (!sourceId) fail("Pick a screen or window to share.");
     const track = 9;
+    st.myShareAudio = audio ? (sourceId.startsWith("window:") ? "app" : "system") : "off";
     st.screenTracks.set(me, track);
     voiceChanged();
     return track;

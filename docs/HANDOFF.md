@@ -4,6 +4,14 @@ Status of the Tincan build for the next session. Updated at every milestone comm
 
 ## Where it stands
 
+### Screen share audio (branch `worktree-agent-adbe5024a577b792e`)
+
+- A share can carry its sound: a window share sends its app's audio (process loopback of its process tree), a display share sends everything except Tincan's own process tree. If it can't be captured, the share goes on without sound and a toast says so. New track kind `KIND_SHARE_AUDIO` (3; kind 2 is the soundboard's `KIND_SOUND`) on the audio datagram, Opus stereo 128 kbps; the host forwards it only to those watching the share, through a policer of its own (it never spends the voice+soundboard budget). See architecture.md "Screen share audio".
+- UI: "Share audio" switch in the picker (on by default), the sharer's stage says what goes out, and a "Screen share volume" slider (saved per sharer) on the stage button and the stage's right click. While someone shares, the same slider also shows under Volume and Soundboard volume in their member list menu and tile menu (`PersonVolumes`).
+- Contract: `screen_start.audio`, `set_share_volume`, `VoiceParticipant.shareVolume`, `VoiceSession.shareAudio`.
+- Compatible both ways: older builds drop the new kind; no control message changed.
+- Verified for real: process loopback capture of this process's tree, included and excluded (ignored test). Not verified: a real browser or game window, UWP windows, hearing it on another machine, echo cancellation with share audio in a real room. Playback is a mono downmix (the engine output is mono).
+
 ### Soundboard and names (branch `worktree-agent-a345a20b5a9682faf`)
 
 - **Stop a sound:** a stop button on the tile of a sound I am playing; it stops it here and in the call at once (`clip_stop`, `VoiceSession.playingClips`).

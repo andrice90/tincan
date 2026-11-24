@@ -14,8 +14,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use iroh::endpoint::{Connection, RecvStream, VarInt};
 use tincan_core::media::{
-    AudioHeader, CODEC_H264_ANNEXB, VIDEO_STREAM_HEADER_LEN, VideoFrame, VideoFrameReader, VideoStreamHeader, is_audio_kind, track_kind,
-    track_short_id,
+    AudioHeader, CODEC_H264_ANNEXB, KIND_SHARE_AUDIO, VIDEO_STREAM_HEADER_LEN, VideoFrame, VideoFrameReader, VideoStreamHeader,
+    is_audio_kind, screen_of_share_audio, track_kind, track_short_id,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -370,10 +370,18 @@ fn on_msg(orders: &mut HashMap<u16, Order>, sink: &dyn VideoSink, m: Msg) {
     }
 }
 
-/// Read audio datagrams on `conn` into `audio_in` (voice and soundboard tracks of anyone but
-/// the owner of `own`, my voice track), counting
-/// them in `stats`. Ends with the connection.
-pub(crate) async fn audio_rx(conn: Connection, own: Arc<std::sync::atomic::AtomicU16>, audio_in: mpsc::Sender<Bytes>, stats: Arc<RxStats>) {
+/// Read audio datagrams on `conn` into `audio_in`: voice and soundboard tracks of anyone but
+/// the owner of `own`, my voice track (counted in `stats`), and share audio only of the screen
+/// tracks in `subs` (what I watch). A host or peer that sends share audio nobody asked for is
+/// dropped here, so unwatching (and a minimized window, which unwatches) stops share audio even
+/// if the sender keeps going. Ends with the connection.
+pub(crate) async fn audio_rx(
+    conn: Connection,
+    own: Arc<std::sync::atomic::AtomicU16>,
+    audio_in: mpsc::Sender<Bytes>,
+    stats: Arc<RxStats>,
+    subs: Arc<parking_lot::Mutex<std::collections::HashSet<u16>>>,
+) {
     let mut buf = vec![Bytes::new(); DATAGRAM_BATCH];
     loop {
         let n = match conn.read_many_datagrams(&mut buf).await {
@@ -384,6 +392,12 @@ pub(crate) async fn audio_rx(conn: Connection, own: Arc<std::sync::atomic::Atomi
         let own = own.load(std::sync::atomic::Ordering::Relaxed);
         for pkt in buf.iter_mut().take(n).map(std::mem::take) {
             let Some((h, _)) = AudioHeader::parse(&pkt) else { continue };
+            if track_kind(h.track) == KIND_SHARE_AUDIO {
+                if screen_of_share_audio(h.track).is_some_and(|s| subs.lock().contains(&s)) {
+                    let _ = audio_in.try_send(pkt);
+                }
+                continue;
+            }
             if !is_audio_kind(track_kind(h.track)) || track_short_id(h.track) == track_short_id(own) {
                 continue;
             }

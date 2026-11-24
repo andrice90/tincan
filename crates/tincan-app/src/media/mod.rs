@@ -54,6 +54,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "user_volume",
     "room_soundboard_volume",
     "set_room_soundboard_volume",
+    "set_share_volume",
     "screen_sources",
     "screen_start",
     "screen_stop",
@@ -82,6 +83,8 @@ pub(crate) const MAX_CLIP_NAME_CHARS: usize = 32;
 pub(crate) struct Counters {
     /// Audio datagrams handed to the engine.
     pub audio_in: AtomicU64,
+    /// Share-audio datagrams handed to the engine (part of `audio_in`).
+    pub share_audio_in: AtomicU64,
     /// Video messages delivered to `screen_watch` sinks.
     pub video_out: AtomicU64,
     /// Times the audio engine was restarted after its thread died.
@@ -113,6 +116,8 @@ struct State {
     room_sound: HashMap<tincan_core::ChannelId, f32>,
     /// My clips playing now, by engine clip id (cleared on detach and engine restart).
     playing: HashMap<u64, BlobHash>,
+    /// Per-sharer screen share audio volume (0..2), persisted.
+    share_volumes: HashMap<UserId, f32>,
     /// My running screen share.
     share: Option<screen::ActiveShare>,
     /// Clips heard in this session.
@@ -218,6 +223,9 @@ struct RoomVolumeArgs {
 struct ScreenStartArgs {
     source_id: String,
     mode: dto::ShareMode,
+    /// Share the window's or the PC's sound too. Absent means no (callers from before it).
+    #[serde(default)]
+    audio: bool,
 }
 
 #[derive(Deserialize)]
@@ -284,6 +292,7 @@ impl Media {
             st.volumes = session::load_volumes(core);
             st.sound_volumes = volumes::load_user_sound(core);
             st.room_sound = volumes::load_room_sound(core);
+            st.share_volumes = session::load_share_volumes(core);
             st.fetching = clips::load_fetches(core);
         }
         self.announce_clips(core);
@@ -356,10 +365,15 @@ impl Media {
                 self.set_room_soundboard_volume(core, parse_channel(&a.channel_id)?, a.volume)?;
                 Ok(Value::Null)
             }
+            "set_share_volume" => {
+                let a: VolumeArgs = parse(cmd, args)?;
+                self.set_share_volume(core, parse_user(&a.user_id)?, a.volume)?;
+                Ok(Value::Null)
+            }
             "screen_sources" => ok(self.screen_sources().await?),
             "screen_start" => {
                 let a: ScreenStartArgs = parse(cmd, args)?;
-                ok(self.screen_start(core, &a.source_id, a.mode).await?)
+                ok(self.screen_start(core, &a.source_id, a.mode, a.audio).await?)
             }
             "screen_stop" => {
                 self.screen_stop(core).await;
@@ -550,6 +564,8 @@ impl Media {
         let c = &self.counters;
         json!({
             "audioIn": c.audio_in.load(Ordering::Relaxed),
+            "shareAudioIn": c.share_audio_in.load(Ordering::Relaxed),
+            "shareAudioSent": self.st.lock().share.as_ref().map_or(0, |s| s.audio_packets()),
             "videoOut": c.video_out.load(Ordering::Relaxed),
             "engineRestarts": c.engine_restarts.load(Ordering::Relaxed),
             "engineRunning": self.engine.lock().running().is_some(),

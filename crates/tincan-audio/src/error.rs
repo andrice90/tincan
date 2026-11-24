@@ -47,6 +47,9 @@ pub enum AudioError {
     /// Spawning the engine or enumeration thread failed.
     #[error("thread: {0}")]
     Thread(String),
+    /// Screen share audio cannot be captured here (process loopback unavailable or refused).
+    #[error("share audio: {0}")]
+    Unsupported(String),
 }
 
 /// Result alias using [`AudioError`].

@@ -2,8 +2,12 @@
 //!
 //! - Audio: each member's datagrams are read by one task and sent verbatim to the other
 //!   members of the sender's voice room (and to the host's own app when it is in that room).
-//!   A datagram whose track id is not the sender's own voice track is dropped. The host's own
-//!   packets are injected the same way.
+//!   A datagram whose track id is not the sender's own voice or soundboard track is dropped;
+//!   both kinds share one per-member policer. The host's own packets are injected the same way.
+//! - Share audio: a datagram on the sender's own share-audio track (`KIND_SHARE_AUDIO`) goes
+//!   only to the members (and the host's app) subscribed to the sender's screen track, through
+//!   its own per-member policer (it never spends the voice+sound budget). It is never counted
+//!   in uplink stats or receiver reports (those drive the voice encoder).
 //! - Video: each member's GOP uploads are put in order and pushed into that track's
 //!   [`VideoTrack`], whose viewers are the members (and the host's app) that subscribed.
 //! - Every second while anything is active: AIMD targets go to sharers (`TargetBitrate`),
@@ -94,6 +98,8 @@ struct State {
     closed: bool,
     /// Audio datagram policers per member (kept across a member's reconnects).
     policers: HashMap<UserId, AudioPolicer>,
+    /// Share-audio datagram policers per member (apart from the voice+sound ones, same bounds).
+    share_policers: HashMap<UserId, AudioPolicer>,
     /// Last soundboard announcement relayed per member.
     sound_last: HashMap<UserId, Instant>,
     /// Clips announced recently per member (relayed once per `SOUND_DEDUPE`).
@@ -118,6 +124,14 @@ impl State {
     }
 
     fn member_by_short(&self, short: u16) -> Option<&Member> { self.members.values().find(|m| m.short_id == short) }
+
+    /// Who gets the share audio that goes with `screen`: the members subscribed to it (not
+    /// `except`, the sharer) and the host's app when it watches it.
+    fn share_viewers(&self, screen: u16, except: Option<UserId>) -> (Vec<Connection>, Option<mpsc::Sender<Bytes>>) {
+        let conns = self.members.iter().filter(|(u, m)| Some(**u) != except && m.subs.contains(&screen)).map(|(_, m)| m.conn.clone()).collect();
+        let local = self.local.as_ref().filter(|l| l.subs.contains(&screen)).map(|l| l.audio_in.clone());
+        (conns, local)
+    }
 
     fn active(&self) -> bool {
         self.local.is_some() || self.members.values().any(|m| m.voice.is_some()) || self.tracks.values().any(|t| !t.viewer_ids().is_empty())
@@ -167,6 +181,7 @@ impl Sfu {
                 ticker: None,
                 closed: false,
                 policers: HashMap::new(),
+                share_policers: HashMap::new(),
                 sound_last: HashMap::new(),
                 sound_seen: HashMap::new(),
             }),
@@ -374,6 +389,21 @@ impl Sfu {
         }
     }
 
+    /// Share audio from the host's own engine: to the members watching the host's share.
+    pub fn inject_local_share_audio(&self, pkt: Bytes) {
+        let (conns, _) = {
+            let st = self.st.lock();
+            let screen = track_id(st.my_short, KIND_SCREEN);
+            if st.local_track != Some(screen) {
+                return;
+            }
+            st.share_viewers(screen, None)
+        };
+        for c in &conns {
+            let _ = c.send_datagram(pkt.clone());
+        }
+    }
+
     /// The host played a soundboard clip: tell its room.
     pub fn local_sound(&self, by: UserId, clip: ClipInfo) {
         let room = {
@@ -391,25 +421,45 @@ impl Sfu {
     /// packets and bytes per second) before anything is counted or fanned out.
     fn forward(&self, from: UserId, short_id: u16, pkts: &mut [Bytes]) {
         let now = Instant::now();
+        let screen = track_id(short_id, KIND_SCREEN);
+        let mut share_to = None;
         let room = {
             let mut st = self.st.lock();
             let Some(ch) = st.members.get(&from).and_then(|m| m.voice) else { return };
             let st = &mut *st;
-            let policer = st.policers.entry(from).or_insert_with(|| AudioPolicer::new(now));
+            let call = st.policers.entry(from).or_insert_with(|| AudioPolicer::new(now));
+            let share = st.share_policers.entry(from).or_insert_with(|| AudioPolicer::new(now));
+            let mut any_share = false;
             for p in pkts.iter_mut() {
-                if super::wire::audio_track_from(p, short_id).is_none() || !policer.allow(p.len(), now) {
-                    *p = Bytes::new();
-                    continue;
+                match police(call, share, short_id, p, now) {
+                    Route::Drop => *p = Bytes::new(),
+                    Route::Watchers => any_share = true,
+                    Route::Room => {
+                        if let Some((h, _)) = AudioHeader::parse(p) {
+                            st.uplink.entry(h.track).or_default().audio(h.seq, h.ts, now);
+                        }
+                    }
                 }
-                if let Some((h, _)) = AudioHeader::parse(p) {
-                    st.uplink.entry(h.track).or_default().audio(h.seq, h.ts, now);
-                }
+            }
+            if any_share {
+                share_to = Some(st.share_viewers(screen, Some(from)));
             }
             st.room(ch)
         };
         for p in pkts.iter_mut() {
             let p = std::mem::take(p);
             if p.is_empty() {
+                continue;
+            }
+            if let Some((conns, local)) = &share_to
+                && super::wire::share_audio_track_from(&p, short_id).is_some()
+            {
+                for c in conns {
+                    let _ = c.send_datagram(p.clone());
+                }
+                if let Some(l) = local {
+                    let _ = l.try_send(p);
+                }
                 continue;
             }
             for (u, c, _) in &room.members {
@@ -764,9 +814,62 @@ async fn forward_task(sfu: Weak<Sfu>, conn: Connection, user: UserId, short_id: 
     }
 }
 
+/// Where a member's audio datagram goes once policed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// Not the sender's own audio track, or over budget.
+    Drop,
+    /// Voice or soundboard: everyone else in the sender's room.
+    Room,
+    /// Share audio: the subscribers of the sender's screen track.
+    Watchers,
+}
+
+/// Police one datagram of the member with `short_id`. Share audio is checked first and
+/// charged only to `share`; voice and soundboard share `call`, which share audio never
+/// spends. A datagram on someone else's track is dropped without charging anything.
+fn police(call: &mut AudioPolicer, share: &mut AudioPolicer, short_id: u16, p: &[u8], now: Instant) -> Route {
+    if super::wire::share_audio_track_from(p, short_id).is_some() {
+        return if share.allow(p.len(), now) { Route::Watchers } else { Route::Drop };
+    }
+    if super::wire::audio_track_from(p, short_id).is_none() || !call.allow(p.len(), now) {
+        return Route::Drop;
+    }
+    Route::Room
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_audio_never_spends_the_voice_and_soundboard_budget() {
+        use tincan_core::media::KIND_SHARE_AUDIO;
+        let t0 = Instant::now();
+        let (mut call, mut share) = (AudioPolicer::new(t0), AudioPolicer::new(t0));
+        let pkt = |kind| AudioHeader { track: track_id(3, kind), ..AudioHeader::default() }.packet(&[0u8; 120]);
+        let (voice, sound, audio) = (pkt(KIND_VOICE), pkt(KIND_SOUND), pkt(KIND_SHARE_AUDIO));
+        // 10 s of a member talking, playing clips and sharing with sound: 50 packets/s on
+        // each of the three tracks, all forwarded, each kind on its own route.
+        for i in 0..500u64 {
+            let at = t0 + Duration::from_millis(i * 20);
+            assert_eq!(police(&mut call, &mut share, 3, &voice, at), Route::Room, "voice {i}");
+            assert_eq!(police(&mut call, &mut share, 3, &sound, at), Route::Room, "sound {i}");
+            assert_eq!(police(&mut call, &mut share, 3, &audio, at), Route::Watchers, "share audio {i}");
+        }
+        // A share audio flood is cut by its own policer and leaves voice and soundboard alone.
+        let at = t0 + Duration::from_secs(20);
+        let passed = (0..1000).filter(|_| police(&mut call, &mut share, 3, &audio, at) == Route::Watchers).count();
+        assert!(passed <= 75, "{passed} flood packets passed");
+        assert_eq!(police(&mut call, &mut share, 3, &voice, at), Route::Room);
+        assert_eq!(police(&mut call, &mut share, 3, &sound, at), Route::Room);
+        // Someone else's tracks and screen kinds are dropped.
+        for kind in [KIND_VOICE, KIND_SOUND, KIND_SHARE_AUDIO] {
+            let other = AudioHeader { track: track_id(4, kind), ..AudioHeader::default() }.packet(b"x");
+            assert_eq!(police(&mut call, &mut share, 3, &other, at), Route::Drop);
+        }
+        assert_eq!(police(&mut call, &mut share, 3, &pkt(KIND_SCREEN), at), Route::Drop);
+    }
 
     #[test]
     fn worst_report_wins() {

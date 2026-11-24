@@ -77,6 +77,10 @@ Join errors: codes shorter than 40 chars, codes not starting with `tincan1`, `ti
 - An active call with no voice session attached shows "Call with <name>" with Hang up, so it can always be ended.
 - Calling someone (DM header or member list) opens the DM with them first: the call stage, their screen share and the per-user volume menu are there.
 - The per-user volume slider starts at the volume picked in this session, else `VoiceParticipant.volume`, else 100%. `volume` is optional in `types.ts` until the app sends it.
+- Screen share audio (`components/ShareVolume.tsx`, wording in `lib/shareAudio.ts`):
+  - The picker has a "Share audio" switch, on by default, with a note for the picked source ("Audio from this app only" for a window, "Everything your PC plays, except Tincan" for a display).
+  - The sharer's stage says what goes out under "You're sharing your screen" (`VoiceSession.shareAudio`).
+  - A watcher gets "Screen share volume" three ways: the speaker button left of the full-window button on the stage, a right click anywhere on the stage, and under Volume and Soundboard volume in `PersonVolumes` (`VolumeSliders.tsx`), so the sharer's member list menu and tile menu have it while they share in my voice session (looked up in `voice.participants`). The slider starts at this session's choice, else `shareVolume`, else 100%, and sends `set_share_volume` on release.
 
 ## Names
 
@@ -158,7 +162,7 @@ Tasks for the owner:
 ## Soundboard stop, volumes, outside click
 
 - **Stop.** An owned tile shows a stop button (`.clip-stop`, a sibling of the tile button in `.clip-cell`, since a button can't hold a button) while its hash is in `VoiceSession.playingClips`. The tile keeps `aria-label="Play <name>"` and `is-playing` (e2e selects both); `is-playing` is also lit by `sound-played` for someone else's play, which has no stop. `playClip` no longer starts a local timer for my own play: the app's list drives it.
-- **Volumes.** `components/VolumeSliders.tsx`: `PersonVolumes` (Volume and Soundboard volume) in the member menu header (not on my own row) and the voice tile popover, `RoomSoundVolume` in the voice room menu header (now for every member; the rename and delete items stay owner only). Without values from the voice session the sliders wait for `user_volume` / `room_soundboard_volume`, so a release never saves a made-up 100 %. Values picked this session are kept per person and room. `Menu` leaves the arrow keys to a slider in its header.
+- **Volumes.** `components/VolumeSliders.tsx`: `PersonVolumes` (Volume, Soundboard volume, and Screen share volume while that person shares in my session) in the member menu header (not on my own row) and the voice tile popover, `RoomSoundVolume` in the voice room menu header (now for every member; the rename and delete items stay owner only). Without values from the voice session the sliders wait for `user_volume` / `room_soundboard_volume`, so a release never saves a made-up 100 %. Values picked this session are kept per person and room. `Menu` leaves the arrow keys to a slider in its header.
 - **Outside click.** The soundboard is not a `Popover` (that closes on window blur, and the Add sound file picker blurs the window). A capture-phase `pointerdown` closes it unless the target is inside it, in a `.popover` or `dialog`, or on `.soundboard-toggle` (the call panel button, so it toggles). Escape closes it unless a menu took the key first or a dialog is open.
 - unslop-ui final pass (`--surface`) on the soundboard, the volume sliders and the menus: none to cut. The new copy is "Volume", "Soundboard volume", "Stop <name>". Two surface fixes made while checking it in the mock: a hovered playing tile lost its accent (the hover rule outranked `is-playing`), and a playing tile's name ran under the stop button (36 px right padding while it shows).
 

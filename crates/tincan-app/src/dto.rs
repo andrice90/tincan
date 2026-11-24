@@ -285,6 +285,8 @@ pub struct VoiceParticipant {
     /// How loud their soundboard clips play for me, on top of `volume` (0..2, saved per
     /// user; 1 for me).
     pub soundboard_volume: f64,
+    /// How loud their screen share's audio plays for me (0..2, saved per sharer; 1 for me).
+    pub share_volume: f64,
 }
 
 /// `user_volume` result: both saved volumes of a person.
@@ -295,6 +297,18 @@ pub struct UserVolume {
     pub volume: f64,
     /// Their clips, on top of `volume`, 0..2.
     pub soundboard_volume: f64,
+}
+
+/// `VoiceSession.shareAudio`: what my share sends besides the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareAudio {
+    /// No audio (not sharing, turned off, or it could not be captured).
+    Off,
+    /// The shared window's app (its process tree).
+    App,
+    /// Everything the PC plays except Tincan (a shared display).
+    System,
 }
 
 /// `VoiceSession.kind`.
@@ -327,6 +341,8 @@ pub struct VoiceSession {
     pub deafened: bool,
     /// I am sharing.
     pub sharing: bool,
+    /// The audio my share sends.
+    pub share_audio: ShareAudio,
     /// Path to the host or peer.
     pub path: PathKind,
     /// Round-trip time.

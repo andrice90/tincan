@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tincan_core::media::{AUDIO_HEADER_LEN, AUDIO_MAGIC, VideoFrame, encode_video_frame, is_audio_kind, track_kind, track_short_id};
+use tincan_core::media::{
+    AUDIO_HEADER_LEN, AUDIO_MAGIC, KIND_SHARE_AUDIO, VideoFrame, encode_video_frame, is_audio_kind, track_id, track_kind, track_short_id,
+};
 use tincan_core::wire::Ctl;
 use tokio::sync::mpsc;
 
@@ -38,10 +40,10 @@ impl Wire {
     pub fn len(&self) -> usize { self.bytes.len() }
 }
 
-/// Write the current track id and epoch byte into an outgoing audio datagram (copies only when
-/// they differ). `voice` is my current voice track: the stamped track keeps the packet's own
-/// kind (voice or soundboard) under my current short id. None for anything that is not an
-/// audio datagram of an audio kind.
+/// Write the current track id and epoch byte into an outgoing call audio datagram (copies
+/// only when they differ). `voice` is my current voice track: the stamped track keeps the
+/// packet's own kind (voice or soundboard) under my current short id. None for anything that
+/// is not an audio datagram of those kinds (share audio goes through `stamp_share_audio`).
 pub(crate) fn stamp_audio(pkt: Bytes, voice: u16, epoch: u8) -> Option<Bytes> {
     if pkt.len() < AUDIO_HEADER_LEN || pkt[0] != AUDIO_MAGIC {
         return None;
@@ -50,15 +52,29 @@ pub(crate) fn stamp_audio(pkt: Bytes, voice: u16, epoch: u8) -> Option<Bytes> {
     if !is_audio_kind(kind) {
         return None;
     }
-    let track = (voice & !3) | kind;
+    Some(stamp(pkt, (voice & !3) | kind, epoch))
+}
+
+/// Like `stamp_audio` for a screen share's audio: the datagram goes out on my share-audio
+/// track (`track_id(short_id, KIND_SHARE_AUDIO)`) whatever it carried. None for anything that
+/// is not an audio datagram.
+pub(crate) fn stamp_share_audio(pkt: Bytes, short_id: u16, epoch: u8) -> Option<Bytes> {
+    if pkt.len() < AUDIO_HEADER_LEN || pkt[0] != AUDIO_MAGIC {
+        return None;
+    }
+    Some(stamp(pkt, track_id(short_id, KIND_SHARE_AUDIO), epoch))
+}
+
+/// `pkt` (a checked audio datagram) with `track` and `epoch` in its header.
+fn stamp(pkt: Bytes, track: u16, epoch: u8) -> Bytes {
     let t = track.to_be_bytes();
     if pkt[2] == t[0] && pkt[3] == t[1] && pkt[11] == epoch {
-        return Some(pkt);
+        return pkt;
     }
     let mut v = pkt.to_vec();
     v[2..4].copy_from_slice(&t);
     v[11] = epoch;
-    Some(Bytes::from(v))
+    Bytes::from(v)
 }
 
 /// The audio track (voice or soundboard) of a datagram sent by the member with `short_id`;
@@ -66,6 +82,13 @@ pub(crate) fn stamp_audio(pkt: Bytes, voice: u16, epoch: u8) -> Option<Bytes> {
 pub(crate) fn audio_track_from(pkt: &[u8], short_id: u16) -> Option<u16> {
     let track = tincan_core::media::audio_track_of(pkt)?;
     (is_audio_kind(track_kind(track)) && track_short_id(track) == short_id).then_some(track)
+}
+
+/// The share-audio track of an audio datagram sent by the member with `short_id`; None if it
+/// is malformed, voice or soundboard, or claims someone else's share.
+pub(crate) fn share_audio_track_from(pkt: &[u8], short_id: u16) -> Option<u16> {
+    let track = tincan_core::media::audio_track_of(pkt)?;
+    (track_kind(track) == KIND_SHARE_AUDIO && track_short_id(track) == short_id).then_some(track)
 }
 
 /// A group replayed from a cache after a migration may start up to this far (90 kHz, 10 s)
@@ -162,7 +185,9 @@ impl CtlTx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tincan_core::media::{AF_SPEAKING, AudioHeader, KIND_SCREEN, KIND_SOUND, KIND_VOICE, track_id};
+    use tincan_core::media::{AF_SPEAKING, AudioHeader, KIND_SCREEN, KIND_SOUND, KIND_VOICE};
+
+    fn pkt_voice(h: &AudioHeader) -> Bytes { AudioHeader { track: track_id(1, KIND_VOICE), ..*h }.packet(b"opus") }
 
     #[test]
     fn wire_slices_the_frame_back_out() {
@@ -193,6 +218,12 @@ mod tests {
         assert_eq!(back.track, track_id(3, KIND_SOUND));
         let screen = AudioHeader { track: track_id(1, KIND_SCREEN), ..h }.packet(b"opus");
         assert!(stamp_audio(screen, track_id(3, KIND_VOICE), 9).is_none());
+        // Share audio is refused on the voice path; the share path forces my share track.
+        let share = AudioHeader { track: track_id(1, KIND_SHARE_AUDIO), ..h }.packet(b"opus");
+        assert!(stamp_audio(share, track_id(3, KIND_VOICE), 9).is_none());
+        let (back, _) = AudioHeader::parse(&stamp_share_audio(pkt_voice(&h), 3, 9).unwrap()).unwrap();
+        assert_eq!((back.track, back.epoch), (track_id(3, KIND_SHARE_AUDIO), 9));
+        assert!(stamp_share_audio(Bytes::from_static(b"short"), 3, 9).is_none());
     }
 
     #[test]
@@ -246,6 +277,14 @@ mod tests {
         assert_eq!(audio_track_from(&pkt(track_id(4, KIND_VOICE)), 3), None);
         assert_eq!(audio_track_from(&pkt(track_id(4, KIND_SOUND)), 3), None);
         assert_eq!(audio_track_from(&pkt(track_id(3, KIND_SCREEN)), 3), None);
-        assert_eq!(audio_track_from(b"\xA1", 3), None);
+        assert_eq!(audio_track_from(&[0xA1], 3), None);
+        // Share audio: the voice+sound check refuses it (what builds without share audio do),
+        // the share check takes only the sender's own share-audio track.
+        assert_eq!(audio_track_from(&pkt(track_id(3, KIND_SHARE_AUDIO)), 3), None);
+        assert_eq!(share_audio_track_from(&pkt(track_id(3, KIND_SHARE_AUDIO)), 3), Some(track_id(3, KIND_SHARE_AUDIO)));
+        assert_eq!(share_audio_track_from(&pkt(track_id(4, KIND_SHARE_AUDIO)), 3), None);
+        assert_eq!(share_audio_track_from(&pkt(track_id(3, KIND_VOICE)), 3), None);
+        assert_eq!(share_audio_track_from(&pkt(track_id(3, KIND_SOUND)), 3), None);
+        assert_eq!(share_audio_track_from(&[0xA1, 0, 0], 3), None);
     }
 }

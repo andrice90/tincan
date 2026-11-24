@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use serde_json::Value;
-use tincan_core::media::{KIND_SOUND, KIND_VOICE, VideoFrame, track_id, ui_video_message};
+use tincan_core::media::{KIND_SHARE_AUDIO, KIND_SOUND, KIND_VOICE, VideoFrame, screen_of_share_audio, track_id, ui_video_message};
 use tincan_core::storage::Storage;
 use tincan_core::{ChannelId, ConvId, ServerId, UserId};
 use tincan_net::{CallEnd, CallInfo, CallState, ConnState, MediaSession, Net, VoiceInfo};
@@ -33,6 +33,8 @@ pub(super) const VOICE_UPLOAD_LIMIT: u64 = 256 * 1024;
 pub(super) const SHARE_UPLOAD_LIMIT: u64 = 128 * 1024;
 /// kv key of the per-user volumes (JSON object: z32 -> gain).
 const VOLUMES_KEY: &str = "app/user_volumes";
+/// kv key of the per-sharer screen share audio volumes (same layout).
+const SHARE_VOLUMES_KEY: &str = "app/share_volumes";
 
 /// What a session is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +61,8 @@ pub(super) struct Attached {
     pub conv: ConvId,
     /// Where the engine sends encoded audio (kept to restart a dead engine).
     pub audio_out: mpsc::Sender<Bytes>,
+    /// Where my share's sound goes (`tincan_audio::ShareAudio`).
+    pub share_audio_out: mpsc::Sender<Bytes>,
     /// My voice track as last reported.
     pub local_track: u16,
     /// Host epoch byte as last reported.
@@ -142,24 +146,36 @@ fn end_notice(ended: Option<CallEnd>, prev: Option<CallState>, name: &str) -> Op
 }
 
 /// Persisted per-user volumes.
-pub(super) fn load_volumes(core: &Core) -> HashMap<UserId, f32> {
-    let Ok(Some(raw)) = core.storage.get_kv(VOLUMES_KEY) else { return HashMap::new() };
+pub(super) fn load_volumes(core: &Core) -> HashMap<UserId, f32> { load_gains(core, VOLUMES_KEY) }
+
+/// Persisted per-sharer share audio volumes.
+pub(super) fn load_share_volumes(core: &Core) -> HashMap<UserId, f32> { load_gains(core, SHARE_VOLUMES_KEY) }
+
+fn load_gains(core: &Core, key: &str) -> HashMap<UserId, f32> {
+    let Ok(Some(raw)) = core.storage.get_kv(key) else { return HashMap::new() };
     let map: HashMap<String, f32> = serde_json::from_slice(&raw).unwrap_or_default();
     map.into_iter().filter_map(|(k, v)| Some((UserId::from_z32(&k)?, if v.is_finite() { v.clamp(0.0, 2.0) } else { 1.0 }))).collect()
 }
 
-fn save_volumes(core: &Core, volumes: &HashMap<UserId, f32>) {
+fn save_volumes(core: &Core, volumes: &HashMap<UserId, f32>) { save_gains(core, VOLUMES_KEY, volumes) }
+
+fn save_gains(core: &Core, key: &str, volumes: &HashMap<UserId, f32>) {
     let map: HashMap<String, f32> = volumes.iter().map(|(u, v)| (u.to_z32(), *v)).collect();
     if let Ok(json) = serde_json::to_vec(&map)
-        && let Err(e) = core.storage.set_kv(VOLUMES_KEY, &json)
+        && let Err(e) = core.storage.set_kv(key, &json)
     {
-        tracing::warn!(error = %e, "saving user volumes failed");
+        tracing::warn!(error = %e, key, "saving volumes failed");
     }
 }
 
 /// How loud `user` plays for me (0..2), as the UI's volume slider shows it.
-fn volume_of(st: &State, user: &UserId) -> f64 {
-    let v = f64::from(st.volumes.get(user).copied().unwrap_or(1.0));
+fn volume_of(st: &State, user: &UserId) -> f64 { gain_of(&st.volumes, user) }
+
+/// How loud `user`'s screen share sound plays for me (0..2).
+fn share_volume_of(st: &State, user: &UserId) -> f64 { gain_of(&st.share_volumes, user) }
+
+fn gain_of(map: &HashMap<UserId, f32>, user: &UserId) -> f64 {
+    let v = f64::from(map.get(user).copied().unwrap_or(1.0));
     (v * 1000.0).round() / 1000.0
 }
 
@@ -193,14 +209,14 @@ impl Media {
         if st.attached.is_some() {
             self.detach_locked(core, st);
         }
-        let MediaSession { conv, local_track, epoch, audio_out, audio_in, video_in } = session;
+        let MediaSession { conv, local_track, epoch, audio_out, share_audio_out, audio_in, video_in } = session;
         self.start_engine_call(core, st, local_track, epoch, &audio_out)?;
         if let Some(e) = self.engine_handle() {
             // A previous session may have left the relayed jitter maximum on.
             e.set_relayed(false);
         }
         let tasks = vec![self.spawn_audio_pump(audio_in), self.spawn_video_pump(core.net.clone(), video_in)];
-        st.attached = Some(Attached { kind, conv, audio_out, local_track, epoch, relayed: false, tasks });
+        st.attached = Some(Attached { kind, conv, audio_out, share_audio_out, local_track, epoch, relayed: false, tasks });
         core.files.set_upload_limit(Some(VOICE_UPLOAD_LIMIT));
         self.refresh_room(core, st);
         tracing::info!(conv = %conv.short(), call = matches!(kind, Kind::Call { .. }), "voice attached");
@@ -336,6 +352,7 @@ impl Media {
             if let (Some(e), Some(short)) = (&engine, short) {
                 e.remove_track(track_id(short, KIND_VOICE));
                 e.remove_track(track_id(short, KIND_SOUND));
+                e.remove_track(track_id(short, KIND_SHARE_AUDIO));
             }
             engine::set_speaking(core, st, user, false);
         }
@@ -345,12 +362,13 @@ impl Media {
         }
     }
 
-    /// Per-user playback gains (voice and soundboard tracks) for everyone in my session, and
-    /// the room's soundboard volume for my own clips.
+    /// Per-user playback gains (voice, soundboard and screen share sound) for everyone in my
+    /// session, and the room's soundboard volume for my own clips.
     pub(super) fn apply_volumes(&self, e: &tincan_audio::AudioEngine, st: &State) {
         for user in &st.room.users {
             if let Some(short) = st.room.short_of(user) {
                 Self::apply_user_gains(e, st, user, short);
+                e.set_track_volume(track_id(short, KIND_SHARE_AUDIO), st.share_volumes.get(user).copied().unwrap_or(1.0));
             }
         }
         e.set_local_sound_gain(Self::current_room_sound(st));
@@ -393,6 +411,7 @@ impl Media {
         };
         for t in gone {
             core.net.unsubscribe_track(t);
+            self.drop_share_audio(t);
         }
     }
 
@@ -446,6 +465,10 @@ impl Media {
         let info = core.net.voice_info().filter(|i| i.conv == a.conv);
         let connected = info.as_ref().is_some_and(|i| i.connected);
         let my_share = info.as_ref().and_then(|i| i.sharing);
+        let share_audio = match (&st.share, my_share) {
+            (Some(s), Some(_)) => s.audio_kind(),
+            _ => dto::ShareAudio::Off,
+        };
         // To the host in a room (None while I host it), to the peer in a call. Net updates
         // it about once a second and reports only real moves, so it does not churn the DTO.
         let rtt_ms = info.as_ref().filter(|i| i.connected).and_then(|i| i.rtt_ms);
@@ -465,6 +488,7 @@ impl Media {
             screen_track: my_share,
             volume: 1.0,
             soundboard_volume: 1.0,
+            share_volume: 1.0,
         };
         let mut participants = vec![me];
         let session = match a.kind {
@@ -485,6 +509,7 @@ impl Media {
                             screen_track: e.sharing,
                             volume: volume_of(st, &e.user),
                             soundboard_volume: sound_volume_of(st, &e.user),
+                            share_volume: share_volume_of(st, &e.user),
                         });
                     }
                 }
@@ -503,6 +528,7 @@ impl Media {
                     muted: st.muted,
                     deafened: st.deafened,
                     sharing: my_share.is_some(),
+                    share_audio,
                     path,
                     rtt_ms,
                     playing_clips: playing_clips(st),
@@ -520,6 +546,7 @@ impl Media {
                     screen_track: call.as_ref().and_then(|c| c.peer_sharing),
                     volume: volume_of(st, &peer),
                     soundboard_volume: sound_volume_of(st, &peer),
+                    share_volume: share_volume_of(st, &peer),
                 });
                 dto::VoiceSession {
                     kind: dto::VoiceKind::Call,
@@ -530,6 +557,7 @@ impl Media {
                     muted: st.muted,
                     deafened: st.deafened,
                     sharing: my_share.is_some(),
+                    share_audio,
                     path,
                     rtt_ms,
                     playing_clips: playing_clips(st),
@@ -600,18 +628,30 @@ impl Media {
     // ------------------------------------------------------------------ pumps
 
     /// Received audio -> the current engine (whichever engine is running, so a restarted
-    /// engine keeps receiving).
+    /// engine keeps receiving). A share's sound plays only while I watch that share (the
+    /// network already filters it; this holds even for a packet in flight at unwatch).
     fn spawn_audio_pump(&self, mut rx: mpsc::Receiver<Bytes>) -> AbortHandle {
         let slot = self.engine.clone();
         let counters = self.counters.clone();
+        let watchers = self.watchers.clone();
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(32);
             while rx.recv_many(&mut batch, 32).await > 0 {
                 let engine = slot.lock().engine.clone();
                 match engine {
                     Some(e) => {
-                        counters.audio_in.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                        batch.drain(..).for_each(|p| e.push_packet(p));
+                        let mut watched: Option<HashSet<u16>> = None;
+                        for p in batch.drain(..) {
+                            if let Some(screen) = tincan_core::media::audio_track_of(&p).and_then(screen_of_share_audio) {
+                                let w = watched.get_or_insert_with(|| watchers.lock().keys().copied().collect());
+                                if !w.contains(&screen) {
+                                    continue;
+                                }
+                                counters.share_audio_in.fetch_add(1, Ordering::Relaxed);
+                            }
+                            counters.audio_in.fetch_add(1, Ordering::Relaxed);
+                            e.push_packet(p);
+                        }
                     }
                     None => batch.clear(),
                 }
@@ -881,6 +921,28 @@ impl Media {
             Self::apply_user_gains(&e, &st, &user, short);
         }
         // `VoiceParticipant.volume` changed.
+        self.emit_voice(core, &mut st);
+        Ok(())
+    }
+
+    /// `set_share_volume`: how loud `user`'s screen share sound plays (0..2, remembered per
+    /// sharer across sessions and restarts).
+    pub(super) fn set_share_volume(&self, core: &Arc<Core>, user: UserId, volume: f64) -> Result<(), String> {
+        if !volume.is_finite() {
+            return Err("Volume must be a number between 0 and 2.".into());
+        }
+        let v = volume.clamp(0.0, 2.0) as f32;
+        let mut st = self.st.lock();
+        if (v - 1.0).abs() < 1e-4 {
+            st.share_volumes.remove(&user);
+        } else {
+            st.share_volumes.insert(user, v);
+        }
+        save_gains(core, SHARE_VOLUMES_KEY, &st.share_volumes);
+        if let (Some(e), Some(short)) = (self.engine_handle(), st.room.short_of(&user)) {
+            e.set_track_volume(track_id(short, KIND_SHARE_AUDIO), v);
+        }
+        // `VoiceParticipant.shareVolume` changed.
         self.emit_voice(core, &mut st);
         Ok(())
     }

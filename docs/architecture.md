@@ -16,7 +16,7 @@ Locked 2026-11-22 from the research in `docs/research/` (every version and API b
   - Soundboard plays while your mic is muted; it is disabled while deafened.
   - Relays: n0's public iroh relays by default (development and hobby tier, rate-limited, no SLA). A custom relay URL is a setting. This is the one caveat to "no servers": a small self-hosted `iroh-relay` or n0 Pro ($19/month) is recommended before a public release.
   - Installer: NSIS, per-user (no admin). Windows Firewall asks once on first run; direct paths need "Allow".
-- Out of scope for v1 (room left in the event enum): kick, ban, roles, reactions, edits, replies, multi-device, group end-to-end encryption beyond QUIC, store-and-forward DM mailboxes, system audio in screen share, camera video.
+- Out of scope for v1 (room left in the event enum): kick, ban, roles, reactions, edits, replies, multi-device, group end-to-end encryption beyond QUIC, store-and-forward DM mailboxes, camera video.
 
 ## Stack (pinned)
 
@@ -223,7 +223,7 @@ Partition merge (two solo hosts is the common case, given the 6 s solo timeout):
 ### How this holds
 
 - Takeover: partition merges count only member-signed attestations (fresh, unique, current members, not the peer's own links). A host with members to hand over counts only established attesters: members whose admission this replica stored at least 24 h ago by its own clock (recorded per member in kv; members known before this was recorded count as long ago). Members admitted just now, by the peer or through members it admitted, never count. A host with members yields only to a peer that proved at least as many, re-checked with the established count when the move arrives. A solo host counts every valid attestation, so it still rejoins a young server. Self-reported counts and scores are ignored, a bare compare never moves the host's epoch, epochs are bounded by a shared ceiling, and compares are rate limited. A successor that never promotes delays a failover by at most `host_dead + stagger`.
-- Disruption and unbounded work: every input a member controls is bounded per member (see notes-tincan-net.md "Hardening"). That covers typing, status and roster, publishes, syncs (one in flight per link), holder queries, held-blob lists, clips, soundboard, admissions, merge compares, attestations, audio datagrams, video uploads, subscriptions and keyframe requests, pending buffers, video receive state, QUIC stream windows and pre-auth connections. Relayed chatter can use at most half of another member's queue and never gets anyone disconnected. Budgets that protect shared resources (admissions, joins) are keyed per member, so one member cannot spend everyone's. Every admission of a new member is budgeted on every path (joins, publishes, own and relayed `Events`, probe links) and charged to the member that answers for its author: the nearest admitter up the chain that this replica stored before the host role started or at least 24 h ago, so keys admitted just now never bring budgets of their own. A host-wide budget bounds new members over everyone, and members bound how many new members a host can make them apply. New events in `Events` frames are charged per sender in bytes, and a sender's own events against its own budget, so `Events` is no way around the publish budget. DM events are budgeted per contact, tightly in a stranger's unanswered conversation.
+- Disruption and unbounded work: every input a member controls is bounded per member (see notes-tincan-net.md "Hardening"). That covers typing, status and roster, publishes, syncs (one in flight per link), holder queries, held-blob lists, clips, soundboard, admissions, merge compares, attestations, audio datagrams, screen share audio (own share-audio track only, own policer, only to subscribers of the sharer's screen track, receivers keep at most 4 share streams and only of shares they watch), video uploads, subscriptions and keyframe requests, pending buffers, video receive state, QUIC stream windows and pre-auth connections. Relayed chatter can use at most half of another member's queue and never gets anyone disconnected. Budgets that protect shared resources (admissions, joins) are keyed per member, so one member cannot spend everyone's. Every admission of a new member is budgeted on every path (joins, publishes, own and relayed `Events`, probe links) and charged to the member that answers for its author: the nearest admitter up the chain that this replica stored before the host role started or at least 24 h ago, so keys admitted just now never bring budgets of their own. A host-wide budget bounds new members over everyone, and members bound how many new members a host can make them apply. New events in `Events` frames are charged per sender in bytes, and a sender's own events against its own budget, so `Events` is no way around the publish budget. DM events are budgeted per contact, tightly in a stranger's unanswered conversation.
 - Impersonation: the host relays `Typing` and `SoundPlayed` only with `by == sender`. Receivers accept them only for current members listed online (rooms) or from the peer (calls and DMs). Attestations, claims and events are signed by whom they name.
 - Divergence: my seq is never moved by a host and never reused once a signed event left the device. Rule-breaking events are rejected identically everywhere (deterministic validation). History over a budget is held back and asked for again later, never dropped, and an author's chain stays contiguous. An author signing two events for one seq is detected, and the proof is kept. Epoch checks need no local history, so no honest node can be locked out by how far the epoch moved while it was away.
 
@@ -378,7 +378,7 @@ People normally share the server's 6-character invite code instead (see "Short c
 ```
 [0]     0xA1 (audio v1)
 [1]     flags: bit0 speaking, bit1 talkspurt start, bit2 FEC present, bit3 soundboard active
-[2..4]  track_id u16 = short_id * 4 + kind (kind 0 = voice, 2 = soundboard; 1 is screen share)
+[2..4]  track_id u16 = short_id * 4 + kind (0 = voice, 1 = screen video, 2 = soundboard, 3 = screen share audio)
 [4..6]  seq u16 (+1 per packet; DTX does not consume seq)
 [6..10] ts u32 (48 kHz sample clock, random origin)
 [10]    level 0..127 (-dBov)
@@ -386,11 +386,20 @@ People normally share the server's 6-character invite code instead (see "Short c
 [12..]  Opus packet
 ```
 
+| Kind | Track | Carried in | The host forwards it to | Host policer (per member) |
+|---|---|---|---|---|
+| 0 | voice | audio datagram, Opus mono | everyone else in the sender's room | voice+soundboard, 150 packets/s, burst 75 |
+| 1 | screen video | GOP uni streams | subscribers of that track | video upload policer (per track, 9 Mbit/s) |
+| 2 | soundboard | audio datagram, Opus mono | everyone else in the sender's room | voice+soundboard (the same one) |
+| 3 | screen share audio | audio datagram, Opus stereo | subscribers of the sender's kind-1 track | share audio, its own, same bounds |
+
+A host accepts audio kinds only on the sender's own short id; share audio is checked first and never charged to the voice+soundboard policer.
+
 - Jitter buffer per track: min 40 ms, start 60 ms, max 200 ms (300 ms on relayed paths). Target = max(min, P95 of relative arrival delay over 2 s + 1 frame). Grow on underrun, shrink by dropping one frame in silence when over target + 20 ms for 1 s.
 - Loss: decode FEC from the next packet if buffered, else Opus PLC for up to 5 frames, then fade to silence.
-- Mixer: per-track gain (a person's voice, and their soundboard track at their volume x their soundboard volume x the room's soundboard volume), sum, soft limiter. UI sounds (join/leave chimes) go through the same mixer so the echo canceller sees them.
+- Mixer: per-track gain (a person's voice, their soundboard track at their volume x their soundboard volume x the room's soundboard volume, and a watched screen share's audio at its sharer's share volume), sum, soft limiter. UI sounds (join/leave chimes) go through the same mixer so the echo canceller sees them.
 - Speaking: sender sets bit0 from post-APM energy with 250 ms hangover; receivers light the ring after 2 speaking packets and hold 300 ms. The engine emits `Speaking{track_id, speaking}` changes only.
-- Mute: stop sending voice datagrams. Deafen: mute + stop playout.
+- Mute: stop sending voice datagrams. Deafen: mute + stop playout (voices, soundboard tracks and share audio).
 
 ### Soundboard
 
@@ -416,9 +425,23 @@ People normally share the server's 6-character invite code instead (see "Short c
 - Host forwarder per viewer: bounded queue; if a viewer's queue exceeds max(2 frames, 250 ms) or a frame is older than 300 ms, reset that viewer's group stream, skip to the next keyframe and send a coalesced `KeyframeRequest` upstream (at most 1/s per track). The host caches the current GOP (bounded 4 s / 2 MB) so a new viewer starts immediately.
 - Viewing: viewers `Subscribe{track_id}` / `Unsubscribe`. Received access units cross to the webview over a raw Tauri Channel: `[u8 flags][u16 track_id][u32 ts][AU bytes]`; the UI decodes with `VideoDecoder({codec: 'avc1.' + SPS profile/level, hardwareAcceleration: 'prefer-hardware', optimizeForLatency: true})` without a description, in a synchronous `onmessage`, and draws the latest frame on rAF while the window is visible.
 
+### Screen share audio
+
+- **Capture** (`tincan_audio::ShareAudio`, its own `tincan-share-audio` thread, Windows process loopback: `ActivateAudioInterfaceAsync` on `VAD\Process_Loopback` with `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, Windows 10 2004+ like screen share):
+  - Window share: the process tree of the process that owns the shared HWND (`PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`). If that process is Tincan or one of its ancestors (say, the terminal that started it), its tree contains Tincan, so the share goes on without audio.
+  - Display share: everything except Tincan's own process tree (`PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` with Tincan's pid; WebView2 runs as children of tincan.exe), so the call's voices and Tincan's sounds never go back to the viewers.
+  - When process loopback is unavailable or fails, the share continues with the picture only and a toast says so. There is no fallback to plain system loopback.
+  - The picker's "Share audio" switch (on by default) sends `screen_start { audio: true }`.
+- **Encode:** Opus 48 kHz stereo, application audio, signal music, 128 kbps VBR, complexity 8, 20 ms frames, no FEC (music is CELT), no DTX. The stream follows the wall clock: a silent source (loopback delivers nothing while the target is quiet) is filled with silence, so sequence and timestamps run at 50 packets a second; a backlog over 100 ms is trimmed. `AF_SPEAKING` is never set.
+- **Transport:** the same 12-byte audio datagram (`0xA1`) on track `short_id * 4 + 3` (`KIND_SHARE_AUDIO`; kind 2 is the soundboard stream), stamped by tincan-net like voice. It is sent only while sharing; in a call only while the peer watches.
+- **Who gets it:** exactly the subscribers of the matching screen track (`Subscribe{track}` of the video, no new control message). The host forwards a member's share audio to members subscribed to that member's screen track (and to its own app when it watches), under its own per-member policer (an `AudioPolicer` of its own, with the same bounds as the voice policer, so share audio never uses the budget of voice and soundboard). Receivers also drop share audio for any screen track they did not subscribe to, so unwatching (and minimizing, which unwatches) stops it even if the host or peer keeps sending. Share audio is never counted in uplink stats or receiver reports, which drive the voice encoder.
+- **Playback** (`Processor` share streams, at most 4, separate from the 64 voice and soundboard tracks): each has its own jitter buffer and decoder. The mono decoder plays the stereo stream as a downmix, because the engine's output path, the device ring and the echo canceller are mono; stereo playout would need a stereo output bus. The app hands the engine a share's packets only while that share is watched and drops the stream on unwatch. Deafen silences it. Per-sharer volume (`set_share_volume`, 0..2) is saved like the per-user volume, separately from it.
+- **Echo:** share audio is mixed into the speaker signal before the output gain and limiter, so it is part of the echo canceller's render reference: the receiver's mic does not send it back into the call, and the canceller only works on the captured signal, so the share audio itself is not altered.
+- **Compatibility:** builds from before this kind drop it everywhere: their receivers accept only voice and soundboard datagrams (`audio_rx`), their hosts forward only the sender's own voice and soundboard tracks (`audio_track_from`, checked before the policer is charged). This build's host checks share audio first, so kind 3 is never charged to the voice+soundboard policer. No control message or struct changed. An older watcher still receives the datagrams (it subscribed to the video) and drops them.
+
 ### Host SFU
 
-The host forwards each voice datagram to every other member in the same voice room (no decode), injects its own engine's packets the same way, and hands members' packets to its own engine. Video goes only to subscribers. A relayed viewer is capped at 800 kbps and a relayed sharer at 1 Mbps.
+The host forwards each voice and soundboard datagram to every other member in the same voice room (no decode), injects its own engine's packets the same way, and hands members' packets to its own engine. Video, and screen share audio, go only to subscribers of the screen track. Voice and soundboard share one per-member audio policer; share audio has its own (track kinds table above). A relayed viewer is capped at 800 kbps and a relayed sharer at 1 Mbps.
 
 ## App API
 
@@ -438,4 +461,4 @@ Tables: `identity`, `settings` (key/value JSON), `servers` (id, name, secret, ge
 
 ## Not verified yet (needs two machines on different networks)
 
-WAN hole punching rate, relay throughput for voice and video, echo cancellation quality in a real room (sonora 0.3), the first-run firewall prompt being dismissed, SmartScreen on an unsigned installer, hardware encoder coverage on iGPU-only machines.
+WAN hole punching rate, relay throughput for voice and video, echo cancellation quality in a real room (sonora 0.3), the first-run firewall prompt being dismissed, SmartScreen on an unsigned installer, hardware encoder coverage on iGPU-only machines. Screen share audio: real capture is verified only by `tincan-audio/tests/share_loopback.rs` (this process's own tree, included and excluded); not verified are a window share of a browser or game, UWP windows (their HWND belongs to ApplicationFrameHost, so the app's audio is probably not in that tree), listening to it on a second machine, and the receiver's echo canceller with share audio playing in a real room.

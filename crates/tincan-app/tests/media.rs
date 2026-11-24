@@ -17,8 +17,8 @@ use tokio::time::Instant;
 /// One test at a time: each runs several endpoints with real timers.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-const VOICE_KEYS: &[&str] = &["kind", "convId", "channelId", "name", "participants", "muted", "deafened", "sharing", "path", "rttMs", "playingClips"];
-const PARTICIPANT_KEYS: &[&str] = &["userId", "name", "muted", "deafened", "speaking", "avatar", "screenTrack", "volume", "soundboardVolume"];
+const VOICE_KEYS: &[&str] = &["kind", "convId", "channelId", "name", "participants", "muted", "deafened", "sharing", "shareAudio", "path", "rttMs", "playingClips"];
+const PARTICIPANT_KEYS: &[&str] = &["userId", "name", "muted", "deafened", "speaking", "avatar", "screenTrack", "volume", "soundboardVolume", "shareVolume"];
 const CLIP_KEYS: &[&str] = &["hash", "name", "durationMs", "size", "owned", "heardFrom", "transfer"];
 const CALL_KEYS: &[&str] = &["callId", "userId", "name", "state"];
 
@@ -738,6 +738,123 @@ async fn screen_share_reaches_a_watcher() {
     call(&a.app, "voice_leave", json!({})).await;
     wait_for(&mut b.rx, "voice-updated", 20, |v| participants(v) == [b.user.clone()]).await;
 
+    a.app.shutdown().await;
+    b.app.shutdown().await;
+}
+
+fn share_audio_in(app: &App) -> u64 { app.test_media_counters()["shareAudioIn"].as_u64().unwrap() }
+
+/// How many share-audio packets reach `app`'s engine over `ms`.
+async fn share_audio_over(app: &App, ms: u64) -> u64 {
+    let before = share_audio_in(app);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    share_audio_in(app) - before
+}
+
+/// Watch `track` on `app` with a sink that keeps every message.
+async fn watch(app: &App, track: u16) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    app.screen_watch(track, Box::new(move |m| tx.send(m).is_ok())).await.expect("watch");
+    rx
+}
+
+/// (e, audio) Screen share sound through the app path (synthetic tone): the sharer reports
+/// it, only a watcher's engine gets it, unwatching stops it, the per-sharer volume is
+/// reported and kept, and a share without sound sends none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn screen_share_audio_plays_only_for_watchers() {
+    let _g = SERIAL.lock().await;
+    let (da, db, dc) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut a = node(da.path(), "Alice").await;
+    let mut b = node(db.path(), "Bob").await;
+    let c = node(dc.path(), "Carol").await;
+    let server = server_with(&a, &[&b, &c], "Sound").await;
+    let room = voice_room(&a.app, &server).await;
+    for n in [&a, &b, &c] {
+        call(&n.app, "voice_join", json!({ "serverId": server, "channelId": room })).await;
+    }
+    let track = call(&a.app, "screen_start", json!({ "sourceId": "test:pattern", "mode": "text", "audio": true })).await.as_u64().unwrap() as u16;
+    let mine = wait_for(&mut a.rx, "voice-updated", 20, |v| v["sharing"] == true && v["shareAudio"] == "system").await;
+    assert_voice_shape(&mine);
+    wait_for(&mut b.rx, "voice-updated", 20, |v| participant(v, &a.user).is_some_and(|p| p["screenTrack"] == track)).await;
+    eventually("the share sends sound", 20, || async { (a.app.test_media_counters()["shareAudioSent"].as_u64().unwrap() > 20).then_some(()) }).await;
+
+    // Bob watches, Carol does not.
+    let frames = watch(&b.app, track).await;
+    eventually("bob's engine gets the share's sound", 20, || async { (share_audio_in(&b.app) > 20).then_some(()) }).await;
+    assert_eq!(share_audio_in(&c.app), 0, "carol does not watch");
+    assert!(frames.recv_timeout(Duration::from_secs(5)).is_ok(), "and the picture");
+
+    // Per-sharer volume: reported in Bob's session and refused when not a number.
+    call(&b.app, "set_share_volume", json!({ "userId": a.user, "volume": 0.4 })).await;
+    let v = wait_for(&mut b.rx, "voice-updated", 20, |v| participant(v, &a.user).is_some_and(|p| p["shareVolume"] == 0.4)).await;
+    assert_eq!(participant(&v, &a.user).unwrap()["volume"], 1.0, "the voice volume is separate");
+    assert!(call_err(&b.app, "set_share_volume", json!({ "userId": "nope", "volume": 1 })).await.contains("not valid"));
+    call(&b.app, "set_share_volume", json!({ "userId": a.user, "volume": 7 })).await;
+    wait_for(&mut b.rx, "voice-updated", 20, |v| participant(v, &a.user).is_some_and(|p| p["shareVolume"] == 2.0)).await;
+
+    // Unwatching (what minimizing does) stops the sound.
+    call(&b.app, "screen_unwatch", json!({ "track": track })).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(share_audio_over(&b.app, 1000).await, 0, "share sound after unwatching");
+    // Watching again brings it back.
+    let _frames = watch(&b.app, track).await;
+    eventually("sound again after rewatching", 20, || async { (share_audio_over(&b.app, 300).await > 5).then_some(()) }).await;
+
+    // The volume is kept across leaving and joining again.
+    call(&b.app, "voice_leave", json!({})).await;
+    call(&b.app, "voice_join", json!({ "serverId": server, "channelId": room })).await;
+    let v = call(&b.app, "app_snapshot", json!({})).await["voice"].clone();
+    assert_eq!(participant(&v, &a.user).unwrap()["shareVolume"], 2.0);
+
+    // A share without sound sends none and says so.
+    call(&a.app, "screen_stop", json!({})).await;
+    call(&a.app, "screen_start", json!({ "sourceId": "test:pattern", "mode": "text" })).await;
+    let mine = eventually("the share without audio started", 20, || async {
+        let v = call(&a.app, "app_snapshot", json!({})).await["voice"].clone();
+        (v["sharing"] == true).then_some(v)
+    })
+    .await;
+    assert_eq!(mine["shareAudio"], "off");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(a.app.test_media_counters()["shareAudioSent"], 0);
+    call(&a.app, "screen_stop", json!({})).await;
+    // The network's share state follows the command a moment later.
+    let mine = eventually("the share stopped", 20, || async {
+        let v = call(&a.app, "app_snapshot", json!({})).await["voice"].clone();
+        (v["sharing"] == false).then_some(v)
+    })
+    .await;
+    assert_eq!(mine["shareAudio"], "off");
+
+    for n in [a, b, c] {
+        n.app.shutdown().await;
+    }
+}
+
+/// (c, audio) Share sound in a 1:1 call reaches the peer only while it watches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_share_audio_reaches_the_watching_peer() {
+    let _g = SERIAL.lock().await;
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut a = node(da.path(), "Alice").await;
+    let mut b = node(db.path(), "Bob").await;
+    a.app.test_add_addr(&b.user, &b.app.test_addrs()).unwrap();
+    b.app.test_add_addr(&a.user, &a.app.test_addrs()).unwrap();
+    call(&a.app, "call_start", json!({ "userId": b.user })).await;
+    let ring = wait_for(&mut b.rx, "call-updated", 20, |c| c["state"] == "ringing-in").await;
+    call(&b.app, "call_accept", json!({ "callId": ring["callId"] })).await;
+    wait_for(&mut a.rx, "call-updated", 20, |c| c["state"] == "active").await;
+    wait_for(&mut a.rx, "voice-updated", 20, |v| v["kind"] == "call" && v["path"] != "none").await;
+    let track = call(&a.app, "screen_start", json!({ "sourceId": "test:pattern", "mode": "text", "audio": true })).await.as_u64().unwrap() as u16;
+    wait_for(&mut b.rx, "voice-updated", 20, |v| participant(v, &a.user).is_some_and(|p| p["screenTrack"] == track)).await;
+    assert_eq!(share_audio_over(&b.app, 800).await, 0, "not watching yet");
+    let _frames = watch(&b.app, track).await;
+    eventually("the peer's engine gets the share's sound", 20, || async { (share_audio_in(&b.app) > 20).then_some(()) }).await;
+    call(&b.app, "screen_unwatch", json!({ "track": track })).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(share_audio_over(&b.app, 1000).await, 0, "share sound after unwatching");
+    call(&a.app, "call_hangup", json!({})).await;
     a.app.shutdown().await;
     b.app.shutdown().await;
 }

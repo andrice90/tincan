@@ -11,7 +11,9 @@ import { useStore } from "../store/store";
 import { ChannelMessages } from "./ChatView";
 import { ICON, ICON_SM, IconButton, PersonName, SpeakingAvatar } from "./common";
 import { Popover, useMenu } from "./Menu";
+import { useStageVolume } from "./ShareVolume";
 import { PersonVolumes } from "./VolumeSliders";
+import { shareAudioNote } from "../lib/shareAudio";
 import { tileGrid } from "../lib/tileGrid";
 import type { CSSProperties } from "react";
 
@@ -125,6 +127,7 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
             screenTrack: null,
             volume: 1,
             soundboardVolume: 1,
+            shareVolume: 1,
           },
           ...voice.participants,
         ]
@@ -149,6 +152,8 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
     if (!stagePerson && full) setFullStage(false);
   }, [stagePerson, full]);
 
+  const stageVolume = useStageVolume(stagePerson && stagePerson.userId !== meId ? stagePerson : null);
+
   if (!stagePerson && !iShare) {
     return (
       <div className="tiles" style={gridStyle(participants.length)}>
@@ -165,10 +170,12 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
       <div
         className={full ? "stage is-full" : "stage"}
         onDoubleClick={() => !mine && setFullStage(!full)}
+        onContextMenu={stageVolume.onContextMenu}
       >
         {mine ? (
           <div className="stage-self">
             <p>You're sharing your screen</p>
+            <p className="stage-self-note">{shareAudioNote(voice.shareAudio)}</p>
             <button type="button" className="btn" onClick={stopShare}>
               Stop sharing
             </button>
@@ -181,6 +188,8 @@ export function VoiceStage({ voice }: { voice: VoiceSession }) {
             <span className="stage-label">
               <bdi>{stagePerson.name}</bdi>'s screen
             </span>
+            {stageVolume.button}
+            {stageVolume.popover}
             <IconButton
               className="stage-full-btn"
               label={full ? "Exit full window" : "Full window"}

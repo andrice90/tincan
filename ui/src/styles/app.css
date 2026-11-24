@@ -1265,6 +1265,20 @@ button.member-row:hover {
   color: #ffffff;
 }
 
+/* the share's sound volume, left of the full-window button */
+.stage-volume-btn {
+  position: absolute;
+  top: var(--sp-2);
+  right: calc(var(--sp-2) * 2 + 32px);
+  background: rgb(0 0 0 / 0.6);
+  color: #ffffff;
+}
+
+.stage-volume-btn:hover:not(:disabled) {
+  background: rgb(0 0 0 / 0.8);
+  color: #ffffff;
+}
+
 .stage-self {
   position: absolute;
   inset: 0;
@@ -1273,6 +1287,12 @@ button.member-row:hover {
   justify-items: center;
   gap: var(--sp-3);
   color: #e9eaec;
+}
+
+.stage-self-note {
+  margin-top: calc(-1 * var(--sp-2));
+  font-size: var(--fs-12);
+  color: #a4a9b0;
 }
 
 .stage-self .btn {
@@ -1779,6 +1799,15 @@ button.clip-tile.is-playing:hover:not(:disabled) {
 .mode-note {
   font-size: var(--fs-12);
   color: var(--text-2);
+}
+
+.share-audio {
+  margin-top: var(--sp-4);
+}
+
+.share-audio-text {
+  display: grid;
+  gap: 2px;
 }
 
 /* settings */

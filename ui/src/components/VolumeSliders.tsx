@@ -1,11 +1,14 @@
-// Volume sliders for the right-click menus: a person's overall and soundboard volume
-// (member list, voice tiles) and a voice room's soundboard volume (channel list).
+// Volume sliders for the right-click menus: a person's overall, soundboard and (while they
+// share their screen in my session) screen share volume (member list, voice tiles), and a
+// voice room's soundboard volume (channel list).
 
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "../api/client";
 import type { ChannelId, UserId } from "../api/types";
 import { setRoomSoundboardVolume, setUserSoundboardVolume, setUserVolume } from "../store/actions";
 import { initialVolume, shouldSend } from "../store/calls";
+import { useStore } from "../store/store";
+import { ShareVolumeSlider } from "./ShareVolume";
 
 /** Volumes picked in this session (0..2); the app's saved values seed them. */
 const picked = {
@@ -54,7 +57,8 @@ function PercentSlider({ id, label, start, onPick, onCommit }: { id: string; lab
 /**
  * Someone's volume and soundboard volume. `known` are the values a voice session reported;
  * without them the saved values are asked for (`user_volume`), and nothing shows until they
- * arrive, so a release can never save a made-up 100%.
+ * arrive, so a release can never save a made-up 100%. While they share their screen in my
+ * voice session, their screen share volume follows.
  */
 export function PersonVolumes({ userId, known }: { userId: UserId; known?: { volume: number | null; soundboardVolume: number | null } }) {
   const [saved, setSaved] = useState<{ volume: number; soundboardVolume: number } | null>(
@@ -73,6 +77,7 @@ export function PersonVolumes({ userId, known }: { userId: UserId; known?: { vol
   }, [userId, saved]);
   const voice = initialVolume(picked.voice.get(userId), saved?.volume ?? null);
   const sound = initialVolume(picked.sound.get(userId), saved?.soundboardVolume ?? null);
+  const sharer = useStore((s) => s.voice?.participants.find((p) => p.userId === userId && p.screenTrack !== null));
   return (
     <div className="volume-sliders">
       {voice !== null && (
@@ -93,6 +98,7 @@ export function PersonVolumes({ userId, known }: { userId: UserId; known?: { vol
           onCommit={(v) => setUserSoundboardVolume(userId, v)}
         />
       )}
+      {sharer && <ShareVolumeSlider p={sharer} />}
     </div>
   );
 }

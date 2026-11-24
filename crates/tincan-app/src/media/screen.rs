@@ -6,12 +6,19 @@
 //! the app's wiring (keyframe requests, bitrate, watching, ending) runs in tests without a
 //! GPU. `ScreenShare::stop` and its `Drop` join the capture thread, so every share is
 //! stopped on a blocking thread.
+//!
+//! Share audio (`screen_start { audio: true }`) is a `tincan_audio::ShareAudio` feeding
+//! `MediaSession::share_audio_out`: the shared window's process tree, or for a display
+//! everything except Tincan's own process tree (so viewers never get the call back). If it
+//! cannot be captured the share goes on without sound and a toast says so; there is no
+//! fallback to plain system loopback. The test pattern sends a synthetic tone.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use tincan_audio::{ShareAudio, ShareAudioSource};
 use tincan_core::media::VideoFrame;
 use tincan_screen::{EndReason, ScreenShare, ShareMode};
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -35,6 +42,37 @@ pub(super) struct ActiveShare {
     /// Distinguishes shares (a late end notice must not stop a newer one).
     pub id: u64,
     imp: ShareImpl,
+    /// Its audio, when shared, and what it captures.
+    audio: Option<(ShareAudio, dto::ShareAudio)>,
+}
+
+/// Shown when the share's sound could not be captured.
+const NO_SOUND: &str = "Couldn't capture audio for this share, so only the picture is shared.";
+/// Shown when the shared window's app started Tincan (its sound would include the call).
+const ANCESTOR_SOUND: &str = "Audio from that window can't be shared because Tincan runs inside it. Only the picture is shared.";
+
+/// Shown when the share's audio capture stops while the picture goes on.
+const AUDIO_STOPPED: &str = "Audio capture stopped, so only the picture is shared now.";
+/// How often a running share's audio capture is checked.
+const AUDIO_CHECK: Duration = Duration::from_secs(1);
+
+/// What share audio captures for `source_id`, or the notice to show instead.
+fn share_audio_source(source_id: &str, synthetic: bool) -> Result<(ShareAudioSource, dto::ShareAudio), &'static str> {
+    if synthetic {
+        return Ok((ShareAudioSource::TestTone, dto::ShareAudio::System));
+    }
+    if source_id.starts_with("display:") {
+        return Ok((ShareAudioSource::AllExcept(std::process::id()), dto::ShareAudio::System));
+    }
+    #[cfg(windows)]
+    if let Some(hwnd) = source_id.strip_prefix("window:").and_then(|h| h.parse::<usize>().ok()) {
+        let pid = tincan_audio::window_process_id(hwnd as isize).ok_or(NO_SOUND)?;
+        if tincan_audio::is_self_or_ancestor(pid) {
+            return Err(ANCESTOR_SOUND);
+        }
+        return Ok((ShareAudioSource::ProcessTree(pid), dto::ShareAudio::App));
+    }
+    Err(NO_SOUND)
 }
 
 enum ShareImpl {
@@ -58,8 +96,22 @@ impl ActiveShare {
         }
     }
 
+    /// What the share's audio captures (`Off` when none, or when its capture stopped).
+    pub(super) fn audio_kind(&self) -> dto::ShareAudio {
+        match &self.audio {
+            Some((a, kind)) if a.is_running() => *kind,
+            _ => dto::ShareAudio::Off,
+        }
+    }
+
+    /// Share-audio datagrams sent so far (test counters).
+    pub(super) fn audio_packets(&self) -> u64 { self.audio.as_ref().map_or(0, |(a, _)| a.packets_sent()) }
+
     /// Stop and wait for the capture thread to finish (on a blocking thread).
     pub(super) async fn stop(self) {
+        if let Some((a, _)) = self.audio {
+            let _ = tokio::task::spawn_blocking(move || a.stop()).await;
+        }
         match self.imp {
             ShareImpl::Screen(s) => {
                 let _ = tokio::task::spawn_blocking(move || s.stop()).await;
@@ -70,6 +122,9 @@ impl ActiveShare {
 
     /// Stop without waiting.
     pub(super) fn stop_in_background(self) {
+        if let Some((a, _)) = self.audio {
+            tokio::task::spawn_blocking(move || a.stop());
+        }
         match self.imp {
             ShareImpl::Screen(s) => {
                 tokio::task::spawn_blocking(move || s.stop());
@@ -178,7 +233,7 @@ impl Media {
     }
 
     /// `screen_start`: returns my screen track id.
-    pub(super) async fn screen_start(&self, core: &Arc<Core>, source_id: &str, mode: dto::ShareMode) -> Result<u16, String> {
+    pub(super) async fn screen_start(&self, core: &Arc<Core>, source_id: &str, mode: dto::ShareMode, audio: bool) -> Result<u16, String> {
         let _ops = self.ops.lock().await;
         if self.st.lock().attached.is_none() {
             return Err("not-in-voice".into());
@@ -219,7 +274,7 @@ impl Media {
             ShareImpl::Screen(s) => Some(s.ended()),
             ShareImpl::Synthetic { .. } => None,
         };
-        let share = ActiveShare { id, imp };
+        let share = ActiveShare { id, imp, audio: None };
         let refused = {
             let mut st = self.st.lock();
             if st.attached.is_none() {
@@ -250,8 +305,75 @@ impl Media {
             });
         }
         tracing::info!(track, synthetic, "screen share started");
+        if audio {
+            self.start_share_audio(core, id, source_id, synthetic).await;
+        }
         self.reconcile(core);
         Ok(track)
+    }
+
+    /// Start the sound of share `id` (already running). On failure the share goes on
+    /// without sound and a toast says why.
+    async fn start_share_audio(&self, core: &Arc<Core>, id: u64, source_id: &str, synthetic: bool) {
+        let Some(out) = self.st.lock().attached.as_ref().map(|a| a.share_audio_out.clone()) else { return };
+        let (source, kind) = match share_audio_source(source_id, synthetic) {
+            Ok(s) => s,
+            Err(notice) => {
+                core.toast(ToastKind::Info, notice);
+                return;
+            }
+        };
+        let audio = match tokio::task::spawn_blocking(move || ShareAudio::start(source, out)).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, ?source, "share audio could not start");
+                core.toast(ToastKind::Info, NO_SOUND);
+                return;
+            }
+            Err(_) => {
+                core.toast(ToastKind::Info, NO_SOUND);
+                return;
+            }
+        };
+        tracing::info!(?source, "share audio started");
+        let left = {
+            let mut st = self.st.lock();
+            match st.share.as_mut().filter(|s| s.id == id) {
+                Some(s) => {
+                    s.audio = Some((audio, kind));
+                    None
+                }
+                // The share ended while its sound was starting.
+                None => Some(audio),
+            }
+        };
+        if let Some(a) = left {
+            let _ = tokio::task::spawn_blocking(move || a.stop()).await;
+            return;
+        }
+        // A capture that stops by itself mid-share (device or session gone) is told, and the
+        // stage stops saying audio goes out. Stopping the share takes it out of `st.share`
+        // first, so that never counts.
+        let weak = Arc::downgrade(core);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(AUDIO_CHECK).await;
+                let Some(core) = weak.upgrade() else { return };
+                let died = {
+                    let st = core.media.st.lock();
+                    match st.share.as_ref().filter(|s| s.id == id).and_then(|s| s.audio.as_ref()) {
+                        Some((a, _)) => !a.is_running(),
+                        None => return,
+                    }
+                };
+                if died {
+                    tracing::warn!("share audio capture stopped during the share");
+                    core.toast(ToastKind::Info, AUDIO_STOPPED);
+                    core.media.reconcile(&core);
+                    return;
+                }
+            }
+        });
     }
 
     /// A share ended by itself (window closed, capture failed).
@@ -321,10 +443,18 @@ impl Media {
         Ok(())
     }
 
-    /// `screen_unwatch`.
+    /// `screen_unwatch`: the picture and the share's sound stop.
     pub(super) fn screen_unwatch(&self, core: &Arc<Core>, track: u16) {
         self.watchers.lock().remove(&track);
         core.net.unsubscribe_track(track);
+        self.drop_share_audio(track);
+    }
+
+    /// Forget the sound of screen track `track` in the engine (no longer watched).
+    pub(super) fn drop_share_audio(&self, track: u16) {
+        if let (Some(e), Some(t)) = (self.engine_handle(), tincan_core::media::share_audio_of_screen(track)) {
+            e.remove_track(t);
+        }
     }
 }
 
@@ -339,6 +469,17 @@ mod tests {
         assert!(h264_is_keyframe(&k));
         assert_eq!(h264_codec_string(&k).as_deref(), Some("avc1.42c01f"));
         assert!(!h264_is_keyframe(&synthetic_au(4, false)));
+    }
+
+    #[test]
+    fn share_audio_targets_follow_the_source() {
+        assert_eq!(share_audio_source("test:pattern", true), Ok((ShareAudioSource::TestTone, dto::ShareAudio::System)));
+        // A display share captures everything except Tincan's own process tree.
+        assert_eq!(share_audio_source("display:0", false), Ok((ShareAudioSource::AllExcept(std::process::id()), dto::ShareAudio::System)));
+        // A window that does not exist, or a malformed id: no sound, never a wider capture.
+        assert_eq!(share_audio_source("window:0", false), Err(NO_SOUND));
+        assert_eq!(share_audio_source("window:nope", false), Err(NO_SOUND));
+        assert_eq!(share_audio_source("weird", false), Err(NO_SOUND));
     }
 
     #[test]

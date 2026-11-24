@@ -35,17 +35,23 @@ pub mod dsp;
 mod engine;
 mod error;
 pub mod jitter;
+#[cfg(windows)]
+mod loopback;
 mod processor;
 mod resample;
 mod ring;
+mod share;
 
 use std::sync::Arc;
 
 pub use clip::{CLIP_LENGTH_TOLERANCE_MS, CLIP_RATE, ClipPcm, decode_clip};
-pub use codec::{EncoderSettings, LibOpus, OpusCodec, OpusDecode, OpusEncode};
+pub use codec::{EncoderSettings, LibOpus, OpusCodec, OpusDecode, OpusEncode, StereoSettings};
 pub use engine::AudioEngine;
 pub use error::{AudioError, Result};
 pub use jitter::JitterConfig;
+#[cfg(windows)]
+pub use loopback::{is_self_or_ancestor, window_process_id};
+pub use share::{MAX_BACKLOG_MS, SHARE_FRAME, SHARE_MAX_PAYLOAD, ShareAudio, ShareAudioSource};
 
 /// Samples in one 10 ms frame at 48 kHz: the unit [`AudioSource`] and [`AudioSink`] work in.
 pub const FRAME_SAMPLES_10MS: usize = 480;

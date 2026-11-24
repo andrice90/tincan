@@ -22,7 +22,11 @@ export function leaveCommand(voice: VoiceSession | null, call: CallInfo | null):
  * not joined (the app reports saved volumes only for joined rooms and calls; the menu then
  * asks for them with `user_volume`).
  */
-export type TilePerson = Omit<VoiceParticipant, "volume" | "soundboardVolume"> & { volume: number | null; soundboardVolume: number | null };
+export type TilePerson = Omit<VoiceParticipant, "volume" | "soundboardVolume" | "shareVolume"> & {
+  volume: number | null;
+  soundboardVolume: number | null;
+  shareVolume?: number;
+};
 
 /**
  * Where a volume slider starts: this session's choice, else the saved volume. Null when

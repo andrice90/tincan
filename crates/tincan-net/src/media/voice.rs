@@ -31,8 +31,8 @@ use super::recv::{self, Pause, VideoSink, spawn_video_rx};
 use super::sfu::{LocalPeer, MEDIA_TICK, Sfu};
 use super::stats::RxStats;
 use super::track::{KEYFRAME_EVERY, VideoTrack, ViewerId};
-use super::wire::{CtlTx, OutError, VideoOut, stamp_audio};
-use super::{AUDIO_IN_QUEUE, AUDIO_OUT_QUEUE, MediaSession, RELAYED_VIEWER_BPS, VIDEO_IN_QUEUE, VIDEO_MAX_BPS, VoiceInfo};
+use super::wire::{CtlTx, OutError, VideoOut, stamp_audio, stamp_share_audio};
+use super::{AUDIO_IN_QUEUE, AUDIO_OUT_QUEUE, MediaSession, RELAYED_VIEWER_BPS, SHARE_AUDIO_QUEUE, VIDEO_IN_QUEUE, VIDEO_MAX_BPS, VoiceInfo};
 use crate::events::NetEvent;
 use crate::inner::Inner;
 use crate::link::Tasks;
@@ -145,6 +145,7 @@ impl VoiceHandle {
 /// Start a session. `short_id`/`epoch` are the best known values (re-stamped later).
 pub(crate) fn spawn(net: &Arc<Inner>, kind: VoiceKind, conv: ConvId, short_id: u16, epoch: u64, call_id: u64) -> (VoiceHandle, MediaSession) {
     let (audio_out, audio_out_rx) = mpsc::channel(AUDIO_OUT_QUEUE);
+    let (share_audio_out, share_audio_rx) = mpsc::channel(SHARE_AUDIO_QUEUE);
     let (audio_in_tx, audio_in) = mpsc::channel(AUDIO_IN_QUEUE);
     let (video_tx, video_in) = mpsc::channel(VIDEO_IN_QUEUE);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -181,8 +182,8 @@ pub(crate) fn spawn(net: &Arc<Inner>, kind: VoiceKind, conv: ConvId, short_id: u
         pause: net.media.pause(),
         report_at: None,
     };
-    net.tasks.spawn(actor.run(cmd_rx, remote_rx, audio_out_rx));
-    let session = MediaSession { conv, local_track, epoch: epoch_byte, audio_out, audio_in, video_in };
+    net.tasks.spawn(actor.run(cmd_rx, remote_rx, audio_out_rx, share_audio_rx));
+    let session = MediaSession { conv, local_track, epoch: epoch_byte, audio_out, share_audio_out, audio_in, video_in };
     (VoiceHandle { kind, conv, cmd: cmd_tx, remote: remote_tx, info }, session)
 }
 
@@ -232,8 +233,15 @@ async fn sleep_opt(at: Option<Instant>) {
 }
 
 impl Voice {
-    async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<VoiceCmd>, mut remote_rx: mpsc::Receiver<VoiceCmd>, mut audio_out: mpsc::Receiver<Bytes>) {
+    async fn run(
+        mut self,
+        mut cmd_rx: mpsc::UnboundedReceiver<VoiceCmd>,
+        mut remote_rx: mpsc::Receiver<VoiceCmd>,
+        mut audio_out: mpsc::Receiver<Bytes>,
+        mut share_audio: mpsc::Receiver<Bytes>,
+    ) {
         let mut audio_open = true;
+        let mut share_audio_open = true;
         loop {
             tokio::select! {
                 biased;
@@ -259,6 +267,10 @@ impl Voice {
                 p = audio_out.recv(), if audio_open => match p {
                     Some(p) => self.send_audio(p),
                     None => audio_open = false,
+                },
+                p = share_audio.recv(), if share_audio_open => match p {
+                    Some(p) => self.send_share_audio(p),
+                    None => share_audio_open = false,
                 },
                 f = next_frame(&mut self.share) => match f {
                     Some(f) => {
@@ -351,7 +363,13 @@ impl Voice {
                 let (conn, ctl, peer) = (conn.clone(), ctl.clone(), *peer);
                 let (short_id, epoch) = (*short_id, *epoch);
                 self.set_ids(short_id, epoch);
-                self.rx_tasks.push(self.tasks.spawn(recv::audio_rx(conn.clone(), self.own_voice.clone(), self.audio_in.clone(), self.stats.clone())));
+                self.rx_tasks.push(self.tasks.spawn(recv::audio_rx(
+                    conn.clone(),
+                    self.own_voice.clone(),
+                    self.audio_in.clone(),
+                    self.stats.clone(),
+                    self.subs.clone(),
+                )));
                 let sink = Arc::new(SessionSink { video_in: self.video_in.clone(), subs: self.subs.clone(), stats: self.stats.clone(), cmd: self.remote_tx.clone() });
                 self.rx_tasks.push(spawn_video_rx(&self.tasks, conn.clone(), sink, self.pause.clone()));
                 if let VoiceKind::Room { channel, .. } = self.kind {
@@ -402,6 +420,24 @@ impl Voice {
                 let _ = conn.send_datagram(p);
             }
             Transport::Sfu { sfu, .. } => sfu.inject_local(p),
+            Transport::None => {}
+        }
+    }
+
+    /// Share audio from the app: only while I share, to those who watch my share (the host
+    /// forwards it to its subscribers; a call peer gets it only while watching).
+    fn send_share_audio(&self, pkt: Bytes) {
+        if self.share.is_none() {
+            return;
+        }
+        let Some(p) = stamp_share_audio(pkt, self.short_id, self.epoch) else { return };
+        match &self.transport {
+            Transport::Remote { conn, .. } => {
+                if matches!(self.kind, VoiceKind::Room { .. }) || self.peer_watching {
+                    let _ = conn.send_datagram(p);
+                }
+            }
+            Transport::Sfu { sfu, .. } => sfu.inject_local_share_audio(p),
             Transport::None => {}
         }
     }

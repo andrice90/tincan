@@ -148,6 +148,8 @@ export interface VoiceParticipant {
   volume: number;
   /** How loud their soundboard clips are for me, on top of `volume` (0..2, saved per user; 1 for me). */
   soundboardVolume: number;
+  /** How loud their screen share's sound is for me (0..2, saved per sharer; 1 for me). */
+  shareVolume: number;
 }
 
 /** `user_volume`: both saved volumes of a person (1 when never changed). */
@@ -155,6 +157,12 @@ export interface UserVolume {
   volume: number;
   soundboardVolume: number;
 }
+
+/**
+ * What my screen share sends besides the picture: nothing, the shared window's app, or
+ * everything the PC plays except Tincan (a shared display).
+ */
+export type ShareAudio = "off" | "app" | "system";
 
 export interface VoiceSession {
   /** Server voice room or DM call. */
@@ -166,6 +174,8 @@ export interface VoiceSession {
   muted: boolean;
   deafened: boolean;
   sharing: boolean;
+  /** The sound my share sends ("off" when not sharing, turned off, or not capturable). */
+  shareAudio: ShareAudio;
   path: PathKind;
   rttMs: number | null;
   /** Hashes of my clips playing now: from `clip_play` until they end or `clip_stop`. */
@@ -326,10 +336,16 @@ export interface Commands {
   /** The soundboard volume of a voice room: a local multiplier on every clip I hear there (0..2, saved). */
   room_soundboard_volume: { args: { channelId: ChannelId }; result: number };
   set_room_soundboard_volume: { args: { channelId: ChannelId; volume: number }; result: null };
+  /** How loud `userId`'s screen share sound plays (0..2), saved per sharer. */
+  set_share_volume: { args: { userId: UserId; volume: number }; result: null };
 
   screen_sources: { args: {}; result: ScreenSource[] };
-  /** Error string "no-hardware-encoder" when unsupported on this machine. */
-  screen_start: { args: { sourceId: string; mode: ShareMode }; result: number };
+  /**
+   * Error string "no-hardware-encoder" when unsupported on this machine. `audio` shares the
+   * window's app sound, or for a display everything except Tincan (absent: no sound). When
+   * the sound can't be captured the share starts anyway and a toast says so.
+   */
+  screen_start: { args: { sourceId: string; mode: ShareMode; audio?: boolean }; result: number };
   screen_stop: { args: {}; result: null };
   /**
    * Start receiving a screen share. `onFrame` is a Tauri Channel<ArrayBuffer>; each message is

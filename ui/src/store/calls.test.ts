@@ -12,6 +12,7 @@ function voice(kind: "room" | "call"): VoiceSession {
     muted: false,
     deafened: false,
     sharing: false,
+    shareAudio: "off",
     path: "direct",
     rttMs: null,
     playingClips: [],
