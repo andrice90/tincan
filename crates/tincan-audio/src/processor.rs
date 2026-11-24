@@ -695,6 +695,7 @@ impl Processor {
             }
         }
         let delay = self.aec_delay_ms;
+        let muted = self.muted || self.deafened;
         let Some(call) = &mut self.call else { return };
         if frame.len() != FRAME_10MS {
             return;
@@ -702,6 +703,11 @@ impl Processor {
         call.apm.set_delay_ms(delay);
         call.apm.capture(frame);
         if let Some(d) = &mut call.denoise {
+            // The denoiser sends its input 50 ms late: give it silence while muted, or the
+            // first 50 ms after unmuting would carry what was said while muted.
+            if muted {
+                frame.fill(0.0);
+            }
             d.process(frame);
         }
         call.pcm20[call.pcm20_len..call.pcm20_len + FRAME_10MS].copy_from_slice(frame);
@@ -992,6 +998,23 @@ mod tests {
         assert!(p.call.as_ref().unwrap().denoise.is_none());
         run(&mut p, 100, 50, speech);
         assert!(!drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(not(dpdfnet_model), ignore = "needs scripts/fetch-dpdfnet.ps1")]
+    fn ai_noise_suppression_sends_nothing_said_while_muted() {
+        let (mut p, _ev) = processor();
+        p.set_processing(true, true, true);
+        let _rx = start(&mut p, 4);
+        p.set_muted(true);
+        run(&mut p, 0, 100, |i| speech(i) * 4.0);
+        p.set_muted(false);
+        // the first 20 ms sent after unmuting: the denoiser's 50 ms delay must not carry
+        // muted speech into it
+        run(&mut p, 100, 2, |_| 0.0);
+        let sent = &p.call.as_ref().unwrap().send;
+        let peak = sent.iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 1e-4, "muted audio leaked after unmute: peak {peak}");
     }
 
     #[test]
