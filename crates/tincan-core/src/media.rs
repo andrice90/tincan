@@ -7,6 +7,11 @@ use bytes::Bytes;
 pub const KIND_VOICE: u16 = 0;
 /// Track kinds (low 2 bits of a track id): screen share.
 pub const KIND_SCREEN: u16 = 1;
+/// Track kinds (low 2 bits of a track id): the audio of a screen share. It rides the same
+/// audio datagrams as voice (`AUDIO_MAGIC`), Opus 48 kHz stereo, and is forwarded only to
+/// those watching the matching `KIND_SCREEN` track. Builds from before this kind drop it:
+/// their receivers and hosts accept only `KIND_VOICE` datagrams.
+pub const KIND_SHARE_AUDIO: u16 = 2;
 /// Largest short id that fits in a track id (14 bits).
 pub const MAX_SHORT_ID: u16 = 0x3FFF;
 
@@ -16,6 +21,16 @@ pub fn track_id(short_id: u16, kind: u16) -> u16 { short_id.wrapping_mul(4) | (k
 pub fn track_short_id(track: u16) -> u16 { track >> 2 }
 /// The kind part of a track id.
 pub fn track_kind(track: u16) -> u16 { track & 3 }
+/// The screen track whose watchers get the share-audio track `track` (same short id).
+/// None if `track` is not a share-audio track.
+pub fn screen_of_share_audio(track: u16) -> Option<u16> {
+    (track_kind(track) == KIND_SHARE_AUDIO).then(|| track_id(track_short_id(track), KIND_SCREEN))
+}
+/// The share-audio track that goes with the screen track `track`. None if `track` is not a
+/// screen track.
+pub fn share_audio_of_screen(track: u16) -> Option<u16> {
+    (track_kind(track) == KIND_SCREEN).then(|| track_id(track_short_id(track), KIND_SHARE_AUDIO))
+}
 
 // ---------------------------------------------------------------- audio datagrams
 
@@ -315,6 +330,30 @@ mod tests {
         assert_eq!(track_kind(t), KIND_SCREEN);
         // kind is masked to 2 bits
         assert_eq!(track_id(1, 7), 7);
+    }
+
+    #[test]
+    fn share_audio_tracks_pair_with_screen_tracks() {
+        // The kinds stay distinct and in their wire positions (never renumbered).
+        assert_eq!((KIND_VOICE, KIND_SCREEN, KIND_SHARE_AUDIO), (0, 1, 2));
+        let audio = track_id(5, KIND_SHARE_AUDIO);
+        assert_eq!(audio, 22);
+        assert_eq!(track_short_id(audio), 5);
+        assert_eq!(track_kind(audio), KIND_SHARE_AUDIO);
+        assert_eq!(screen_of_share_audio(audio), Some(track_id(5, KIND_SCREEN)));
+        assert_eq!(share_audio_of_screen(track_id(5, KIND_SCREEN)), Some(audio));
+        assert_eq!(screen_of_share_audio(track_id(5, KIND_VOICE)), None);
+        assert_eq!(screen_of_share_audio(track_id(5, KIND_SCREEN)), None);
+        assert_eq!(share_audio_of_screen(track_id(5, KIND_VOICE)), None);
+        assert_eq!(share_audio_of_screen(audio), None);
+        let top = track_id(MAX_SHORT_ID, KIND_SHARE_AUDIO);
+        assert_eq!(screen_of_share_audio(top), Some(track_id(MAX_SHORT_ID, KIND_SCREEN)));
+        // A share-audio datagram is an ordinary audio datagram: same header, other kind.
+        let pkt = AudioHeader { track: audio, seq: 1, ts: 960, ..AudioHeader::default() }.packet(b"stereo");
+        let (h, payload) = AudioHeader::parse(&pkt).unwrap();
+        assert_eq!(track_kind(h.track), KIND_SHARE_AUDIO);
+        assert_eq!(payload, b"stereo");
+        assert_eq!(audio_track_of(&pkt), Some(audio));
     }
 
     #[test]

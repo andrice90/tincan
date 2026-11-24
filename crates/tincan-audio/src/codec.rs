@@ -2,15 +2,18 @@
 //!
 //! The engine only talks to the [`OpusCodec`], [`OpusEncode`] and [`OpusDecode`] traits, so the
 //! unmaintained `unsafe-libopus` (libopus 1.3.1 transpiled to Rust) can be swapped for another
-//! Opus implementation later. Everything is fixed at 48 kHz mono, which is all Tincan uses.
+//! Opus implementation later. Voice is 48 kHz mono; screen share audio is 48 kHz stereo
+//! ([`StereoSettings`], music application). A mono decoder also decodes stereo packets (libopus
+//! downmixes), which is how the engine plays share audio.
 
 use crate::error::{AudioError, Result};
 use unsafe_libopus::{
-    OPUS_ALLOC_FAIL, OPUS_APPLICATION_VOIP, OPUS_BAD_ARG, OPUS_BUFFER_TOO_SMALL,
+    OPUS_ALLOC_FAIL, OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_VOIP, OPUS_BAD_ARG, OPUS_BUFFER_TOO_SMALL,
     OPUS_GET_IN_DTX_REQUEST, OPUS_INTERNAL_ERROR, OPUS_INVALID_PACKET, OPUS_INVALID_STATE,
     OPUS_OK, OPUS_RESET_STATE, OPUS_SET_BITRATE_REQUEST, OPUS_SET_COMPLEXITY_REQUEST,
     OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
-    OPUS_SET_SIGNAL_REQUEST, OPUS_SET_VBR_REQUEST, OPUS_SIGNAL_VOICE, OPUS_UNIMPLEMENTED,
+    OPUS_SET_SIGNAL_REQUEST, OPUS_SET_VBR_REQUEST, OPUS_SIGNAL_MUSIC, OPUS_SIGNAL_VOICE,
+    OPUS_UNIMPLEMENTED,
     OpusDecoder, OpusEncoder, opus_decode_float, opus_decoder_create, opus_decoder_ctl_impl,
     opus_decoder_destroy, opus_encode_float, opus_encoder_create, opus_encoder_ctl_impl,
     opus_encoder_destroy, varargs,
@@ -43,11 +46,27 @@ impl Default for EncoderSettings {
     }
 }
 
-/// A 48 kHz mono Opus encoder (VOIP application, voice signal).
+/// Settings of a stereo (screen share audio) encoder: music application, VBR, no FEC (music
+/// is coded by CELT, which has none), no DTX.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StereoSettings {
+    /// Target bitrate in bits per second.
+    pub bitrate_bps: i32,
+    /// Encoder complexity 0..=10.
+    pub complexity: i32,
+}
+
+impl Default for StereoSettings {
+    fn default() -> Self {
+        Self { bitrate_bps: 128_000, complexity: 8 }
+    }
+}
+
+/// A 48 kHz Opus encoder: mono VOIP for voice, or stereo music for share audio.
 pub trait OpusEncode: Send {
-    /// Encodes one frame (`pcm.len()` must be a valid Opus frame size at 48 kHz, Tincan uses
-    /// 960 = 20 ms) into `out` and returns the packet length. A length of 1 or 2 bytes is a DTX
-    /// frame that should not be transmitted.
+    /// Encodes one frame into `out` and returns the packet length. `pcm` holds one frame of a
+    /// valid Opus frame size at 48 kHz per channel (Tincan uses 960 = 20 ms), interleaved for
+    /// stereo. A length of 1 or 2 bytes is a DTX frame that should not be transmitted.
     fn encode(&mut self, pcm: &[f32], out: &mut [u8]) -> Result<usize>;
     /// Sets the target bitrate in bits per second.
     fn set_bitrate(&mut self, bps: i32) -> Result<()>;
@@ -59,9 +78,10 @@ pub trait OpusEncode: Send {
     fn in_dtx(&mut self) -> Result<bool>;
 }
 
-/// A 48 kHz mono Opus decoder.
+/// A 48 kHz Opus decoder (mono, or stereo with interleaved output). Sizes below are per
+/// channel.
 pub trait OpusDecode: Send {
-    /// Decodes `packet` into `out` and returns the number of samples written.
+    /// Decodes `packet` into `out` and returns the number of samples written per channel.
     fn decode(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize>;
     /// Reconstructs the frame *before* `next_packet` from its in-band FEC data (falls back to
     /// packet loss concealment when the packet carries none). `out.len()` must equal the
@@ -77,8 +97,16 @@ pub trait OpusDecode: Send {
 pub trait OpusCodec: Send + Sync {
     /// Creates a 48 kHz mono VOIP encoder with `settings` applied.
     fn encoder(&self, settings: &EncoderSettings) -> Result<Box<dyn OpusEncode>>;
-    /// Creates a 48 kHz mono decoder.
+    /// Creates a 48 kHz mono decoder (it also decodes stereo packets, downmixed).
     fn decoder(&self) -> Result<Box<dyn OpusDecode>>;
+    /// Creates a 48 kHz stereo music encoder (screen share audio). The default refuses.
+    fn stereo_encoder(&self, _settings: &StereoSettings) -> Result<Box<dyn OpusEncode>> {
+        Err(opus_error(OPUS_UNIMPLEMENTED))
+    }
+    /// Creates a 48 kHz stereo decoder with interleaved output. The default refuses.
+    fn stereo_decoder(&self) -> Result<Box<dyn OpusDecode>> {
+        Err(opus_error(OPUS_UNIMPLEMENTED))
+    }
 }
 
 /// [`OpusCodec`] backed by `unsafe-libopus` (pure Rust libopus 1.3.1).
@@ -91,7 +119,15 @@ impl OpusCodec for LibOpus {
     }
 
     fn decoder(&self) -> Result<Box<dyn OpusDecode>> {
-        Ok(Box::new(LibOpusDecoder::new()?))
+        Ok(Box::new(LibOpusDecoder::new(1)?))
+    }
+
+    fn stereo_encoder(&self, settings: &StereoSettings) -> Result<Box<dyn OpusEncode>> {
+        Ok(Box::new(LibOpusEncoder::stereo(settings)?))
+    }
+
+    fn stereo_decoder(&self) -> Result<Box<dyn OpusDecode>> {
+        Ok(Box::new(LibOpusDecoder::new(2)?))
     }
 }
 
@@ -125,6 +161,7 @@ fn len_i32(n: usize) -> i32 {
 /// Encoder state owned exclusively by this value.
 struct LibOpusEncoder {
     st: std::ptr::NonNull<OpusEncoder>,
+    channels: usize,
 }
 
 // SAFETY: the encoder state is a plain heap block owned exclusively by this value and only
@@ -132,13 +169,17 @@ struct LibOpusEncoder {
 unsafe impl Send for LibOpusEncoder {}
 
 impl LibOpusEncoder {
-    fn new(s: &EncoderSettings) -> Result<Self> {
+    fn create(channels: usize, application: i32) -> Result<Self> {
         let mut err = 0i32;
         // SAFETY: valid rate/channels/application constants and a valid out pointer.
-        let raw = unsafe { opus_encoder_create(OPUS_RATE as i32, 1, OPUS_APPLICATION_VOIP, &mut err) };
+        let raw = unsafe { opus_encoder_create(OPUS_RATE as i32, len_i32(channels), application, &mut err) };
         check(err)?;
         let st = std::ptr::NonNull::new(raw).ok_or(opus_error(OPUS_ALLOC_FAIL))?;
-        let mut enc = Self { st };
+        Ok(Self { st, channels })
+    }
+
+    fn new(s: &EncoderSettings) -> Result<Self> {
+        let mut enc = Self::create(1, OPUS_APPLICATION_VOIP)?;
         enc.ctl(OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_VOICE)?;
         enc.ctl(OPUS_SET_VBR_REQUEST, 1)?;
         enc.ctl(OPUS_SET_BITRATE_REQUEST, s.bitrate_bps)?;
@@ -146,6 +187,17 @@ impl LibOpusEncoder {
         enc.ctl(OPUS_SET_INBAND_FEC_REQUEST, i32::from(s.fec))?;
         enc.ctl(OPUS_SET_PACKET_LOSS_PERC_REQUEST, s.packet_loss_perc.clamp(0, 100))?;
         enc.ctl(OPUS_SET_DTX_REQUEST, i32::from(s.dtx))?;
+        Ok(enc)
+    }
+
+    fn stereo(s: &StereoSettings) -> Result<Self> {
+        let mut enc = Self::create(2, OPUS_APPLICATION_AUDIO)?;
+        enc.ctl(OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC)?;
+        enc.ctl(OPUS_SET_VBR_REQUEST, 1)?;
+        enc.ctl(OPUS_SET_BITRATE_REQUEST, s.bitrate_bps)?;
+        enc.ctl(OPUS_SET_COMPLEXITY_REQUEST, s.complexity.clamp(0, 10))?;
+        enc.ctl(OPUS_SET_INBAND_FEC_REQUEST, 0)?;
+        enc.ctl(OPUS_SET_DTX_REQUEST, 0)?;
         Ok(enc)
     }
 
@@ -164,16 +216,17 @@ impl Drop for LibOpusEncoder {
 
 impl OpusEncode for LibOpusEncoder {
     fn encode(&mut self, pcm: &[f32], out: &mut [u8]) -> Result<usize> {
-        if !valid_frame(pcm.len()) || out.is_empty() {
+        let frame = pcm.len() / self.channels;
+        if !pcm.len().is_multiple_of(self.channels) || !valid_frame(frame) || out.is_empty() {
             return Err(opus_error(OPUS_BAD_ARG));
         }
-        // SAFETY: pointers and lengths come from live slices; libopus reads `pcm.len()`
-        // samples and writes at most `out.len()` bytes.
+        // SAFETY: pointers and lengths come from live slices; libopus reads `frame` samples per
+        // channel (`pcm.len()` in all) and writes at most `out.len()` bytes.
         let n = unsafe {
             opus_encode_float(
                 self.st.as_ptr(),
                 pcm.as_ptr(),
-                len_i32(pcm.len()),
+                len_i32(frame),
                 out.as_mut_ptr(),
                 len_i32(out.len()),
             )
@@ -204,23 +257,25 @@ impl OpusEncode for LibOpusEncoder {
 /// Decoder state owned exclusively by this value.
 struct LibOpusDecoder {
     st: std::ptr::NonNull<OpusDecoder>,
+    channels: usize,
 }
 
 // SAFETY: see `LibOpusEncoder`.
 unsafe impl Send for LibOpusDecoder {}
 
 impl LibOpusDecoder {
-    fn new() -> Result<Self> {
+    fn new(channels: usize) -> Result<Self> {
         let mut err = 0i32;
-        // SAFETY: valid rate/channels and a valid out pointer.
-        let raw = unsafe { opus_decoder_create(OPUS_RATE as i32, 1, &mut err) };
+        // SAFETY: valid rate/channels (1 or 2) and a valid out pointer.
+        let raw = unsafe { opus_decoder_create(OPUS_RATE as i32, len_i32(channels), &mut err) };
         check(err)?;
         let st = std::ptr::NonNull::new(raw).ok_or(opus_error(OPUS_ALLOC_FAIL))?;
-        Ok(Self { st })
+        Ok(Self { st, channels })
     }
 
     fn run(&mut self, data: Option<&[u8]>, out: &mut [f32], fec: bool) -> Result<usize> {
-        if !valid_frame(out.len()) {
+        let frame = out.len() / self.channels;
+        if !out.len().is_multiple_of(self.channels) || !valid_frame(frame) {
             return Err(opus_error(OPUS_BAD_ARG));
         }
         let (ptr, len) = match data {
@@ -229,9 +284,9 @@ impl LibOpusDecoder {
             None => (std::ptr::null(), 0),
         };
         // SAFETY: `ptr`/`len` describe a live slice (or null/0 for PLC, which libopus accepts);
-        // libopus writes at most `out.len()` samples.
+        // libopus writes at most `frame` samples per channel, `out.len()` in all.
         let n = unsafe {
-            opus_decode_float(self.st.as_ptr(), ptr, len, out.as_mut_ptr(), len_i32(out.len()), i32::from(fec))
+            opus_decode_float(self.st.as_ptr(), ptr, len, out.as_mut_ptr(), len_i32(frame), i32::from(fec))
         };
         if n < 0 { Err(opus_error(n)) } else { Ok(n as usize) }
     }
@@ -335,6 +390,51 @@ mod tests {
         enc.set_dtx(false).unwrap();
         let n = enc.encode(&silence, &mut pkt).unwrap();
         assert!(n > 2, "DTX off sends every frame");
+    }
+
+    /// Share audio: stereo music encoder, a stereo decoder keeps the channels apart, and the
+    /// engine's mono decoder plays the same packets as a downmix.
+    #[test]
+    fn stereo_music_roundtrip_keeps_channels_and_downmixes() {
+        let codec = LibOpus;
+        let s = StereoSettings::default();
+        assert_eq!(s.bitrate_bps, 128_000);
+        let mut enc = codec.stereo_encoder(&s).unwrap();
+        let mut stereo = codec.stereo_decoder().unwrap();
+        let mut mono = codec.decoder().unwrap();
+        let mut pkt = [0u8; MAX_OPUS_PACKET];
+        // left: 440 Hz tone, right: silence
+        let frame = |k: usize| -> Vec<f32> {
+            (0..960)
+                .flat_map(|i| {
+                    let t = (k * 960 + i) as f32 / 48_000.0;
+                    [0.4 * (2.0 * std::f32::consts::PI * 440.0 * t).sin(), 0.0]
+                })
+                .collect()
+        };
+        let (mut out2, mut out1) = (vec![0f32; 1920], vec![0f32; 960]);
+        let (mut l, mut r, mut m, mut bytes) = (0f32, 0f32, 0f32, 0usize);
+        for k in 0..50 {
+            let n = enc.encode(&frame(k), &mut pkt).unwrap();
+            assert!(n > 2, "no DTX for share audio");
+            bytes += n;
+            assert_eq!(stereo.decode(&pkt[..n], &mut out2).unwrap(), 960);
+            assert_eq!(mono.decode(&pkt[..n], &mut out1).unwrap(), 960);
+            if k >= 5 {
+                l += out2.iter().step_by(2).map(|x| x * x).sum::<f32>();
+                r += out2.iter().skip(1).step_by(2).map(|x| x * x).sum::<f32>();
+                m += out1.iter().map(|x| x * x).sum::<f32>();
+            }
+        }
+        assert!(l > 100.0 * r.max(1e-3), "left {l} right {r}: the channels stay apart");
+        assert!(m > 0.1 * l, "mono downmix {m} carries the tone (left {l})");
+        // 50 frames = 1 s: near the 128 kbps target, far below the policer's cap
+        let kbps = bytes * 8 / 1000;
+        assert!((60..=200).contains(&kbps), "{kbps} kbps");
+        // a stereo frame must be 2 x a valid size
+        assert!(enc.encode(&[0.0; 960 * 2 + 2], &mut pkt).is_err());
+        assert!(stereo.decode(&pkt[..10], &mut [0f32; 961]).is_err());
+        assert_eq!(stereo.conceal(&mut out2).unwrap(), 960);
     }
 
     #[test]

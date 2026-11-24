@@ -17,13 +17,16 @@ use crate::jitter::{FRAME_MS, FRAME_SAMPLES, JitterBuffer, JitterConfig, Playout
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tincan_core::media::{AF_FEC, AF_SOUNDBOARD, AF_SPEAKING, AF_TALKSPURT, AUDIO_HEADER_LEN, AudioHeader};
+use tincan_core::media::{AF_FEC, AF_SOUNDBOARD, AF_SPEAKING, AF_TALKSPURT, AUDIO_HEADER_LEN, AudioHeader, KIND_SHARE_AUDIO, track_kind};
 use tokio::sync::mpsc;
 
 /// Samples per processing frame (10 ms at 48 kHz).
 pub(crate) const FRAME_10MS: usize = APM_FRAME;
 /// Remote tracks kept at once; packets for further track ids are ignored.
 pub(crate) const MAX_TRACKS: usize = 32;
+/// Screen share audio streams kept at once (separate from `MAX_TRACKS`); packets for
+/// further share-audio tracks are ignored.
+pub(crate) const MAX_SHARE_STREAMS: usize = 4;
 /// Clip voices playing at once; the oldest is cut when another starts.
 pub(crate) const MAX_VOICES: usize = 8;
 /// Gain applied to soundboard clips (in the call and locally), -3 dB.
@@ -192,6 +195,8 @@ pub(crate) struct Processor {
     deafened: bool,
     call: Option<CallState>,
     tracks: Vec<RemoteTrack>,
+    /// Screen share audio streams (`KIND_SHARE_AUDIO` tracks), see `push_share`.
+    share: Vec<RemoteTrack>,
     gains: HashMap<u16, f32>,
     voices: Vec<Voice>,
     mic_test: bool,
@@ -221,6 +226,7 @@ impl Processor {
             deafened: false,
             call: None,
             tracks: Vec::new(),
+            share: Vec::new(),
             gains: HashMap::new(),
             voices: Vec::new(),
             mic_test: false,
@@ -287,6 +293,7 @@ impl Processor {
                 self.emit(AudioEvent::Speaking { track: t.id, speaking: false });
             }
         }
+        self.share.clear();
         self.cancel_soundboard();
     }
 
@@ -301,6 +308,7 @@ impl Processor {
     }
 
     pub(crate) fn remove_track(&mut self, track: u16) {
+        self.share.retain(|t| t.id != track);
         if let Some(i) = self.tracks.iter().position(|t| t.id == track) {
             let t = self.tracks.swap_remove(i);
             if t.speaking.speaking() {
@@ -358,7 +366,7 @@ impl Processor {
 
     pub(crate) fn set_jitter_config(&mut self, cfg: JitterConfig) {
         self.settings.jitter = cfg;
-        for t in &mut self.tracks {
+        for t in self.tracks.iter_mut().chain(self.share.iter_mut()) {
             t.jb.set_config(cfg);
         }
     }
@@ -450,6 +458,10 @@ impl Processor {
         if h.track == own || opus.is_empty() || opus.len() > MAX_OPUS_PACKET {
             return;
         }
+        if track_kind(h.track) == KIND_SHARE_AUDIO {
+            self.push_share(&h, &pkt, now_ms);
+            return;
+        }
         let idx = match self.tracks.iter().position(|t| t.id == h.track) {
             Some(i) => i,
             None => {
@@ -519,6 +531,7 @@ impl Processor {
             }
             t.cursor += n;
         }
+        self.mix_share(out, now_ms, n);
         for v in &mut self.voices {
             let len = v.clip.len();
             if v.play_pos >= len {
@@ -666,6 +679,69 @@ impl Processor {
         call.seq = call.seq.wrapping_add(1);
         call.talkspurt = false;
         call.prev_sent = true;
+    }
+}
+
+// ---------------------------------------------------------------------- screen share audio
+
+impl Processor {
+    /// A share-audio datagram (`KIND_SHARE_AUDIO`): into that share's own jitter buffer. Its
+    /// Opus is stereo; the mono decoder plays it as a downmix. Share streams never report
+    /// speaking (the sharer's ring stays the voice's). Whether to play a share at all is the
+    /// caller's decision: the app hands over only the shares being watched.
+    fn push_share(&mut self, h: &AudioHeader, pkt: &Bytes, now_ms: u64) {
+        let idx = match self.share.iter().position(|t| t.id == h.track) {
+            Some(i) => i,
+            None => {
+                if self.share.len() >= MAX_SHARE_STREAMS {
+                    return;
+                }
+                let dec = match self.codec.decoder() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(%e, "opus decoder");
+                        return;
+                    }
+                };
+                self.share.push(RemoteTrack {
+                    id: h.track,
+                    jb: JitterBuffer::new(self.settings.jitter),
+                    dec,
+                    frame: vec![0.0; FRAME_SAMPLES],
+                    cursor: FRAME_SAMPLES,
+                    silent: true,
+                    last_peak: 0.0,
+                    speaking: RemoteSpeaking::default(),
+                });
+                self.share.len() - 1
+            }
+        };
+        self.share[idx].jb.push(h, pkt.slice(AUDIO_HEADER_LEN..), now_ms);
+    }
+
+    /// Adds the share streams to the mix (before the output gain and limiter, so the echo
+    /// canceller's render reference contains them and the mic does not send them back).
+    /// Silent while deafened; each stream has its own gain (`set_track_volume`).
+    fn mix_share(&mut self, out: &mut [f32], now_ms: u64, n: usize) {
+        let deaf = self.deafened;
+        for t in &mut self.share {
+            if t.cursor + n > FRAME_SAMPLES {
+                t.next_frame(now_ms);
+            }
+            let gain = self.gains.get(&t.id).copied().unwrap_or(1.0);
+            if !deaf && gain > 0.0 {
+                for (o, s) in out.iter_mut().zip(&t.frame[t.cursor..t.cursor + n]) {
+                    *o += s * gain;
+                }
+            }
+            t.cursor += n;
+        }
+    }
+
+    /// Share streams playing now (tests).
+    #[cfg(test)]
+    pub(crate) fn share_streams(&self) -> usize {
+        self.share.len()
     }
 }
 
@@ -912,6 +988,69 @@ mod tests {
             b.tick(now + 30);
         }
         assert!(max_jump < 0.03, "largest sample step {max_jump} around and after the pause");
+    }
+
+    /// Share audio from a stereo encoder: played through its own stream (not a voice track),
+    /// never lights speaking, follows its gain and deafen, and is in the AEC render path.
+    #[test]
+    fn share_audio_plays_as_its_own_stream() {
+        use tincan_core::media::{KIND_SHARE_AUDIO, track_id};
+        let (mut p, mut ev) = processor();
+        let _rx = start(&mut p, 4);
+        let mut enc = LibOpus.stereo_encoder(&crate::codec::StereoSettings::default()).unwrap();
+        let track = track_id(3, KIND_SHARE_AUDIO);
+        let mut pkt = vec![0u8; 1000];
+        let mut out = vec![0f32; FRAME_10MS];
+        let mut energy = |p: &mut Processor, from: usize, frames: usize| -> f32 {
+            let mut e = 0.0;
+            for f in from..from + frames {
+                let now = f as u64 * 10;
+                if f % 2 == 0 {
+                    let k = f / 2;
+                    let pcm: Vec<f32> = (0..960)
+                        .flat_map(|i| {
+                            let t = (k * 960 + i) as f32 / 48_000.0;
+                            let s = 0.3 * (2.0 * std::f32::consts::PI * 300.0 * t).sin();
+                            [s, -s * 0.5]
+                        })
+                        .collect();
+                    let n = enc.encode(&pcm, &mut pkt).unwrap();
+                    let h = AudioHeader { flags: 0, track, seq: k as u16, ts: (k * 960) as u32, level: 20, epoch: 7 };
+                    p.push_packet(h.packet(&pkt[..n]), now);
+                }
+                p.render(&mut out, now + 5, true);
+                if f > from + 20 {
+                    e += out.iter().map(|x| x * x).sum::<f32>();
+                }
+                p.tick(now);
+            }
+            e
+        };
+        let loud = energy(&mut p, 0, 200);
+        assert!(loud > 1.0, "share audio plays: {loud}");
+        assert_eq!(p.share_streams(), 1);
+        assert!(p.tracks.is_empty(), "not a voice track");
+        assert!(!events(&mut ev).iter().any(|e| matches!(e, AudioEvent::Speaking { .. })), "share audio never lights speaking");
+        p.set_track_volume(track, 0.0);
+        let muted = energy(&mut p, 200, 100);
+        assert!(muted < 1e-6, "volume 0: {muted}");
+        p.set_track_volume(track, 1.0);
+        p.set_deafened(true);
+        let deaf = energy(&mut p, 300, 100);
+        assert!(deaf < 1e-6, "deafened: {deaf}");
+        p.set_deafened(false);
+        assert!(energy(&mut p, 400, 100) > 0.5, "back after undeafen");
+        // Unwatching removes the stream; a bounded number of streams exist at once.
+        p.remove_track(track);
+        assert_eq!(p.share_streams(), 0);
+        for s in 0..10u16 {
+            let h = AudioHeader { flags: 0, track: track_id(s, KIND_SHARE_AUDIO), seq: 0, ts: 0, level: 20, epoch: 7 };
+            p.push_packet(h.packet(&pkt[..20]), 6000);
+        }
+        assert_eq!(p.share_streams(), MAX_SHARE_STREAMS);
+        assert!(p.tracks.is_empty());
+        p.stop_call();
+        assert_eq!(p.share_streams(), 0);
     }
 
     #[test]
