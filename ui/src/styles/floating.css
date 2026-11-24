@@ -83,19 +83,31 @@
 }
 
 /* The card is the composer's box. */
+/* Even padding: with one line of text the card is 52 px tall (5 + 42 px composer + 5),
+   the height of the account card beside it. */
 :root[data-layout="floating"] .composer-slot .composer-wrap {
-  padding: var(--sp-2) var(--sp-2) 0;
+  padding: 5px;
 }
 
 :root[data-layout="floating"] .composer-slot .removed-note {
   margin-bottom: var(--sp-2);
 }
 
+/* The typing line takes room only while someone types, and grows and shrinks with the
+   panel motion, so the card is symmetric when nobody does. */
 :root[data-layout="floating"] .composer-slot .typing-line {
-  height: 20px;
-  line-height: 20px;
+  height: 18px;
+  margin-top: -2px;
+  line-height: 18px;
+  overflow: hidden;
+  transition: height var(--motion-panel), margin-top var(--motion-panel);
   /* starts on the composer box's edge, as in Classic */
   padding: 0 var(--sp-2);
+}
+
+:root[data-layout="floating"] .composer-slot .typing-line:empty {
+  height: 0;
+  margin-top: 0;
 }
 
 /* Right card: the member list, or a voice room's chat beside its tiles. */
