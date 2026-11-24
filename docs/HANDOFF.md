@@ -4,6 +4,18 @@ Status of the Tincan build for the next session. Updated at every milestone comm
 
 ## Where it stands
 
+### Third round (2026-11-24)
+
+- **Floating layout, now the default:** every region is a rounded card with a gap around it, and panels slide open and closed (ease-in-out, with a reverse for each). Classic stays available in Settings > Appearance > Layout. The composer card and the account card are both 52 px tall.
+- **Typing indicator:** "X is typing" shows in the chat area under the newest message, not in the composer.
+- **Voice tiles:** the column count follows the number of people (`lib/tileGrid.ts`), and tiles scale from the stage size (container query units). Sliding panels or dragging a grab bar no longer rewraps them or makes them jump.
+- **Join and leave sounds in voice rooms:** cues from the owner's Player Status Sound FX Pack (`crates/tincan-app/assets`). They play locally at half gain, silent while deafened, at most one per 1.5 s.
+- **Log file per profile:** `%APPDATA%\Tincan\profiles\<profile>\logs\tincan.log` (rotates at 4 MB, max 16 MB per run). `TINCAN_LOG` overrides the filter.
+- **App icon:** `src-tauri/build.rs` now reruns when the icon changes. Before this, the exe kept the old icon.
+- **Open:** the owner once saw voice stuck on "Connecting" as a solo host after an in-place upgrade. It didn't reproduce here in four scenarios, including an upgrade from the previous build. The log file is there to catch it next time.
+
+The two-profile UI e2e passed 49/49 after each change. The installer was rebuilt at `024e63e`.
+
 ### Second round of owner requests (2026-11-23)
 
 Added since the first handoff, all merged on main:
