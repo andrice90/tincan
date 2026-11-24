@@ -41,6 +41,8 @@ pub const AUDIO_IN_QUEUE: usize = 256;
 pub const VIDEO_IN_QUEUE: usize = 64;
 /// Capacity of the frame channel returned by `Net::share_start`.
 pub const SHARE_QUEUE: usize = 8;
+/// Capacity of [`MediaSession::share_audio_out`] in packets (20 ms each: about 0.6 s).
+pub const SHARE_AUDIO_QUEUE: usize = 32;
 
 /// Highest bitrate target the host gives a screen share.
 pub const VIDEO_MAX_BPS: u32 = 4_500_000;
@@ -67,7 +69,12 @@ pub struct MediaSession {
     pub epoch: u8,
     /// Encoded audio datagrams from the app's engine (`AudioEngine::start_call(.., out)`).
     pub audio_out: mpsc::Sender<Bytes>,
-    /// Remote audio datagrams, for `AudioEngine::push_packet`.
+    /// Encoded screen share audio (`tincan_audio::ShareAudio`): sent only while I share, to
+    /// those watching my share. Re-stamped with my share-audio track
+    /// (`track_id(short_id, KIND_SHARE_AUDIO)`) and the epoch byte, like `audio_out`.
+    pub share_audio_out: mpsc::Sender<Bytes>,
+    /// Remote audio datagrams, for `AudioEngine::push_packet`: voice of my room or call, and
+    /// share audio (`KIND_SHARE_AUDIO`) of the screen tracks I subscribed to, nothing else.
     pub audio_in: mpsc::Receiver<Bytes>,
     /// Frames of the video tracks I subscribed to (`Net::subscribe_track`), in order, each
     /// track starting at a keyframe.

@@ -40,6 +40,8 @@ mod tests;
 #[cfg(test)]
 mod tests_media;
 #[cfg(test)]
+mod tests_share_audio;
+#[cfg(test)]
 mod tests_security;
 #[cfg(test)]
 mod tests_removal;

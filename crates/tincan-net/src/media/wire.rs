@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tincan_core::media::{AUDIO_HEADER_LEN, AUDIO_MAGIC, KIND_VOICE, VideoFrame, encode_video_frame, track_kind, track_short_id};
+use tincan_core::media::{AUDIO_HEADER_LEN, AUDIO_MAGIC, KIND_SHARE_AUDIO, KIND_VOICE, VideoFrame, encode_video_frame, track_kind, track_short_id};
 use tincan_core::wire::Ctl;
 use tokio::sync::mpsc;
 
@@ -59,6 +59,13 @@ pub(crate) fn stamp_audio(pkt: Bytes, track: u16, epoch: u8) -> Option<Bytes> {
 pub(crate) fn voice_track_from(pkt: &[u8], short_id: u16) -> Option<u16> {
     let track = tincan_core::media::audio_track_of(pkt)?;
     (track_kind(track) == KIND_VOICE && track_short_id(track) == short_id).then_some(track)
+}
+
+/// The share-audio track of an audio datagram sent by the member with `short_id`; None if it
+/// is malformed, voice, or claims someone else's share.
+pub(crate) fn share_audio_track_from(pkt: &[u8], short_id: u16) -> Option<u16> {
+    let track = tincan_core::media::audio_track_of(pkt)?;
+    (track_kind(track) == KIND_SHARE_AUDIO && track_short_id(track) == short_id).then_some(track)
 }
 
 /// A group replayed from a cache after a migration may start up to this far (90 kHz, 10 s)
@@ -231,6 +238,13 @@ mod tests {
         assert_eq!(voice_track_from(&pkt(track_id(3, KIND_VOICE)), 3), Some(12));
         assert_eq!(voice_track_from(&pkt(track_id(4, KIND_VOICE)), 3), None);
         assert_eq!(voice_track_from(&pkt(track_id(3, KIND_SCREEN)), 3), None);
+        // Share audio: a voice check refuses it (what builds without share audio do), the
+        // share check takes only the sender's own share-audio track.
+        assert_eq!(voice_track_from(&pkt(track_id(3, KIND_SHARE_AUDIO)), 3), None);
+        assert_eq!(share_audio_track_from(&pkt(track_id(3, KIND_SHARE_AUDIO)), 3), Some(track_id(3, KIND_SHARE_AUDIO)));
+        assert_eq!(share_audio_track_from(&pkt(track_id(4, KIND_SHARE_AUDIO)), 3), None);
+        assert_eq!(share_audio_track_from(&pkt(track_id(3, KIND_VOICE)), 3), None);
+        assert_eq!(share_audio_track_from(&[0xA1, 0, 0], 3), None);
         assert_eq!(voice_track_from(b"\xA1", 3), None);
     }
 }
