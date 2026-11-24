@@ -13,6 +13,9 @@ sonora = { workspace = true }
 unsafe-libopus = { workspace = true }
 symphonia = { version = "0.6", features = ["mp3", "aac", "isomp4"] }
 rubato = "5"
+# DPDFNet noise suppression (src/denoise.rs): pure-Rust ONNX inference and the STFT around it
+tract-onnx = "0.23"
+realfft = "3.5"
 crossbeam-channel = "0.5"
 tokio = { workspace = true }
 bytes = { workspace = true }

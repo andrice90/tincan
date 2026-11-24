@@ -958,7 +958,11 @@ impl Media {
             failed()
         })?;
         let map = |d: &tincan_audio::DeviceInfo| dto::AudioDevice { id: d.id.clone(), name: d.name.clone(), is_default: d.is_default };
-        Ok(dto::AudioDevices { inputs: list.inputs.iter().map(map).collect(), outputs: list.outputs.iter().map(map).collect() })
+        Ok(dto::AudioDevices {
+            inputs: list.inputs.iter().map(map).collect(),
+            outputs: list.outputs.iter().map(map).collect(),
+            ai_noise_suppression_available: tincan_audio::denoise::available(),
+        })
     }
 
     /// `mic_test`: `mic-level` events about 20 times per second while on.

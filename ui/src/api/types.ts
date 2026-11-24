@@ -222,12 +222,16 @@ export interface AudioDevice {
 export interface AudioDevices {
   inputs: AudioDevice[];
   outputs: AudioDevice[];
+  /** This build has the AI noise suppression model. */
+  aiNoiseSuppressionAvailable: boolean;
 }
 
 export interface Settings {
   inputDeviceId: string | null;
   outputDeviceId: string | null;
   noiseSuppression: boolean;
+  /** DPDFNet instead of WebRTC noise suppression (when `AudioDevices.aiNoiseSuppressionAvailable`). */
+  aiNoiseSuppression: boolean;
   echoCancellation: boolean;
   inputVolume: number; // 0..2
   outputVolume: number; // 0..2

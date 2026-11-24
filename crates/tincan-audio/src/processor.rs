@@ -10,6 +10,7 @@
 use crate::AudioEvent;
 use crate::apm::{APM_FRAME, Apm};
 use crate::clip::ClipPcm;
+use crate::denoise::Denoiser;
 use crate::codec::{EncoderSettings, MAX_OPUS_PACKET, OpusCodec, OpusDecode, OpusEncode, packet_has_silk};
 use crate::dsp::{LocalVad, RemoteSpeaking, dbov, fade_in, fade_out, level_byte, meter_level, rms, soft_limit, soft_limit_all};
 use crate::error::{AudioError, Result};
@@ -49,6 +50,8 @@ const METER_FRAMES: u32 = 5;
 pub(crate) struct Settings {
     pub echo_cancellation: bool,
     pub noise_suppression: bool,
+    /// Noise suppression by DPDFNet instead of WebRTC's suppressor (when the model is there).
+    pub ai_noise_suppression: bool,
     pub input_gain: f32,
     pub output_gain: f32,
     pub jitter: JitterConfig,
@@ -60,6 +63,8 @@ struct CallState {
     out: mpsc::Sender<Bytes>,
     enc: Box<dyn OpusEncode>,
     apm: Apm,
+    /// DPDFNet, after the APM; None runs WebRTC noise suppression in the APM instead.
+    denoise: Option<Denoiser>,
     pcm20: Vec<f32>,
     pcm20_len: usize,
     send: Vec<f32>,
@@ -312,12 +317,14 @@ impl Processor {
                 None
             }
         };
+        let denoise = self.wants_ai_denoise().then(Denoiser::new).flatten();
         self.call = Some(CallState {
             track,
             epoch,
             out,
             enc,
-            apm: Apm::new(self.settings.echo_cancellation, self.settings.noise_suppression),
+            apm: Apm::new(self.settings.echo_cancellation, self.settings.noise_suppression && denoise.is_none()),
+            denoise,
             pcm20: vec![0.0; FRAME_SAMPLES],
             pcm20_len: 0,
             send: vec![0.0; FRAME_SAMPLES],
@@ -398,11 +405,23 @@ impl Processor {
         self.settings.output_gain = if g.is_finite() { g.clamp(0.0, 4.0) } else { 1.0 };
     }
 
-    pub(crate) fn set_processing(&mut self, echo_cancellation: bool, noise_suppression: bool) {
+    fn wants_ai_denoise(&self) -> bool {
+        self.settings.noise_suppression && self.settings.ai_noise_suppression
+    }
+
+    pub(crate) fn set_processing(&mut self, echo_cancellation: bool, noise_suppression: bool, ai_noise_suppression: bool) {
         self.settings.echo_cancellation = echo_cancellation;
         self.settings.noise_suppression = noise_suppression;
+        self.settings.ai_noise_suppression = ai_noise_suppression;
+        let ai = self.wants_ai_denoise();
         if let Some(c) = &mut self.call {
-            c.apm.set_processing(echo_cancellation, noise_suppression);
+            // keep a running denoiser's state; start a fresh one when it is switched on
+            if !ai {
+                c.denoise = None;
+            } else if c.denoise.is_none() {
+                c.denoise = Denoiser::new();
+            }
+            c.apm.set_processing(echo_cancellation, noise_suppression && c.denoise.is_none());
         }
     }
 
@@ -682,6 +701,9 @@ impl Processor {
         }
         call.apm.set_delay_ms(delay);
         call.apm.capture(frame);
+        if let Some(d) = &mut call.denoise {
+            d.process(frame);
+        }
         call.pcm20[call.pcm20_len..call.pcm20_len + FRAME_10MS].copy_from_slice(frame);
         call.pcm20_len += FRAME_10MS;
         if call.pcm20_len >= FRAME_SAMPLES {
@@ -893,6 +915,7 @@ mod tests {
         Settings {
             echo_cancellation: true,
             noise_suppression: true,
+            ai_noise_suppression: false,
             input_gain: 1.0,
             output_gain: 1.0,
             jitter: JitterConfig::default(),
@@ -949,6 +972,26 @@ mod tests {
             p.capture(&mut buf, now);
             p.tick(now);
         }
+    }
+
+    #[test]
+    #[cfg_attr(not(dpdfnet_model), ignore = "needs scripts/fetch-dpdfnet.ps1")]
+    fn ai_noise_suppression_runs_in_the_call_and_switches_off() {
+        let (mut p, _ev) = processor();
+        p.set_processing(true, true, true);
+        let mut rx = start(&mut p, 4);
+        assert!(p.call.as_ref().unwrap().denoise.is_some());
+        run(&mut p, 0, 100, speech);
+        assert!(!drain(&mut rx).is_empty(), "the call still sends");
+        p.set_processing(true, true, false);
+        assert!(p.call.as_ref().unwrap().denoise.is_none());
+        p.set_processing(true, true, true);
+        assert!(p.call.as_ref().unwrap().denoise.is_some());
+        // noise suppression off turns the AI one off too
+        p.set_processing(true, false, true);
+        assert!(p.call.as_ref().unwrap().denoise.is_none());
+        run(&mut p, 100, 50, speech);
+        assert!(!drain(&mut rx).is_empty());
     }
 
     #[test]

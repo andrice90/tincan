@@ -135,6 +135,7 @@ const st = {
     inputDeviceId: null,
     outputDeviceId: null,
     noiseSuppression: true,
+    aiNoiseSuppression: false,
     echoCancellation: true,
     inputVolume: 1,
     outputVolume: 1,
@@ -1676,6 +1677,7 @@ const handlers: Handlers = {
       { id: "out:hyperx", name: "Headphones (HyperX Cloud II)", isDefault: false },
       { id: "out:monitor", name: "LG ULTRAGEAR (NVIDIA High Definition Audio)", isDefault: false },
     ],
+    aiNoiseSuppressionAvailable: true,
   }),
 
   mic_test: ({ on }) => {

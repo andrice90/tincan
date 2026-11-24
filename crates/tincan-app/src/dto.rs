@@ -455,6 +455,8 @@ pub struct AudioDevices {
     pub inputs: Vec<AudioDevice>,
     /// Speakers.
     pub outputs: Vec<AudioDevice>,
+    /// This build has the AI noise suppression model (`Settings.aiNoiseSuppression` works).
+    pub ai_noise_suppression_available: bool,
 }
 
 /// `Settings.theme`.
@@ -480,6 +482,9 @@ pub struct Settings {
     pub output_device_id: Option<String>,
     /// Noise suppression on.
     pub noise_suppression: bool,
+    /// Noise suppression by the DPDFNet model instead of WebRTC's suppressor (ignored when the
+    /// build has no model, see `AudioDevices.aiNoiseSuppressionAvailable`).
+    pub ai_noise_suppression: bool,
     /// Echo cancellation on.
     pub echo_cancellation: bool,
     /// Input gain 0..2.

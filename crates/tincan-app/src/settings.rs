@@ -17,6 +17,7 @@ impl Default for Settings {
             input_device_id: None,
             output_device_id: None,
             noise_suppression: true,
+            ai_noise_suppression: false,
             echo_cancellation: true,
             input_volume: 1.0,
             output_volume: 1.0,

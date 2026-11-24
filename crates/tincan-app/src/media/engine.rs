@@ -121,6 +121,7 @@ fn audio_config(s: &dto::Settings, no_devices: bool) -> AudioConfig {
         output_device: if no_devices { None } else { s.output_device_id.clone() },
         echo_cancellation: s.echo_cancellation,
         noise_suppression: s.noise_suppression,
+        ai_noise_suppression: s.ai_noise_suppression,
         input_gain: s.input_volume as f32,
         output_gain: s.output_volume as f32,
         ..AudioConfig::default()
@@ -132,7 +133,7 @@ pub(super) fn apply_settings(e: &AudioEngine, s: &dto::Settings, no_devices: boo
     if !no_devices && let Err(err) = e.set_devices(s.input_device_id.clone(), s.output_device_id.clone()) {
         tracing::debug!(error = %err, "audio devices not applied");
     }
-    e.set_processing(s.echo_cancellation, s.noise_suppression);
+    e.set_processing(s.echo_cancellation, s.noise_suppression, s.ai_noise_suppression);
     e.set_input_gain(s.input_volume as f32);
     e.set_output_gain(s.output_volume as f32);
 }

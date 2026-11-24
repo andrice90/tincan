@@ -350,6 +350,14 @@ function VoiceTab({ settings, save }: { settings: Settings; save: (c: Partial<Se
           checked={settings.noiseSuppression}
           onChange={(noiseSuppression) => save({ noiseSuppression })}
         />
+        {devices?.aiNoiseSuppressionAvailable && settings.noiseSuppression && (
+          <Switch
+            id="ai-noise-suppression"
+            label="AI noise suppression"
+            checked={settings.aiNoiseSuppression}
+            onChange={(aiNoiseSuppression) => save({ aiNoiseSuppression })}
+          />
+        )}
         <Switch
           id="echo-cancellation"
           label="Echo cancellation"

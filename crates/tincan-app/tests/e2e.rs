@@ -1101,7 +1101,7 @@ async fn contract_matches_types_ts() {
     }
     // Media results without a session are well formed (no devices in tests).
     assert_eq!(call(&app, "clips", json!({})).await, json!([]));
-    assert_eq!(call(&app, "audio_devices", json!({})).await, json!({ "inputs": [], "outputs": [] }));
+    assert_eq!(call(&app, "audio_devices", json!({})).await, json!({ "inputs": [], "outputs": [], "aiNoiseSuppressionAvailable": false }));
     assert_eq!(call_err(&app, "voice_join", json!({ "serverId": "00", "channelId": "00" })).await, "That conversation id is not valid.");
     assert_eq!(call_err(&app, "clip_play", json!({ "hash": "ab".repeat(32) })).await, "not-in-voice");
     assert_eq!(call_err(&app, "screen_start", json!({ "sourceId": "test:pattern", "mode": "text" })).await, "not-in-voice");

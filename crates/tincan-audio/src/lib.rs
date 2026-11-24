@@ -1,6 +1,7 @@
 ﻿//! Tincan native audio engine.
 //!
-//! Capture (cpal/WASAPI) -> echo cancellation, noise suppression, AGC2 and high-pass (sonora)
+//! Capture (cpal/WASAPI) -> echo cancellation, noise suppression, AGC2 and high-pass (sonora;
+//! noise suppression optionally by the DPDFNet model instead, see [`denoise`])
 //! -> Opus (20 ms, VOIP, 32 kbps VBR, FEC, DTX) -> 12-byte [`tincan_core::media::AudioHeader`]
 //! datagrams; and received datagrams -> per-track adaptive jitter buffer -> Opus decode with FEC
 //! and PLC -> mixer (per-track gain, soft limiter) -> speaker, with the exact speaker signal fed
@@ -30,6 +31,7 @@
 mod apm;
 pub mod codec;
 mod clip;
+pub mod denoise;
 mod device;
 pub mod dsp;
 mod engine;
@@ -69,6 +71,9 @@ pub struct AudioConfig {
     pub echo_cancellation: bool,
     /// Noise suppression on (default true).
     pub noise_suppression: bool,
+    /// Noise suppression uses the DPDFNet model instead of WebRTC's suppressor when the build
+    /// has it ([`denoise::available`]); default false.
+    pub ai_noise_suppression: bool,
     /// Microphone gain, 0..=4 (default 1).
     pub input_gain: f32,
     /// Speaker gain, 0..=4 (default 1).
@@ -86,6 +91,7 @@ impl Default for AudioConfig {
             output_device: None,
             echo_cancellation: true,
             noise_suppression: true,
+            ai_noise_suppression: false,
             input_gain: 1.0,
             output_gain: 1.0,
             jitter: JitterConfig::default(),
@@ -101,6 +107,7 @@ impl std::fmt::Debug for AudioConfig {
             .field("output_device", &self.output_device)
             .field("echo_cancellation", &self.echo_cancellation)
             .field("noise_suppression", &self.noise_suppression)
+            .field("ai_noise_suppression", &self.ai_noise_suppression)
             .field("input_gain", &self.input_gain)
             .field("output_gain", &self.output_gain)
             .field("jitter", &self.jitter)

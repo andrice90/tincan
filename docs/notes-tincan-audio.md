@@ -44,6 +44,18 @@ Implementation notes for whoever wires `tincan-audio` into `tincan-app`. The des
 - `AudioEngine::is_running()` is false once the engine thread has stopped: a panic unwound it, or the last handle is being dropped. Every later command then fails with `AudioError::EngineStopped` (or is dropped, for the fire-and-forget ones). A stopped engine never restarts; drop it and make a new one.
 - The event receiver closing outside shutdown means the same thing; `is_running` lets the app check without owning the receiver. Test: `tests/e2e.rs` `is_running_turns_false_when_the_engine_thread_dies` (a custom source that panics on the engine thread).
 
+## AI noise suppression (DPDFNet, prototype)
+
+- `src/denoise.rs` runs DPDFNet (Apache-2.0, github.com/ceva-ip/DPDFNet), the 48 kHz streaming model `dpdfnet2_48khz_hr` (2.6M parameters), with tract (pure Rust, no ONNX Runtime). The STFT and overlap-add around it follow the reference `StreamEnhancer`: 960-point FFT, Vorbis window, 480-sample hop.
+- Latency: the output is 50 ms behind the input (`denoise::DELAY`): 10 ms for the STFT plus 40 ms inside the model, measured by cross-correlating clean speech with the output. The reference implementation has the same lag; its README only mentions the 10 ms. WebRTC noise suppression adds about 7 ms.
+- The model is not in git. `scripts/fetch-dpdfnet.ps1` downloads it (pinned Hugging Face revision and sha256) to `crates/tincan-audio/models/`, and build.rs embeds it (+10 MB) when present. Without it `denoise::available()` is false, the switch is hidden and calls keep WebRTC noise suppression.
+- Chain with `ai_noise_suppression`: high-pass, AEC3 and AGC2 in sonora with its noise suppression off, then DPDFNet, then VAD and Opus. AGC2 after the model instead (a second, gain-only APM) was tried and not kept: the residual noise floor was better on two test files and worse on the third. The soundboard stream never goes through it. Switching it on starts a fresh denoiser state; switching off drops it.
+- tract: run every frame with a fresh plan state (`plan.run`). A reused `SimpleState` keeps the GRUs' hidden state as op state and adds it to `state_in`, so the output drifts (found by the parity check below).
+- Parity: on 16.5 s of noisy speech the Rust output matches the reference Python package (onnxruntime) at 69 dB SNR, the 16-bit WAV limit; model outputs alone agree to about 1e-5 relative.
+- Cost on an i9-12900K: 3.1-3.6 ms per 10 ms frame (31-36 % of one core), p99 about 5 ms; under heavy other load up to 5.3 ms. ONNX Runtime (`ort` 2.0.0-rc.15) runs the same model in about half the time; tract was kept for the prototype for a pure-Rust build. opt-level 3 for the tract crates gained about 2 %, not kept. The model loads in about 140 ms, once per process, off the engine thread (`denoise::preload` in `AudioEngine::new` and `set_processing`).
+- A/B on TTS speech mixed with synthetic fan noise, keyboard clicks and both (0-4 dB SNR): residual noise in a noise-only stretch, relative to the speech level, was -53 / -11 / +1 dB with DPDFNet against -2 / -1 / +5 dB with WebRTC (both chains with AGC2, which raises quiet stretches). Not yet tried on real recordings.
+- A/B: `cargo run --release -p tincan-audio --example denoise_ab -- noisy.wav out_dir` writes the WebRTC chain, the DPDFNet chain and DPDFNet alone, and prints the per-frame cost. Live: `examples/loopback.rs` with `ai=1` as its fourth argument.
+
 ## What the app supplies
 
 - `local_track` = `track_id(short_id, KIND_VOICE)`. Remote tracks are created on their first packet (64 at most: a voice and a soundboard track per person) and keyed by `header.track`. Map track to user with `track_short_id`, and the kind with `track_kind`. Packets of my own short id (either kind) are ignored.

@@ -4,8 +4,10 @@
 //! canceller only knows A's own playout).
 //!
 //! ```text
-//! cargo run -p tincan-audio --example loopback -- [seconds=20] [loss_pct=0] [max_jitter_ms=0]
+//! cargo run -p tincan-audio --example loopback -- [seconds=20] [loss_pct=0] [max_jitter_ms=0] [ai=0]
 //! ```
+//!
+//! `ai=1` runs A's noise suppression with DPDFNet (needs `scripts/fetch-dpdfnet.ps1`).
 
 use bytes::Bytes;
 use rand::rngs::StdRng;
@@ -33,6 +35,10 @@ async fn main() -> anyhow::Result<()> {
     let seconds = arg(1, 20);
     let loss = arg(2, 0).min(100) as f64 / 100.0;
     let jitter = arg(3, 0);
+    let ai = arg(4, 0) != 0;
+    if ai && !tincan_audio::denoise::available() {
+        anyhow::bail!("this build has no DPDFNet model: run scripts/fetch-dpdfnet.ps1 and rebuild");
+    }
 
     let devices = AudioEngine::devices()?;
     for d in devices.inputs.iter().filter(|d| d.is_default) {
@@ -42,7 +48,8 @@ async fn main() -> anyhow::Result<()> {
         println!("speaker:    {}", d.name);
     }
 
-    let (a, a_events) = AudioEngine::new(AudioConfig::default())?;
+    let (a, a_events) = AudioEngine::new(AudioConfig { ai_noise_suppression: ai, ..AudioConfig::default() })?;
+    println!("noise suppression: {}", if ai { "DPDFNet" } else { "WebRTC" });
     let (b, b_events) = AudioEngine::new(AudioConfig::default())?;
     print_events("A", a_events);
     print_events("B", b_events);

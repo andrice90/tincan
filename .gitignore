@@ -6,3 +6,6 @@ dist/
 
 # Third-party voice cue sounds (Ovani Sound license): kept locally, never committed
 crates/tincan-app/assets/*.wav
+
+# DPDFNet model (Apache-2.0), fetched by scripts/fetch-dpdfnet.ps1
+crates/tincan-audio/models/

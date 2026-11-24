@@ -45,7 +45,7 @@ enum Cmd {
     TrackVolume(u16, f32),
     InputGain(f32),
     OutputGain(f32),
-    Processing { echo_cancellation: bool, noise_suppression: bool },
+    Processing { echo_cancellation: bool, noise_suppression: bool, ai_noise_suppression: bool },
     LossHint(u8),
     Relayed(bool),
     PlayClip(Arc<ClipPcm>, u64),
@@ -132,6 +132,10 @@ impl AudioEngine {
     /// Starts the engine thread. No device is opened until a call, a mic test or a UI sound
     /// needs one. Events arrive on the returned receiver.
     pub fn new(cfg: AudioConfig) -> Result<(AudioEngine, mpsc::UnboundedReceiver<AudioEvent>)> {
+        if cfg.noise_suppression && cfg.ai_noise_suppression {
+            // off the engine thread: loading the model takes ~150 ms
+            crate::denoise::preload();
+        }
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (pkt_tx, pkt_rx) = crossbeam_channel::bounded(PACKET_QUEUE);
@@ -140,6 +144,7 @@ impl AudioEngine {
         let settings = Settings {
             echo_cancellation: cfg.echo_cancellation,
             noise_suppression: cfg.noise_suppression,
+            ai_noise_suppression: cfg.ai_noise_suppression,
             input_gain: cfg.input_gain,
             output_gain: cfg.output_gain,
             jitter: cfg.jitter,
@@ -264,8 +269,13 @@ impl AudioEngine {
     }
 
     /// Turns echo cancellation and noise suppression on or off (AGC and high-pass stay on).
-    pub fn set_processing(&self, echo_cancellation: bool, noise_suppression: bool) {
-        self.post(Cmd::Processing { echo_cancellation, noise_suppression });
+    /// `ai_noise_suppression` picks DPDFNet over WebRTC's suppressor when the build has the
+    /// model; the first time it is on, this call loads the model (~150 ms).
+    pub fn set_processing(&self, echo_cancellation: bool, noise_suppression: bool, ai_noise_suppression: bool) {
+        if noise_suppression && ai_noise_suppression {
+            crate::denoise::preload();
+        }
+        self.post(Cmd::Processing { echo_cancellation, noise_suppression, ai_noise_suppression });
     }
 
     /// Receiver-reported packet loss in percent: sets Opus packet-loss-perc (clamped 5..=20)
@@ -498,8 +508,8 @@ impl Driver {
             Cmd::TrackVolume(t, g) => self.proc.set_track_volume(t, g),
             Cmd::InputGain(g) => self.proc.set_input_gain(g),
             Cmd::OutputGain(g) => self.proc.set_output_gain(g),
-            Cmd::Processing { echo_cancellation, noise_suppression } => {
-                self.proc.set_processing(echo_cancellation, noise_suppression);
+            Cmd::Processing { echo_cancellation, noise_suppression, ai_noise_suppression } => {
+                self.proc.set_processing(echo_cancellation, noise_suppression, ai_noise_suppression);
             }
             Cmd::LossHint(l) => self.proc.set_loss_hint(l),
             Cmd::Relayed(r) => {
