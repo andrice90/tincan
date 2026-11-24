@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <!-- Repository social preview (GitHub Settings > Social preview, and link cards on X/Twitter).
+       Render: scripts/render-social-preview.ps1 -> docs/social-preview.png -->
+  <rect width="1280" height="640" fill="#e0784f"/>
+  <!-- the app icon (src-tauri/icons/icon.svg), 300 px -->
+  <g transform="translate(204 170) scale(1.875)">
+    <rect width="160" height="160" rx="44" fill="#1e1f24"/>
+    <g fill="none" stroke="#e0784f" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" transform="translate(-6,-4) translate(160,0) scale(-1,1)">
+      <g transform="translate(80,82) rotate(45) translate(10,0)">
+        <path d="M-22 -24 L30 -24 M-22 24 L30 24"/>
+        <path d="M30 -24 A8 24 0 0 1 30 24"/>
+        <ellipse cx="-22" cy="0" rx="8" ry="24"/>
+        <path d="M0 -24 A7 24 0 0 1 0 24 M14 -24 A7 24 0 0 1 14 24" stroke-width="3.5"/>
+        <path d="M38 0 C 52 0, 54 14, 66 14"/>
+        <path d="M-40 -12 A20 20 0 0 0 -40 12"/>
+        <path d="M-52 -20 A32 32 0 0 0 -52 20"/>
+        <path d="M-64 -28 A44 44 0 0 0 -64 28"/>
+      </g>
+    </g>
+  </g>
+  <text x="572" y="372" font-family="Segoe UI, sans-serif" font-weight="600" font-size="150" fill="#1a1c1f">Tin Can</text>
+</svg>
