@@ -104,6 +104,18 @@
   min-height: 0;
 }
 
+/* The Floating layout's cards and slots (floating.css). Classic lays out their contents
+   as if they were not there. */
+.side-card,
+.voice-slot,
+.voice-slot-inner,
+.content-card,
+.composer-slot,
+.composer-slot-inner,
+.right-card {
+  display: contents;
+}
+
 .center-screen {
   flex: 1;
   display: grid;
@@ -984,12 +996,25 @@ html:has(.resize-handle.is-dragging) {
 
 /* ---------------------------------------------------------------- member list */
 
-/* Width set inline from the saved value (lib/panelWidth.ts); in a narrow window the panel
-   gives way down to its minimum before the content does. */
-.members {
+/* The right slot (Shell.tsx) holds the member list and its grab bar. Its width comes from
+   the saved value (lib/panelWidth.ts) through --right-w; in a narrow window it gives way
+   down to --right-min before the content does. Classic hides it while closed. */
+.right-slot {
   position: relative;
   flex: 0 1 auto;
-  min-width: 220px;
+  display: flex;
+  width: var(--right-w);
+  min-width: var(--right-min);
+  min-height: 0;
+}
+
+.right-slot:not([data-state]) {
+  display: none;
+}
+
+.members {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;

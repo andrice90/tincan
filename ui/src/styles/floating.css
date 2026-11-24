@@ -1,0 +1,200 @@
+/* Floating layout (docs/design.md, "Floating layout"): data-layout="floating" on <html>.
+   Every region is a card: one radius, one shadow, one gap between cards and around the
+   window. Panels that open and close push their neighbours over --motion-panel; the
+   wrappers that animate stay mounted (Shell.tsx), so a close animates like an open.
+   Under prefers-reduced-motion --motion-panel is 0 and the JS close delay is 0 too. */
+
+:root[data-layout="floating"] body,
+:root[data-layout="floating"] .titlebar {
+  background: var(--bg-backdrop);
+}
+
+:root[data-layout="floating"] .shell {
+  padding: 0 var(--gap-float) var(--gap-float);
+  background: var(--bg-backdrop);
+}
+
+/* ---------------------------------------------------------------- cards */
+
+:root[data-layout="floating"] :is(.rail, .side-card, .sidebar-foot, .content-card, .composer-slot, .right-card) {
+  border-radius: var(--r-float);
+  box-shadow: var(--shadow-float);
+}
+
+/* Server rail */
+:root[data-layout="floating"] .rail {
+  background: var(--bg-side);
+}
+
+:root[data-layout="floating"] .rail-btn:not([aria-current="page"]) {
+  background: var(--bg-main);
+}
+
+:root[data-layout="floating"] .rail-btn:not([aria-current="page"]):hover {
+  background: var(--bg-raised);
+}
+
+/* Channel card over the account card, in the sidebar column. The channel card takes
+   what the account card leaves, so it shrinks as the voice controls open. */
+:root[data-layout="floating"] .sidebar {
+  margin-left: var(--gap-float);
+  background: none;
+}
+
+:root[data-layout="floating"] .side-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-side);
+}
+
+:root[data-layout="floating"] .sidebar-foot {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--gap-float);
+  border-top: 0;
+  overflow: hidden;
+  background: var(--bg-side);
+}
+
+:root[data-layout="floating"] .user-panel {
+  background: none;
+}
+
+/* Content card over the composer card. */
+:root[data-layout="floating"] .main {
+  /* 800 px window less the gaps, rail, narrowest sidebar and member list (design.md) */
+  min-width: 240px;
+  margin-left: var(--gap-float);
+  background: none;
+}
+
+:root[data-layout="floating"] .content-card {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-main);
+}
+
+/* The card is the composer's box. */
+:root[data-layout="floating"] .composer-slot .composer-wrap {
+  padding: var(--sp-2) var(--sp-2) 0;
+}
+
+:root[data-layout="floating"] .composer-slot .removed-note {
+  margin-bottom: var(--sp-2);
+}
+
+:root[data-layout="floating"] .composer-slot .typing-line {
+  height: 20px;
+  line-height: 20px;
+  padding: 0 var(--sp-3);
+}
+
+/* Right card: the member list, or a voice room's chat beside its tiles. */
+:root[data-layout="floating"] .right-card {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  /* Opening, the content is wider than the card: anchored right, it slides in with the edge. */
+  justify-content: flex-end;
+  overflow: hidden;
+  background: var(--bg-side);
+}
+
+:root[data-layout="floating"] .right-card > * {
+  flex: none;
+  width: 100%;
+  min-width: var(--right-min);
+}
+
+:root[data-layout="floating"] .room-chat {
+  border-left: 0;
+}
+
+/* ---------------------------------------------------------------- open and close */
+
+/* Voice controls in the account card, and the composer card: a grid row from 0fr to 1fr,
+   so the height follows the content with no fixed number. */
+:root[data-layout="floating"] .voice-slot,
+:root[data-layout="floating"] .composer-slot {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--motion-panel);
+}
+
+:root[data-layout="floating"] .voice-slot[data-state="open"],
+:root[data-layout="floating"] .composer-slot[data-state="open"] {
+  grid-template-rows: 1fr;
+}
+
+:root[data-layout="floating"] .voice-slot-inner,
+:root[data-layout="floating"] .composer-slot-inner {
+  display: block;
+  min-height: 0;
+  overflow: hidden;
+}
+
+:root[data-layout="floating"] .composer-slot {
+  flex: none;
+  margin-top: 0;
+  background: var(--bg-main);
+  transition:
+    grid-template-rows var(--motion-panel),
+    margin-top var(--motion-panel);
+}
+
+:root[data-layout="floating"] .composer-slot[data-state="open"] {
+  margin-top: var(--gap-float);
+}
+
+/* The right slot's width goes from 0 to the panel's; its gap opens with it. */
+:root[data-layout="floating"] .right-slot {
+  display: flex;
+  width: 0;
+  min-width: 0;
+  margin-left: 0;
+  transition:
+    width var(--motion-panel),
+    min-width var(--motion-panel),
+    margin-left var(--motion-panel);
+}
+
+:root[data-layout="floating"] .right-slot[data-state="open"] {
+  width: var(--right-w);
+  min-width: var(--right-min);
+  margin-left: var(--gap-float);
+}
+
+/* Closed: no empty card or its shadow left at the edge. */
+:root[data-layout="floating"] :is(.composer-slot, .right-slot):not([data-state]) {
+  visibility: hidden;
+}
+
+/* A drag follows the pointer. */
+html:has(.resize-handle.is-dragging) .right-slot {
+  transition: none;
+}
+
+/* ---------------------------------------------------------------- grab bars in the gaps */
+
+:root[data-layout="floating"] .resize-handle.is-right {
+  right: calc(-1 * var(--gap-float));
+  width: var(--gap-float);
+}
+
+:root[data-layout="floating"] .resize-handle.is-left {
+  left: calc(-1 * var(--gap-float));
+  width: var(--gap-float);
+}
+
+:root[data-layout="floating"] .resize-handle::after {
+  left: calc(50% - 1px);
+  border-radius: 1px;
+}

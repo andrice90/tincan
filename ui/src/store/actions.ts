@@ -18,6 +18,7 @@ import type {
   UserId,
   VoiceSession,
 } from "../api/types";
+import { browserStorage, saveLayout, type Layout } from "../lib/layout";
 import { leaveCommand } from "./calls";
 import { shownChat } from "./chatView";
 import { addPlayedClip } from "./clips";
@@ -570,6 +571,12 @@ export function setSoundboardOpen(open: boolean): void {
 
 export function setFullStage(on: boolean): void {
   patch({ fullStage: on });
+}
+
+/** Switches between the Classic and Floating layouts and saves the choice. */
+export function setLayout(layout: Layout): void {
+  patch({ layout });
+  saveLayout(browserStorage(), layout);
 }
 
 // ------------------------------------------------------------------ profile and servers

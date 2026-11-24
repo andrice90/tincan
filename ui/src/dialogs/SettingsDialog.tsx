@@ -7,8 +7,9 @@ import { CopyButton } from "../components/CopyButton";
 import { Modal } from "../components/Modal";
 import { hostLine } from "../components/ChannelSidebar";
 import { formatBytes } from "../lib/format";
+import { LAYOUTS, type Layout } from "../lib/layout";
 import { Avatar } from "../components/common";
-import { closeDialog, pickImageFor, saveSettings, setAvatar, setName } from "../store/actions";
+import { closeDialog, pickImageFor, saveSettings, setAvatar, setLayout, setName } from "../store/actions";
 import { useStore, type SettingsTab } from "../store/store";
 import { connStatus, debounced, fetchLimitOptions } from "./settingsLogic";
 
@@ -478,14 +479,38 @@ function AppearanceTab({ settings, save }: { settings: Settings; save: (c: Parti
     { id: "light", label: "Light" },
   ];
   return (
+    <>
+      <div className="field">
+        <span className="field-label" id="theme-label">
+          Theme
+        </span>
+        <div className="segmented" role="radiogroup" aria-labelledby="theme-label">
+          {options.map((o) => (
+            <button key={o.id} type="button" role="radio" aria-checked={settings.theme === o.id} onClick={() => save({ theme: o.id })}>
+              {o.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <LayoutField />
+    </>
+  );
+}
+
+const LAYOUT_LABELS: Record<Layout, string> = { classic: "Classic", floating: "Floating" };
+
+/** Saved on this PC (localStorage), not in the app's settings. */
+function LayoutField() {
+  const layout = useStore((s) => s.layout);
+  return (
     <div className="field">
-      <span className="field-label" id="theme-label">
-        Theme
+      <span className="field-label" id="layout-label">
+        Layout
       </span>
-      <div className="segmented" role="radiogroup" aria-labelledby="theme-label">
-        {options.map((o) => (
-          <button key={o.id} type="button" role="radio" aria-checked={settings.theme === o.id} onClick={() => save({ theme: o.id })}>
-            {o.label}
+      <div className="segmented" role="radiogroup" aria-labelledby="layout-label">
+        {LAYOUTS.map((id) => (
+          <button key={id} type="button" role="radio" aria-checked={layout === id} onClick={() => setLayout(id)}>
+            {LAYOUT_LABELS[id]}
           </button>
         ))}
       </div>

@@ -1,14 +1,13 @@
-// Right panel: who is in the server, online first.
+// Right panel: who is in the server, online first. The shell's right slot sets the width
+// and holds the grab bar.
 
 import { MessageSquare, Phone, UserMinus } from "lucide-react";
 import { memo, useMemo } from "react";
 import type { Member, ServerId } from "../api/types";
 import { messageUser, openDialog, startCall } from "../store/actions";
-import { MEMBERS_BOUNDS, MEMBERS_KEY } from "../lib/panelWidth";
 import { useStore } from "../store/store";
 import { ICON_SM, PersonId, PersonName, SpeakingAvatar } from "./common";
 import { Menu, useMenu, type MenuItem } from "./Menu";
-import { ResizeHandle, usePanelWidth } from "./ResizeHandle";
 
 const EMPTY: Member[] = [];
 
@@ -89,7 +88,6 @@ export function MemberList({ serverId }: { serverId: ServerId }) {
   const members = useStore((s) => s.members[serverId] ?? EMPTY);
   const meId = useStore((s) => s.me?.userId);
   const busy = useStore((s) => s.call !== null || s.voice?.kind === "call");
-  const width = usePanelWidth(MEMBERS_KEY, MEMBERS_BOUNDS);
   const isOwner = useStore((s) => s.servers.find((x) => x.id === serverId)?.isOwner ?? false);
   const [online, offline] = useMemo(() => {
     const byName = (a: Member, b: Member) => a.name.localeCompare(b.name);
@@ -97,8 +95,7 @@ export function MemberList({ serverId }: { serverId: ServerId }) {
   }, [members]);
 
   return (
-    <aside className="members" aria-label="Members" style={{ width: width.width }}>
-      <ResizeHandle panel={width} bounds={MEMBERS_BOUNDS} edge="left" label="Resize member list" />
+    <aside className="members" aria-label="Members">
       <div className="members-scroll">
         {online.length > 0 && (
           <section className="member-group">

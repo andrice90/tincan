@@ -25,6 +25,7 @@ import type {
   VoiceSession,
 } from "../api/types";
 import { buildAvatarIndex } from "../lib/avatars";
+import { browserStorage, loadLayout, type Layout } from "../lib/layout";
 import { buildNameIndex, sharesName, type NameIndex } from "../lib/names";
 
 /** What the main area shows. */
@@ -110,6 +111,8 @@ export interface State {
   roomChatPanel: boolean;
   /** Voice room whose stage is shown in full window, by channel or conv id. */
   fullStage: boolean;
+  /** Classic or Floating window layout, saved per profile (lib/layout.ts). */
+  layout: Layout;
   dialog: DialogState | null;
   toasts: Toast[];
 }
@@ -136,6 +139,7 @@ const initial: State = {
   soundboardOpen: false,
   roomChatPanel: false,
   fullStage: false,
+  layout: loadLayout(browserStorage()),
   dialog: null,
   toasts: [],
 };
