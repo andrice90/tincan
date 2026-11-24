@@ -1151,9 +1151,13 @@ button.member-row:hover {
   color: var(--text-2);
 }
 
+/* Fixed-width tiles, centred: when the panels around the stage slide open or closed, the
+   tiles keep their size and only rewrap, instead of stretching with the width every frame
+   (narrower than one tile, a tile takes the whole width). */
 .tiles {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 240px));
+  justify-content: center;
   align-content: start;
   gap: var(--sp-3);
   padding: var(--sp-4);

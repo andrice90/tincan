@@ -395,17 +395,32 @@ impl Media {
 
     /// Join and leave sounds (`cues.rs`): compares the room's people with the last emit.
     fn room_cue(&self, core: &Core, st: &mut State, dto: Option<&dto::VoiceSession>) {
+        // While the server's roster is not current (a host change in progress) the session
+        // lists only me: keep the last membership instead of cueing everyone out and back in.
+        if let Some(a) = st.attached.as_ref()
+            && let Kind::Room { server, .. } = a.kind
+            && dto.is_some()
+            && !roster_current(core.net.connection(&server).state)
+        {
+            return;
+        }
         let me = core.me.to_z32();
         let next: super::cues::Seen = dto.filter(|v| matches!(v.kind, dto::VoiceKind::Room)).map(|v| {
             (v.conv_id.clone(), v.participants.iter().map(|p| p.user_id.clone()).filter(|u| *u != me).collect())
         });
         let cue = super::cues::cue_for(&st.last_room, &next);
         st.last_room = next;
-        if let Some(cue) = cue
-            && !st.deafened
+        let Some(cue) = cue else { return };
+        // Members joining and leaving over and over must not turn into a stream of sounds.
+        let now = std::time::Instant::now();
+        if st.last_cue.is_some_and(|t| now.duration_since(t) < super::cues::MIN_GAP) {
+            return;
+        }
+        if !st.deafened
             && let Some(engine) = self.engine_handle()
             && let Some(pcm) = super::cues::pcm(cue)
         {
+            st.last_cue = Some(now);
             engine.play_local(pcm);
         }
     }

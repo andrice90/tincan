@@ -117,6 +117,8 @@ struct State {
     last_voice: Option<Value>,
     /// The voice room and the others in it as last emitted, for the join and leave cues.
     last_room: cues::Seen,
+    /// When the last join or leave cue played (cues are rate-limited).
+    last_cue: Option<std::time::Instant>,
     /// The call as last reported (peer, state), for end-of-call notices.
     last_call: Option<(UserId, tincan_net::CallState)>,
 }

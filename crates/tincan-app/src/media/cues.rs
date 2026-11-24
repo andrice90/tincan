@@ -14,6 +14,9 @@ static LEAVE_WAV: &[u8] = include_bytes!("../../assets/voice-leave.wav");
 /// Playback gain of the cues: they sit under voices and soundboard clips.
 const CUE_GAIN: f32 = 0.5;
 
+/// Shortest time between two cues; changes inside it play nothing.
+pub(super) const MIN_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cue {
     Join,
