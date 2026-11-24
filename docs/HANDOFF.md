@@ -4,6 +4,34 @@ Status of the Tincan build for the next session. Updated at every milestone comm
 
 ## Where it stands
 
+### Second round of owner requests (2026-11-23)
+
+Added since the first handoff, all merged on main:
+
+- **Voice click fix.** unsafe-libopus packet loss concealment emitted near full-scale bursts after quiet hybrid frames, which was the click about every second in voice. Concealment is now checked against the last frame and dropped if it bursts. Pauses fade out, and clips have 5 ms ramps.
+- **UI:**
+  - The member list never overlaps "(you)" or the Host and Owner tags.
+  - The channel list and member list resize with a grab bar.
+  - The WebView page menu is suppressed outside text fields and selections.
+  - Unread channels show badges.
+- **Voice room chat:** each voice room has its own message history. The chat icon on the room row opens it, and "Chat" opens a panel beside the tiles.
+- **Remove member:** owner only, through `Body::MemberRemove` (index 11). The host enforces it, including a new host after migration. A removed user can rejoin only with an invite that still works: their own old invites are dead.
+- **Short codes:** 6-character server invite codes that last until the owner rotates them, and 6-character friend codes, both rotatable. Each code commits to its target with argon2id, so knowing a code doesn't let anyone redirect it. Long codes stay as a fallback.
+- **Avatars and server icons:** `Body::ProfileImage` (12) and `ServerIcon` (13), plus `Ctl::DmAvatar` (40). A crop dialog shows a circle or squircle outline, with drag and zoom. Images are 128x128 and at most 64 KB.
+- **New logo:** a tin can angled up and right, projecting sound. Sources are in `src-tauri/icons/*.svg`, with variants for each size.
+
+**Compatibility:** these add event and frame variants. A build from before them rejects the new events and stalls on the sender, so every machine in a server needs the new build.
+
+Last full check: `cargo test --workspace` 531 passed, 0 failed (14 ignored). Clippy is clean. `pnpm test` 97 passed. The two-profile UI e2e passed 49/49 on the debug build.
+
+**Not verified:**
+- Short-code lookups over the real pkarr relay and DHT; only the offline folder path is tested.
+- Avatar upload through the real WebView2 file picker.
+- The voice click fix on real hardware.
+- The e2e has no steps yet for voice room chat, removal, avatars or the resize bar.
+
+### First handoff
+
 Testable product (2026-11-23). Every feature in the original request is built. These run end to end between two profiles on one machine through the real UI:
 
 - text rooms and DMs
@@ -34,7 +62,7 @@ Last checks on `main`:
 - `cargo test --workspace`: 0 failures; the real-device and live-network tests are ignored.
 - clippy `--workspace --all-targets -D warnings` is clean.
 - `pnpm typecheck` and `pnpm build` are clean.
-- `pnpm test`: 62 passed.
+- `pnpm test`: 97 passed (after the second round).
 
 ## Build, run, test
 
